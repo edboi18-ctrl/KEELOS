@@ -1,0 +1,65 @@
+# Continuous integration (spec section 7; P0-T7).
+#
+# Workflows contain no build logic: every step that builds or tests calls
+# `cargo xtask`, exactly as a developer does locally. The other steps only
+# prepare the runner (toolchain, QEMU, KVM access).
+#
+# Security rules (SR-32 to SR-34), enforced by `cargo xtask audit`:
+# actions pinned by full commit SHA, read-only token, no secrets, no
+# pull_request_target, GitHub-hosted runners only.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Audit and host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Format, lint, unsafe count, licenses, workflow policy, advisories
+        run: cargo xtask audit
+      - name: Host unit tests
+        run: cargo test --locked --offline
+
+  qemu:
+    name: Build and boot tests (QEMU with KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Install QEMU and UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 ovmf
+      - name: Allow this user to use KVM
+        # From GitHub's changelog entry on hardware acceleration for hosted
+        # Linux runners (2024-04-02).
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Acceptance tests for every completed phase
+        run: cargo xtask test --kvm
+      - name: Build release artifacts
+        run: cargo xtask dist
+      - name: Boot the release disk image
+        run: cargo xtask boot-check target/dist/keel-0.0.0.img --kvm

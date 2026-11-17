@@ -45,3 +45,17 @@ enters the code (spec section 1, rule 3).
 | Microsoft, "Tar and Curl Come to Windows!", https://devblogs.microsoft.com/commandline/tar-and-curl-come-to-windows/ ; curl project, https://curl.se/windows/microsoft.html | ADR 0001 |
 | Cargo book, "Environment variables" (`CARGO_ENCODED_RUSTFLAGS`), "Source replacement" | `xtask/src/build.rs`, `.cargo/config.toml` |
 | crates.io version list for `limine` (0.6.x requires nightly) | ADR 0002 |
+
+## Release artifacts and CI
+
+| Source | Used for |
+| --- | --- |
+| UEFI specification, chapter "GUID Partition Table (GPT) Disk Layout" (Protective MBR, GPT Header, GPT Partition Entry) and Appendix A (GUID byte order) | `disk_image` and `gpt_header` in `xtask/src/dist.rs` |
+| Microsoft, "FAT32 File System Specification" (FAT type determination: FAT32 needs at least 65525 clusters) | Minimum partition size in `xtask/src/dist.rs` |
+| PKWARE `APPNOTE.TXT` 6.3 (sections 4.3.7, 4.3.12, 4.3.16, 4.4.6, 4.4.7) | `zip_stored` and `crc32` in `xtask/src/dist.rs` |
+| RFC 4122 section 4.4 (version and variant bits) | `derived_guid` in `xtask/src/dist.rs` |
+| `gh attestation verify --help` (GitHub CLI): `--repo`, `--signer-workflow`, `--deny-self-hosted-runners` | `xtask/src/verify.rs` |
+| `actions/attest-build-provenance` v4.2.2 `action.yml` (`subject-checksums` input) | `.github/workflows/release.yml` |
+| GitHub changelog 2024-04-02, hardware acceleration on hosted Linux runners (KVM udev rule) | `.github/workflows/*.yml` |
+| The Rust Reference, "Comments" and "Tokens" | Lexer for the `unsafe` census in `xtask/src/audit.rs` |
+| Limine 12.9.6 `.github/workflows/release.yml` and `README.md` (binary release assets and their GPG signatures) | Limine pin procedure in `docs/DEPENDENCIES.md` |

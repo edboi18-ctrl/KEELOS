@@ -55,6 +55,8 @@ Host tool `xtask` only (never linked into the image):
 | --- | --- | --- | --- |
 | `sha2` | 0.11.1 | MIT OR Apache-2.0 | SHA-256 of downloads and release artifacts |
 | `blake2` | 0.11.0 | MIT OR Apache-2.0 | BLAKE2B hashes written into `limine.conf` (SR-27) |
+| `fatfs` | 0.3.6 | MIT | Writes the FAT32 system partition of the release disk image (built without the `chrono` feature, so no timestamps) |
+| `bitflags` 1.3.2, `byteorder` 1.5.0, `log` 0.4.35 | see `Cargo.lock` | MIT OR Apache-2.0; Unlicense OR MIT (`byteorder`) | Dependencies of `fatfs` |
 | `digest`, `crypto-common`, `block-buffer`, `hybrid-array`, `typenum`, `const-oid`, `cpufeatures`, `cmov`, `ctutils`, `cfg-if`, `libc` | see `Cargo.lock` | MIT OR Apache-2.0 | Transitive dependencies of the two RustCrypto crates above (`libc` only on non-x86 hosts) |
 
 ## Host tools (not build inputs)
@@ -65,9 +67,24 @@ contribute bytes to the image, so they are named here but not hash-pinned.
 | Tool | Used for |
 | --- | --- |
 | `curl`, `tar` | Downloading and unpacking the Limine archive (ADR 0001); the result is SHA-256 verified |
-| QEMU (`qemu-system-x86_64`) and OVMF/edk2 firmware | `cargo xtask run` and `cargo xtask test` |
+| QEMU (`qemu-system-x86_64`) and OVMF/edk2 firmware | `cargo xtask run`, `test`, `boot-check`. CI installs the runner distribution's packages (`qemu-system-x86`, `ovmf` on Ubuntu 24.04). |
+| `cargo-deny` 0.21.0 (MIT OR Apache-2.0) | `cargo xtask audit` advisory check. Upstream release binary, pinned by SHA-256 in `xtask/src/audit.rs` and verified on every run: Linux `a2170b85...b4585a903`, Windows `8c445ef9...bfcef4824`; both equal the `.sha256` files upstream publishes beside the assets (checked 2026-11-17). It downloads the RustSec advisory database at run time, which is by nature unpinned. |
+| GitHub CLI (`gh`) | `cargo xtask verify` (attestation check) on the owner's PC; `gh release create` in the release workflow (preinstalled on hosted runners) |
+| `git` | `cargo xtask dist` clean-tree check |
 
 ## GitHub Actions
 
-None yet. Each action will be listed here with its full commit SHA when
-the workflows are added (SR-32).
+Every action is first-party (owned by GitHub) and pinned by full commit
+SHA (SR-32). The SHAs were read from the upstream tags with
+`git ls-remote --tags` on 2026-11-17. No third-party action is used; the
+release is created with the `gh` CLI in a plain shell step.
+
+| Action | Version | Commit SHA | Used in |
+| --- | --- | --- | --- |
+| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | `ci.yml`, `release.yml` |
+| `actions/upload-artifact` | v7.0.2 | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | `release.yml` |
+| `actions/download-artifact` | v8.0.2 | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | `release.yml` |
+| `actions/attest-build-provenance` | v4.2.2 | `4d101475d8b20a2381f78447822ac1eab6504dd8` | `release.yml` |
+
+Runner image: `ubuntu-24.04` (GitHub-hosted). Its preinstalled `rustup`
+installs the toolchain named in `rust-toolchain.toml`.

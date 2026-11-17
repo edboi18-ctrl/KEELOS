@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn bootloader_strings_are_bounded_and_validated() {
-        // SAFETY (all four calls): each pointer is null or refers to a
+        // SAFETY: (all four calls) each pointer is null or refers to a
         // static byte string that is readable up to its NUL terminator or
         // for at least MAX_STRING_LEN bytes.
         unsafe {

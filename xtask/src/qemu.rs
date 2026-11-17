@@ -18,6 +18,9 @@ const EXIT_SUCCESS: i32 = 33;
 /// Phases whose acceptance tests exist. `cargo xtask test` runs them all.
 pub const COMPLETED_PHASES: &[u32] = &[0];
 
+/// First line of the kernel's panic output (`keel-kernel/src/main.rs`).
+const PANIC_BANNER: &str = "*** KEEL KERNEL PANIC ***";
+
 /// Serial lines printed when a test run fails (spec section 15).
 const TAIL_LINES: usize = 200;
 
@@ -88,13 +91,28 @@ pub struct RunOptions {
     pub gdb: bool,
 }
 
+/// The disk QEMU boots from.
+enum BootDisk<'a> {
+    /// A directory exposed as a virtual FAT drive (the `target/esp` tree).
+    Directory(&'a Path),
+    /// A raw disk image file. Opened with `snapshot=on`, so it is never
+    /// modified.
+    Image(&'a Path),
+}
+
 /// The QEMU command line from spec section 4, "QEMU baseline invocation".
-fn base_command(esp: &Path, options: &RunOptions) -> Result<Command> {
+fn base_command(disk: BootDisk, options: &RunOptions) -> Result<Command> {
     let qemu = find_qemu()?;
     let ovmf = find_ovmf(&qemu)?;
     let root = util::workspace_root();
-    // A relative path keeps drive-letter colons out of the `fat:` spec.
-    let esp = esp.strip_prefix(&root).unwrap_or(esp);
+    let drive = match disk {
+        BootDisk::Directory(esp) => {
+            // A relative path keeps drive-letter colons out of the `fat:` spec.
+            let esp = esp.strip_prefix(&root).unwrap_or(esp);
+            format!("format=raw,file=fat:rw:{}", esp.display())
+        }
+        BootDisk::Image(image) => format!("format=raw,snapshot=on,file={}", image.display()),
+    };
 
     let mut command = Command::new(qemu);
     command.current_dir(&root);
@@ -108,9 +126,7 @@ fn base_command(esp: &Path, options: &RunOptions) -> Result<Command> {
         "if=pflash,format=raw,readonly=on,file={}",
         ovmf.display()
     ));
-    command
-        .arg("-drive")
-        .arg(format!("format=raw,file=fat:rw:{}", esp.display()));
+    command.arg("-drive").arg(drive);
     command.args(["-serial", "stdio", "-no-reboot"]);
     command.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     if options.gdb {
@@ -122,7 +138,7 @@ fn base_command(esp: &Path, options: &RunOptions) -> Result<Command> {
 /// `cargo xtask run`: build, then boot interactively with serial on stdio.
 pub fn run(options: &RunOptions) -> Result<()> {
     let esp = build::build(BootMode::Normal)?;
-    let mut command = base_command(&esp, options)?;
+    let mut command = base_command(BootDisk::Directory(&esp), options)?;
     command.arg("-no-shutdown");
     if options.gdb {
         println!("xtask: QEMU is paused. Attach with:");
@@ -152,7 +168,7 @@ pub fn parse_report<'a>(lines: impl IntoIterator<Item = &'a str>) -> TestReport 
     let mut report = TestReport::default();
     for line in lines {
         let line = line.trim_end();
-        if line.contains("*** KEEL KERNEL PANIC ***") {
+        if line.contains(PANIC_BANNER) {
             report.panicked = true;
         }
         let Some(rest) = line.strip_prefix("TEST ") else {
@@ -253,12 +269,12 @@ struct Capture {
 /// timeout expires, or `stop` returns true for a line. QEMU is always
 /// killed before this returns, so nothing is left running.
 fn boot_headless(
-    esp: &Path,
+    disk: BootDisk,
     options: &RunOptions,
     timeout: Duration,
     stop: impl Fn(&str) -> bool,
 ) -> Result<Capture> {
-    let mut command = base_command(esp, options)?;
+    let mut command = base_command(disk, options)?;
     command.args(["-display", "none", "-monitor", "none"]);
     command.stdin(Stdio::null()).stdout(Stdio::piped());
 
@@ -320,7 +336,7 @@ fn print_tail(lines: &[String]) {
 fn test_phase(phase: u32, options: &RunOptions, timeout: Duration) -> Result<()> {
     println!("xtask: ---- phase {phase} ----");
     let esp = build::build(BootMode::Test(phase))?;
-    let capture = boot_headless(&esp, options, timeout, |_| false)?;
+    let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
     let result = if capture.timed_out {
         Err(format!("timed out after {} s", timeout.as_secs()))
     } else {
@@ -387,7 +403,7 @@ fn test_tampered_boot(options: &RunOptions, timeout: Duration) -> Result<()> {
             }
             util::write(&esp.join(path), &data)?;
         }
-        let capture = boot_headless(&esp, options, timeout, |line| {
+        let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |line| {
             line.contains(LIMINE_HASH_PANIC) || line.starts_with("Keel ")
         })?;
         match tamper_verdict(&capture.lines) {
@@ -399,6 +415,32 @@ fn test_tampered_boot(options: &RunOptions, timeout: Duration) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Boots a raw disk image headless and succeeds once a serial line starts
+/// with `marker`. Fails on a kernel panic, on QEMU exiting first, or after
+/// the default timeout.
+pub fn boot_image_until(image: &Path, options: &RunOptions, marker: &str) -> Result<()> {
+    if !image.is_file() {
+        return Err(format!("{} is not a file", image.display()).into());
+    }
+    let image = image.canonicalize()?;
+    let timeout = Duration::from_secs(180);
+    let capture = boot_headless(BootDisk::Image(&image), options, timeout, |line| {
+        line.starts_with(marker) || line.contains(PANIC_BANNER)
+    })?;
+    let reached = capture.lines.iter().any(|line| line.starts_with(marker));
+    let panicked = capture.lines.iter().any(|line| line.contains(PANIC_BANNER));
+    if reached && !panicked {
+        for line in capture.lines.iter().filter(|l| l.starts_with("boot: ")) {
+            println!("  {line}");
+        }
+        println!("xtask: image booted: \"{marker}\" seen on serial");
+        Ok(())
+    } else {
+        print_tail(&capture.lines);
+        Err(format!("image did not reach \"{marker}\"").into())
+    }
 }
 
 /// `cargo xtask test [--phase N]`.

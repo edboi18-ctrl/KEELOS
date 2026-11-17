@@ -3,11 +3,15 @@
 //! It is plain Rust so that every command behaves the same in PowerShell
 //! on Windows and in a shell on Linux (spec section 1, rule 5).
 
+mod audit;
 mod build;
 mod cpio;
+mod dist;
+mod fetch;
 mod limine;
 mod qemu;
 mod util;
+mod verify;
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -23,6 +27,15 @@ Commands:
                             Build, then boot in QEMU with serial on stdio
   test  [--phase N] [--kvm] [--accel NAME] [--timeout SECONDS]
                             Build, boot headless, run the in-guest tests
+  dist  [--version V] [--allow-dirty]
+                            Build release artifacts into target/dist
+  boot-check <image> [--kvm] [--accel NAME]
+                            Boot a raw disk image headless; pass when the
+                            kernel finishes a normal boot
+  verify <file>             Check a downloaded release artifact: SHA256SUMS
+                            entry and GitHub build-provenance attestation
+  audit [--offline]         Format, lint, unsafe count, licenses, workflow
+                            policy, dependency advisories
 
 Environment:
   KEEL_QEMU                 Path of qemu-system-x86_64, if not on PATH
@@ -111,6 +124,31 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
             qemu::test(phase, &options, timeout)
+        }
+        "dist" => {
+            let version = take_value(&mut args, "--version")?;
+            let allow_dirty = take_flag(&mut args, "--allow-dirty");
+            no_extra_args(&args)?;
+            dist::dist(version, allow_dirty)?;
+            Ok(())
+        }
+        "boot-check" => {
+            let options = run_options(&mut args)?;
+            if args.len() != 1 {
+                return Err("boot-check needs exactly one image path".into());
+            }
+            dist::boot_check(std::path::Path::new(&args[0]), &options)
+        }
+        "verify" => {
+            if args.len() != 1 {
+                return Err("verify needs exactly one file path".into());
+            }
+            verify::verify(std::path::Path::new(&args[0]))
+        }
+        "audit" => {
+            let offline = take_flag(&mut args, "--offline");
+            no_extra_args(&args)?;
+            audit::audit(offline)
         }
         "help" | "--help" | "-h" => {
             print!("{USAGE}");

@@ -13,6 +13,10 @@ publish = false
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+# Spec section 1, rule 7: every `unsafe` block states its invariant.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
 # SR-17: integer-overflow checks stay on in release, panics abort, and frame
 # pointers are kept (see .cargo/config.toml) for backtraces.
 [profile.dev]

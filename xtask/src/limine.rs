@@ -7,14 +7,12 @@
 //! From then on the build trusts only the SHA-256 values in this file, so
 //! a changed or substituted download fails the build.
 //!
-//! The download and extraction use `curl` and `tar`. Both ship with
-//! Windows 10 (1803 and later) and with every Linux CI image, so this
-//! needs no Unix tools on the Windows host (ADR 0001).
+//! Downloading and extraction are in `fetch.rs` (ADR 0001).
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
-use crate::util::{self, Result};
+use crate::fetch;
+use crate::util::Result;
 
 pub const VERSION: &str = "12.9.6";
 const ARCHIVE_URL: &str =
@@ -23,11 +21,11 @@ const ARCHIVE_SHA256: &str = "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb41
 
 /// Files taken from the archive, with the SHA-256 each must have.
 const BOOTX64_EFI: (&str, &str) = (
-    "BOOTX64.EFI",
+    "limine-binary/BOOTX64.EFI",
     "e486ae7abd7d5b88f98f43cfd6e8f9057ff975ecd667dfb33f1581de36e00982",
 );
 const LICENSE: (&str, &str) = (
-    "LICENSE",
+    "limine-binary/LICENSE",
     "5372ada69c825812b93b9e3f222253be3919bed3489372e797c9a85cd4e37fbc",
 );
 
@@ -39,73 +37,28 @@ pub struct Limine {
     pub license: PathBuf,
 }
 
-fn verified(path: &Path, expected_sha256: &str) -> bool {
-    std::fs::read(path).is_ok_and(|data| util::sha256_hex(&data) == expected_sha256)
-}
-
 /// Returns the verified Limine files, downloading the pinned release into
 /// `target/keel-cache/` if they are not already there.
 pub fn ensure() -> Result<Limine> {
-    let cache = util::workspace_root()
-        .join("target")
-        .join("keel-cache")
-        .join(format!("limine-{VERSION}"));
-    let unpacked = cache.join("limine-binary");
+    let cache = fetch::cache_dir(&format!("limine-{VERSION}"));
     let limine = Limine {
-        bootx64_efi: unpacked.join(BOOTX64_EFI.0),
-        license: unpacked.join(LICENSE.0),
+        bootx64_efi: cache.join(BOOTX64_EFI.0),
+        license: cache.join(LICENSE.0),
     };
-    if verified(&limine.bootx64_efi, BOOTX64_EFI.1) && verified(&limine.license, LICENSE.1) {
+    let all_verified = || {
+        fetch::verified(&limine.bootx64_efi, BOOTX64_EFI.1)
+            && fetch::verified(&limine.license, LICENSE.1)
+    };
+    if all_verified() {
         return Ok(limine);
     }
-
-    std::fs::create_dir_all(&cache)?;
     let archive = cache.join("limine-binary.tar.gz");
-    if !verified(&archive, ARCHIVE_SHA256) {
-        println!("xtask: downloading Limine {VERSION}");
-        util::run(
-            Command::new("curl")
-                .args(["--fail", "--location", "--silent", "--show-error"])
-                .args(["--proto", "=https", "--tlsv1.2"])
-                .arg("--output")
-                .arg(&archive)
-                .arg(ARCHIVE_URL),
-        )
-        .map_err(|e| {
-            format!("{e}\nhint: `curl` must be on PATH (it ships with Windows 10 1803+)")
-        })?;
-        let actual = util::sha256_hex(&util::read(&archive)?);
-        if actual != ARCHIVE_SHA256 {
-            // Do not leave an unverified file where a later run could
-            // mistake it for a good one.
-            let _ = std::fs::remove_file(&archive);
-            return Err(format!(
-                "Limine archive checksum mismatch\n  expected {ARCHIVE_SHA256}\n  actual   {actual}"
-            )
-            .into());
-        }
-    }
-
-    // Extract only the two files we use. The archive was verified above,
-    // so its member paths are the known upstream ones.
-    util::run(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&cache)
-            .arg(format!("limine-binary/{}", BOOTX64_EFI.0))
-            .arg(format!("limine-binary/{}", LICENSE.0)),
-    )
-    .map_err(|e| format!("{e}\nhint: `tar` must be on PATH (it ships with Windows 10 1803+)"))?;
-
-    for (path, (name, sha256)) in [
-        (&limine.bootx64_efi, BOOTX64_EFI),
-        (&limine.license, LICENSE),
-    ] {
-        if !verified(path, sha256) {
-            return Err(format!("Limine file {name} does not match its pinned SHA-256").into());
-        }
+    fetch::download(ARCHIVE_URL, ARCHIVE_SHA256, &archive)?;
+    // The archive was verified above, so its member paths are the known
+    // upstream ones. Only the two files we use are extracted.
+    fetch::extract(&archive, &cache, &[BOOTX64_EFI.0, LICENSE.0])?;
+    if !all_verified() {
+        return Err("extracted Limine files do not match their pinned SHA-256".into());
     }
     Ok(limine)
 }
