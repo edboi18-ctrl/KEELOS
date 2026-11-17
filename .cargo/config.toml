@@ -1,0 +1,11 @@
+[alias]
+xtask = "run --quiet -p xtask --"
+
+# SR-29: every crate is vendored under vendor/ (created by `cargo vendor`),
+# so builds need no network access and cannot pick up a changed upstream.
+# Cargo checks each vendored file against vendor/<crate>/.cargo-checksum.json.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
