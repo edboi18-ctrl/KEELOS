@@ -1,7 +1,7 @@
 //! Running the boot tree in QEMU: `cargo xtask run` and `cargo xtask test`
 //! (P0-T6).
 
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -258,6 +258,14 @@ pub fn strip_ansi(line: &str) -> String {
     out
 }
 
+/// Serial output as the reader thread reports it.
+enum SerialEvent {
+    /// A complete line (or the last, unterminated one at end of output).
+    Line(String),
+    /// The current line so far; more may follow.
+    Partial(String),
+}
+
 /// What a headless boot produced.
 struct Capture {
     lines: Vec<String>,
@@ -280,13 +288,38 @@ fn boot_headless(
 
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("stdout was piped");
-    let (sender, receiver) = mpsc::channel::<String>();
+    // The reader sends each finished line, and also a snapshot of the
+    // unfinished line after every read. Firmware and Limine can print a
+    // message and then wait for a key without ever ending the line, and
+    // the stop predicate must still see it.
+    let (sender, receiver) = mpsc::channel::<SerialEvent>();
     let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).split(b'\n').map_while(|l| l.ok()) {
-            let line = strip_ansi(&String::from_utf8_lossy(&line));
-            if sender.send(line.trim_end().to_string()).is_err() {
-                break;
+        let mut stdout = stdout;
+        let mut pending = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let clean = |bytes: &[u8]| {
+            strip_ansi(&String::from_utf8_lossy(bytes))
+                .trim_end()
+                .to_string()
+        };
+        loop {
+            let read = match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            pending.extend_from_slice(&chunk[..read]);
+            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                if sender.send(SerialEvent::Line(clean(&line))).is_err() {
+                    return;
+                }
             }
+            if !pending.is_empty() && sender.send(SerialEvent::Partial(clean(&pending))).is_err() {
+                return;
+            }
+        }
+        if !pending.is_empty() {
+            let _ = sender.send(SerialEvent::Line(clean(&pending)));
         }
     });
 
@@ -298,9 +331,14 @@ fn boot_headless(
     };
     let mut stopped = false;
     loop {
-        while let Ok(line) = receiver.try_recv() {
-            stopped |= stop(&line);
-            capture.lines.push(line);
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                SerialEvent::Line(line) => {
+                    stopped |= stop(&line);
+                    capture.lines.push(line);
+                }
+                SerialEvent::Partial(text) => stopped |= stop(&text),
+            }
         }
         if stopped {
             break;
@@ -320,7 +358,14 @@ fn boot_headless(
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
-    capture.lines.extend(receiver.try_iter());
+    // After the kill the reader hits end-of-file and sends what was left
+    // of an unfinished line as a final `Line`.
+    capture
+        .lines
+        .extend(receiver.try_iter().filter_map(|event| match event {
+            SerialEvent::Line(line) => Some(line),
+            SerialEvent::Partial(_) => None,
+        }));
     Ok(capture)
 }
 

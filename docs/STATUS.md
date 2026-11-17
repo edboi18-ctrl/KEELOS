@@ -17,7 +17,7 @@ need the owner (see "Open items").
 | P0-T4 | COM1 serial, `kprintln!`, panic handler | Done |
 | P0-T5 | Framebuffer text console mirroring serial | Done |
 | P0-T6 | `cargo xtask test` harness | Done |
-| P0-T7 | `ci.yml` | Written; first CI run pending |
+| P0-T7 | `ci.yml` | Done: run 44011447886 on the working branch passed both jobs (audit and host tests; QEMU with KVM on a hosted runner). Not yet run on `main`. |
 | P0-T8 | `xtask dist`, `release.yml`, `xtask verify` | Written; artifacts build and the disk image boots in OVMF. The attestation path can only be exercised by a real tagged release. |
 | P0-T9 | Repository setup checklist | Written: `docs/REPOSITORY-SETUP.md`. Owner to carry out. |
 | P0-S1 | Verified downloads; BLAKE2B hashes in `limine.conf` | Done, with a tamper test for kernel and initramfs |
@@ -49,8 +49,19 @@ entry point, which the audit allows by exact file and count.
 
 ## Image hashes
 
-Not recorded yet. They are meaningful once CI builds a commit on `main`;
-byte-for-byte reproducibility is a Phase 4 gate (SR-30).
+Version 0.0.0 at commit `51c60c0`, built three times with identical
+results: in the development container, in a fresh clone at a different
+path, and on the GitHub-hosted runner.
+
+```
+d52347bc7fb22519dd3c1e36b26ee5b70b8c24e3bc7d6f41c35388f2d270d531  keel-0.0.0-esp.zip
+d4481c9e8ed0bb6ba88715098941783c9ab54ff5c3c46398a5614cb5b42ab728  keel-0.0.0.img
+54e902d64c8bb3a7faa5460464e398e8bf9bb66c706065cb95548ead8dcb3f38  keel-0.0.0-notices.zip
+```
+
+These are for a working-branch commit, not a release. The formal
+reproducibility gate (two independent CI jobs comparing hashes) is
+Phase 4 work (SR-30).
 
 ## Decisions made by the owner (2026-11-17)
 
