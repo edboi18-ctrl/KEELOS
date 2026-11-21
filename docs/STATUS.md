@@ -3,11 +3,18 @@
 Updated at the end of every working session so a fresh session can
 resume from here.
 
-## Current phase: 0 (toolchain and first boot)
+## Phase 0 (toolchain and first boot): ACCEPTED 2026-11-21
 
-Implemented and passing locally on Linux. **Not yet accepted**: the gate
-is judged on CI from a commit on `main` (spec section 15), and two items
-need the owner (see "Open items").
+- Acceptance P0: `cargo xtask test --phase 0` passes locally on Linux,
+  on the owner's Windows PC, and in CI.
+- CI acceptance P0: `ci` run 44946991701 passed on `main` at
+  `1502eb9` (the merge of PR #1). Tag `v0.0.1` on that commit ran
+  `release` (run 44948575379), which published the zip, the disk image,
+  the notices and `SHA256SUMS` with a build-provenance attestation. On
+  the owner's PC, `cargo xtask verify` reported all three artifacts
+  verified (checksum and attestation from `release.yml@refs/tags/v0.0.1`
+  on a GitHub-hosted runner).
+- The owner carried out `docs/REPOSITORY-SETUP.md`, sections 1 to 6.
 
 | ID | Task | Status |
 | --- | --- | --- |
@@ -82,19 +89,16 @@ entry point, which the audit allows by exact file and count.
 
 ## Image hashes
 
-Version 0.0.0 at commit `51c60c0`, built three times with identical
-results: in the development container, in a fresh clone at a different
-path, and on the GitHub-hosted runner.
+Release v0.0.1 (commit `1502eb9`, built by CI):
 
 ```
-d52347bc7fb22519dd3c1e36b26ee5b70b8c24e3bc7d6f41c35388f2d270d531  keel-0.0.0-esp.zip
-d4481c9e8ed0bb6ba88715098941783c9ab54ff5c3c46398a5614cb5b42ab728  keel-0.0.0.img
-54e902d64c8bb3a7faa5460464e398e8bf9bb66c706065cb95548ead8dcb3f38  keel-0.0.0-notices.zip
+d561819723b1fb0c21816f0d87be2bce42d27a7f64bbcb206b9e867060af756b  keel-0.0.1-esp.zip
+a658ffbdad33cb31a3bdec9d3a4cabc9ea1ba0f802a3066669317ed8c13b4307  keel-0.0.1.img
+54e902d64c8bb3a7faa5460464e398e8bf9bb66c706065cb95548ead8dcb3f38  keel-0.0.1-notices.zip
 ```
 
-These are for a working-branch commit, not a release. The formal
-reproducibility gate (two independent CI jobs comparing hashes) is
-Phase 4 work (SR-30).
+The formal reproducibility gate (two independent CI jobs comparing
+hashes) is Phase 4 work (SR-30).
 
 ## Decisions made by the owner (2026-11-17)
 
@@ -124,17 +128,13 @@ Phase 4 work (SR-30).
 
 ## Open items for the owner
 
-1. ~~Run on Windows.~~ Done 2026-11-21.
-2. **Repository settings**: `docs/REPOSITORY-SETUP.md`.
-3. **Merge to `main`**: open a pull request from the working branch when
-   CI is green, so the Phase 0 gate can be judged on `main`.
-4. **Tagged release** (after 2 and 3): push a `v0.0.1` tag, then run
-   `cargo xtask verify` on the downloaded files. This is the last part of
-   "CI acceptance P0".
-5. Still open from the spec: which video output is in use, whether a USB
+1. Still open from the spec: which video output is in use, whether a USB
    mouse is available, whether a serial connector is on the back panel
-   (a UART does answer at COM1); the
-   first third-party GUI target after Notepad; any time budget per phase.
+   (a UART does answer at COM1); the first third-party GUI target after
+   Notepad; any time budget per phase.
+2. The `gh` login on the owner's PC uses the CLI's default scopes
+   (`repo`, `workflow`, `gist`, `read:org`). Verifying releases of a
+   public repository needs none of them; that is the owner's call.
 
 ## Notes
 
