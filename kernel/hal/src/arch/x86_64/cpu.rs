@@ -284,3 +284,19 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
             in("edx") (value >> 32) as u32, options(nostack, preserves_flags));
     }
 }
+
+/// Removes the TLB entry for the page containing `virt` on this CPU.
+pub fn invalidate_page(virt: u64) {
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: CPL 0; `{}` holds a linear address.
+    // Instruction: `invlpg [{}]` invalidates TLB entries and paging-
+    //   structure caches for the page containing the address (SDM Vol. 2A
+    //   "INVLPG"). It does not access the memory at that address. Flags are
+    //   not affected; the stack is not used.
+    // Exit state: the next access to that page walks the page tables.
+    // SAFETY: invalidating a TLB entry can only make translations more
+    // up to date; it has no other effect.
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+    }
+}

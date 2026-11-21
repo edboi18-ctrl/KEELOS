@@ -272,6 +272,7 @@ fn phase1(t: &mut Runner) {
     );
     phase1_frames(t);
     phase1_paging(t);
+    phase1_heap(t);
     t.check(
         "cpu.interrupts_off",
         !cpu::interrupts_enabled(),
@@ -425,4 +426,65 @@ pub fn phase1_paging(t: &mut Runner) {
         protections,
         "NX, WP, and every reported one of SMEP, SMAP and UMIP are on (SR-13)",
     );
+}
+
+/// P1-T5: the kernel heap behind `alloc`.
+pub fn phase1_heap(t: &mut Runner) {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::fmt::Write;
+
+    // Many small objects of mixed sizes, kept alive together.
+    let mut numbers: Vec<u64> = Vec::new();
+    for i in 0..20_000u64 {
+        numbers.push(i * 3);
+    }
+    let mut map = BTreeMap::new();
+    for i in 0..2_000u32 {
+        let mut text = String::new();
+        let _ = write!(text, "entry-{i}");
+        map.insert(i, (Box::new(i ^ 0x5A5A), text));
+    }
+    let numbers_ok = numbers.iter().sum::<u64>() == 3 * (19_999 * 20_000 / 2);
+    let map_ok = map.len() == 2_000
+        && map.iter().all(|(k, (b, s))| {
+            **b == k ^ 0x5A5A
+                && s.strip_prefix("entry-").and_then(|n| n.parse::<u32>().ok()) == Some(*k)
+        });
+    t.check(
+        "heap.collections",
+        numbers_ok && map_ok,
+        "Vec, Box, String and BTreeMap work with 22,000 live objects",
+    );
+    drop(map);
+
+    // A large allocation gets its own pages, non-executable, with an
+    // unmapped page after it, and returns its frames when freed.
+    const LARGE: usize = 1 << 20;
+    let before = memory::free_frames();
+    let block: Vec<u8> = alloc::vec![0xAB; LARGE];
+    let start = block.as_ptr() as u64;
+    let after_alloc = memory::free_frames();
+    let rights_ok = paging::translate(start)
+        .is_some_and(|t| t.flags.writable && !t.flags.executable && !t.flags.user)
+        && paging::translate(start + LARGE as u64 - 1).is_some()
+        && paging::translate(start + LARGE as u64).is_none()
+        && (paging::KERNEL_HEAP_BASE..paging::KERNEL_HEAP_BASE + paging::KERNEL_HEAP_SIZE)
+            .contains(&start);
+    let content_ok = block.iter().all(|&b| b == 0xAB);
+    drop(block);
+    let after_free = memory::free_frames();
+    let pages = LARGE / 4096;
+    t.check(
+        "heap.large",
+        rights_ok
+            && content_ok
+            && before - after_alloc >= pages
+            && after_free >= before.saturating_sub(4)
+            && paging::translate(start).is_none(),
+        "1 MiB allocation: own RW+NX pages, guard page after, frames returned and unmapped on free",
+    );
+    drop(numbers);
 }

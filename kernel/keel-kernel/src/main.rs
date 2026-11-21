@@ -3,6 +3,8 @@
 #![no_main]
 #![deny(unsafe_code)]
 
+extern crate alloc;
+
 mod selftest;
 
 use core::panic::PanicInfo;

@@ -196,6 +196,31 @@ pub fn map<A: TableAccess>(
     Ok(())
 }
 
+/// Removes the 4 KiB mapping at `virt` and returns the physical address it
+/// pointed to. Intermediate tables are kept. The caller must invalidate
+/// the TLB entry for `virt` afterwards. Returns `None` if nothing (or a
+/// 2 MiB page) is mapped there.
+pub fn unmap_small<A: TableAccess>(access: &mut A, root: Frame, virt: u64) -> Option<u64> {
+    if !is_canonical(virt) || !virt.is_multiple_of(PageSize::Small.bytes()) {
+        return None;
+    }
+    let mut table = root;
+    for level in 0..3 {
+        let entry = access.table(table)[index(virt, level)];
+        if entry & PRESENT == 0 || (level > 0 && entry & HUGE != 0) {
+            return None;
+        }
+        table = Frame::containing(entry & ADDRESS_MASK);
+    }
+    let slot = &mut access.table(table)[index(virt, 3)];
+    if *slot & PRESENT == 0 {
+        return None;
+    }
+    let phys = *slot & ADDRESS_MASK;
+    *slot = 0;
+    Some(phys)
+}
+
 /// A resolved mapping with its effective rights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Translation {
@@ -665,6 +690,28 @@ mod tests {
         map(&mut t, root, 0x40_0000, 0x1000, PageSize::Small, user).unwrap();
         assert!(translate(&mut t, root, 0x40_0000).unwrap().flags.user);
         assert!(!translate(&mut t, root, KERNEL).unwrap().flags.user);
+    }
+
+    #[test]
+    fn unmapping_removes_only_small_pages() {
+        let (mut t, root) = HeapTables::new();
+        map(&mut t, root, KERNEL, 0x5000, PageSize::Small, Flags::DATA).unwrap();
+        map(
+            &mut t,
+            root,
+            KERNEL + 0x20_0000,
+            0x20_0000,
+            PageSize::Large,
+            Flags::DATA,
+        )
+        .unwrap();
+        assert_eq!(unmap_small(&mut t, root, KERNEL), Some(0x5000));
+        assert_eq!(translate(&mut t, root, KERNEL), None);
+        assert_eq!(unmap_small(&mut t, root, KERNEL), None);
+        assert_eq!(unmap_small(&mut t, root, KERNEL + 0x20_0000), None);
+        assert!(translate(&mut t, root, KERNEL + 0x20_0000).is_some());
+        // The slot can be reused.
+        map(&mut t, root, KERNEL, 0x6000, PageSize::Small, Flags::DATA).unwrap();
     }
 
     #[test]

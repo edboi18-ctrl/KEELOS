@@ -5,11 +5,18 @@ spinlock. Update this file whenever a lock is added.
 
 | Order | Lock | Crate | Protects |
 | --- | --- | --- | --- |
-| 1 | `console::SERIAL` | `keel-hal` | The COM1 UART |
-| 2 | `console::FRAMEBUFFER` | `keel-hal` | The framebuffer text console |
-| 3 | `memory::FRAMES` | `keel-hal` | The physical frame allocator. Never held while printing; nothing else is locked while it is held. |
+| 4 | `console::SERIAL` | `keel-hal` | The COM1 UART. Takes no lock except `FRAMEBUFFER`. |
+| 5 | `console::FRAMEBUFFER` | `keel-hal` | The framebuffer text console |
+| 1 | `heap::KERNEL_HEAP` | `keel-hal` | Kernel heap free lists. May take `paging::TABLES` (to map pages), which takes `memory::FRAMES`. |
+| 2 | `paging::TABLES` | `keel-hal` | The kernel's page tables after boot. May take `memory::FRAMES`. |
+| 3 | `memory::FRAMES` | `keel-hal` | The physical frame allocator. Takes no other lock. |
 
 Notes:
+
+- The console locks are independent of the memory locks: printing never
+  allocates, and no memory code prints while holding a memory lock.
+- Never allocate from an interrupt or exception handler: the interrupted
+  code may hold the heap lock. The fatal-exception path does not allocate.
 
 - Interrupts are disabled for the whole of Phase 0, so neither lock can
   be re-entered from an interrupt handler. Phase 1 (interrupts on) must

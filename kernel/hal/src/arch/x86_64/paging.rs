@@ -65,6 +65,10 @@ impl TableAccess for DirectMapTables {
 /// Physical address of the active PML4, or 0 before `init`.
 static ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// Serialises every change to, and walk of, the kernel's page tables after
+/// `init`. Lock order: see docs/locking.md.
+static TABLES: spin::Mutex<()> = spin::Mutex::new(());
+
 /// What `init` set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagingReport {
@@ -236,13 +240,95 @@ pub fn translate(virt: u64) -> Option<Translation> {
     if root == 0 {
         return None;
     }
+    let _guard = TABLES.lock();
     paging::translate(&mut DirectMapTables, Frame::containing(root), virt)
 }
 
 /// Walks the kernel's page tables (the page-table self-test).
 pub fn walk() -> Option<WalkSummary> {
     let root = ROOT.load(Ordering::Acquire);
-    (root != 0).then(|| paging::walk(&mut DirectMapTables, Frame::containing(root), |_, _| {}))
+    if root == 0 {
+        return None;
+    }
+    let _guard = TABLES.lock();
+    Some(paging::walk(
+        &mut DirectMapTables,
+        Frame::containing(root),
+        |_, _| {},
+    ))
+}
+
+/// Start of the kernel-heap virtual region. It lies outside both the
+/// direct map (which starts at Limine's HHDM offset and spans physical
+/// memory, at most 1 TiB here) and the kernel image (top 2 GiB).
+pub const KERNEL_HEAP_BASE: u64 = 0xffff_c000_0000_0000;
+/// Size of the kernel-heap virtual region (64 GiB).
+pub const KERNEL_HEAP_SIZE: u64 = 64 << 30;
+
+/// Maps fresh zeroed frames, read+write and not executable, at the 4 KiB
+/// pages `[virt, virt + pages * 4096)` inside the kernel-heap region.
+/// On failure nothing stays mapped.
+pub fn map_heap_pages(virt: u64, pages: u64) -> Result<(), paging::MapError> {
+    let in_region = virt >= KERNEL_HEAP_BASE
+        && pages
+            .checked_mul(PAGE)
+            .and_then(|len| virt.checked_add(len))
+            .is_some_and(|end| end <= KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE);
+    let root = ROOT.load(Ordering::Acquire);
+    // Before `init` there are no kernel tables to map into.
+    if !in_region || root == 0 {
+        return Err(paging::MapError::Misaligned);
+    }
+    let root = Frame::containing(root);
+    let _guard = TABLES.lock();
+    for i in 0..pages {
+        let page = virt + i * PAGE;
+        let result = memory::allocate_zeroed()
+            .ok_or(paging::MapError::OutOfMemory)
+            .and_then(|frame| {
+                paging::map(
+                    &mut DirectMapTables,
+                    root,
+                    page,
+                    frame.address(),
+                    PageSize::Small,
+                    Flags::DATA,
+                )
+                .inspect_err(|_| {
+                    let _ = memory::release(frame);
+                })
+            });
+        if let Err(error) = result {
+            for j in 0..i {
+                unmap_locked(root, virt + j * PAGE);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Unmaps heap pages mapped by `map_heap_pages` and frees their frames.
+pub fn unmap_heap_pages(virt: u64, pages: u64) {
+    let root = ROOT.load(Ordering::Acquire);
+    if root == 0 {
+        return;
+    }
+    let root = Frame::containing(root);
+    let _guard = TABLES.lock();
+    for i in 0..pages {
+        let page = virt + i * PAGE;
+        if (KERNEL_HEAP_BASE..KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE).contains(&page) {
+            unmap_locked(root, page);
+        }
+    }
+}
+
+fn unmap_locked(root: Frame, page: u64) {
+    if let Some(phys) = paging::unmap_small(&mut DirectMapTables, root, page) {
+        cpu::invalidate_page(page);
+        let _ = memory::release(Frame::containing(phys));
+    }
 }
 
 /// The kernel image's virtual layout: start, rodata, data, end.
