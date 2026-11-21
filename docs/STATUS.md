@@ -11,7 +11,7 @@ need the owner (see "Open items").
 
 | ID | Task | Status |
 | --- | --- | --- |
-| P0-T1 | Workspace, `rust-toolchain.toml`, xtask skeleton | Done on Linux; Windows run not yet verified |
+| P0-T1 | Workspace, `rust-toolchain.toml`, xtask skeleton | Done. Built on the owner's Windows PC after the line-ending fix (`.gitattributes`). |
 | P0-T2 | Pinned Limine download with checksum; `target/esp` | Done (Limine 12.9.6) |
 | P0-T3 | Limine protocol entry; higher-half linker script | Done (own bindings, ADR 0002; base revision 6) |
 | P0-T4 | COM1 serial, `kprintln!`, panic handler | Done |
@@ -34,6 +34,23 @@ need the owner (see "Open items").
   boots under OVMF.
 
 Known failing tests: none.
+
+## First boot on the target machine (2026-11-21)
+
+The owner built the image on Windows, wrote it to a USB stick, and booted
+the OptiPlex 3060 (Secure Boot off). Not a phase gate, since bare metal
+is Phase 6, but it confirms the boot path on real UEFI firmware. The
+screen showed every boot line through `Keel: nothing more to run yet;
+halting.`:
+
+- Limine base revision 6 honoured.
+- Framebuffer console 120x67 characters, so the GOP mode is 1920x1080
+  (16-pixel cells).
+- 39 memory-map regions, 7679 MiB usable (8 GB installed).
+- ACPI RSDP found; initramfs module loaded.
+- `serial COM1 ok`: a 16550 UART answered the loopback test at I/O port
+  0x3F8. That shows the UART exists in the chipset or Super I/O; it does
+  not show a serial connector is fitted on the back panel.
 
 ## `unsafe` budget
 
@@ -91,11 +108,7 @@ Phase 4 work (SR-30).
 
 ## Open items for the owner
 
-1. **Run on Windows.** From PowerShell in a clean checkout:
-   `cargo xtask test`. Needs QEMU for Windows installed. Everything was
-   developed and tested on Linux only; the Windows paths (QEMU and
-   firmware discovery, `curl.exe`/`tar.exe`) are written from
-   documentation and unverified.
+1. ~~Run on Windows.~~ Done 2026-11-21.
 2. **Repository settings**: `docs/REPOSITORY-SETUP.md`.
 3. **Merge to `main`**: open a pull request from the working branch when
    CI is green, so the Phase 0 gate can be judged on `main`.
@@ -103,7 +116,8 @@ Phase 4 work (SR-30).
    `cargo xtask verify` on the downloaded files. This is the last part of
    "CI acceptance P0".
 5. Still open from the spec: which video output is in use, whether a USB
-   mouse is available, whether the optional serial port is fitted; the
+   mouse is available, whether a serial connector is on the back panel
+   (a UART does answer at COM1); the
    first third-party GUI target after Notepad; any time budget per phase.
 
 ## Notes
