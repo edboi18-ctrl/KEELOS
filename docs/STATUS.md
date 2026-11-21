@@ -32,8 +32,8 @@ resume from here.
 
 ## Phase 1 (kernel core): in progress
 
-Started 2026-11-21 at the owner's request, on the working branch, while
-the Phase 0 pull request (#1) awaits the owner's merge.
+Started 2026-11-21 at the owner's request. P1-T1 to P1-T3 were merged
+to `main` with PR #1.
 
 | ID | Task | Status |
 | --- | --- | --- |
