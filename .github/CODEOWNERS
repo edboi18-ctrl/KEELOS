@@ -1,0 +1,3 @@
+# Workflow files build the images that boot a real machine. Changes to
+# them are reviewed and merged only by the repository owner (SR-36).
+/.github/ @edboi18-ctrl

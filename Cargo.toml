@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["xtask", "kernel/hal", "kernel/core", "kernel/keel-kernel"]
+# Plain `cargo build` / `cargo test` on the host only touch host-buildable
+# crates. The kernel binary is built for x86_64-unknown-none by `cargo xtask`.
+default-members = ["xtask", "kernel/hal", "kernel/core"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# Spec section 1, rule 7: every `unsafe` block states its invariant.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+# SR-17: integer-overflow checks stay on in release, panics abort, and frame
+# pointers are kept (see .cargo/config.toml) for backtraces.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+debug = "line-tables-only"
+codegen-units = 1

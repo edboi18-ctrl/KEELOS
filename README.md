@@ -17,3 +17,22 @@ The kernel and native user-space code are licensed under either of
 
 at your option. Code derived from Wine, kept under `wine/`, is licensed
 LGPL-2.1-or-later.
+
+## Building and running
+
+Requirements: [rustup](https://rustup.rs) (the pinned toolchain installs
+itself from `rust-toolchain.toml`) and QEMU. Windows 10 1803 or later, or
+Linux. Every command is the same in PowerShell and in a Unix shell.
+
+```
+cargo xtask build        # kernel + initramfs -> target/esp
+cargo xtask run          # boot in QEMU, serial on the terminal
+cargo xtask test         # headless acceptance tests for completed phases
+cargo xtask audit        # format, lint, unsafe count, licenses, advisories
+cargo xtask dist         # release zip and disk image -> target/dist
+cargo xtask verify FILE  # check a downloaded release before using it
+```
+
+If QEMU or its UEFI firmware is not found, set `KEEL_QEMU` and
+`KEEL_OVMF_CODE` to their full paths. Project status is in
+[docs/STATUS.md](docs/STATUS.md).

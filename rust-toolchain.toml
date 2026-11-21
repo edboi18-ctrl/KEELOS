@@ -1,0 +1,8 @@
+# Pinned toolchain (SR-29). Stable is sufficient: x86_64-unknown-none ships
+# prebuilt core/alloc via rustup, so no nightly build-std is needed.
+# rustup verifies component hashes against the signed channel manifest.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy", "rust-src", "llvm-tools"]
+targets = ["x86_64-unknown-none"]
+profile = "minimal"
