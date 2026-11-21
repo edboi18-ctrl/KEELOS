@@ -325,6 +325,10 @@ pub fn breakpoint_count() -> u64 {
 pub struct FatalException {
     /// Vector number.
     pub vector: u64,
+    /// Error code pushed by the processor (0 for vectors without one).
+    pub error_code: u64,
+    /// CR2 for a page fault: the linear address that faulted.
+    pub fault_address: u64,
     /// Address of the saved TrapFrame, which tells which stack the handler
     /// ran on.
     pub frame_address: u64,
@@ -332,12 +336,16 @@ pub struct FatalException {
 
 static FATAL_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
 static FATAL_FRAME: AtomicU64 = AtomicU64::new(0);
+static FATAL_ERROR_CODE: AtomicU64 = AtomicU64::new(0);
+static FATAL_CR2: AtomicU64 = AtomicU64::new(0);
 
 /// The fatal exception that caused the current panic, if any.
 pub fn last_fatal_exception() -> Option<FatalException> {
     let vector = FATAL_VECTOR.load(Ordering::Acquire);
     (vector != u64::MAX).then(|| FatalException {
         vector,
+        error_code: FATAL_ERROR_CODE.load(Ordering::Relaxed),
+        fault_address: FATAL_CR2.load(Ordering::Relaxed),
         frame_address: FATAL_FRAME.load(Ordering::Relaxed),
     })
 }
@@ -361,13 +369,15 @@ extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
 
 #[cfg(target_os = "none")]
 fn fatal(frame: &TrapFrame) -> ! {
-    FATAL_FRAME.store(frame as *const TrapFrame as u64, Ordering::Relaxed);
-    FATAL_VECTOR.store(frame.vector, Ordering::Release);
     let cr2 = if frame.vector == 14 {
         super::cpu::read_cr2()
     } else {
         0
     };
+    FATAL_FRAME.store(frame as *const TrapFrame as u64, Ordering::Relaxed);
+    FATAL_ERROR_CODE.store(frame.error_code, Ordering::Relaxed);
+    FATAL_CR2.store(cr2, Ordering::Relaxed);
+    FATAL_VECTOR.store(frame.vector, Ordering::Release);
     crate::console::emergency_print(format_args!("{}", Dump { frame, cr2 }));
     panic!(
         "unhandled exception {} at {:#018x}",
@@ -466,4 +476,19 @@ mod tests {
         assert_eq!(ist_for(18), 3);
         assert_eq!(ist_for(14), 0);
     }
+}
+
+/// Page-fault error code bits (SDM Vol. 3 section 7.15, Figure 7-11
+/// "Page-Fault Error Code").
+pub mod page_fault {
+    /// 1: protection violation; 0: page not present.
+    pub const PRESENT: u64 = 1 << 0;
+    /// 1: the access was a write.
+    pub const WRITE: u64 = 1 << 1;
+    /// 1: the access came from user mode.
+    pub const USER: u64 = 1 << 2;
+    /// 1: a reserved bit was set in a paging-structure entry.
+    pub const RESERVED: u64 = 1 << 3;
+    /// 1: the access was an instruction fetch.
+    pub const INSTRUCTION_FETCH: u64 = 1 << 4;
 }

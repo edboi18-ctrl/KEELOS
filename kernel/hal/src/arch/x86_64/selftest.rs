@@ -100,3 +100,52 @@ pub fn trigger_double_fault() -> ! {
         );
     }
 }
+
+/// Writes one byte to the kernel's own text, which must raise #PF with the
+/// present and write bits set: text is mapped read-only and CR0.WP makes
+/// the kernel obey that (SR-12, SR-13; spec section 8, security
+/// acceptance P1 item 3). Never returns.
+pub fn write_to_kernel_text() -> ! {
+    let target = write_to_kernel_text as *const () as u64;
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: kernel page tables active; `{target}` holds the address
+    //   of this function's first instruction, in the read-only text
+    //   segment.
+    // 1. `mov byte ptr [{target}], 0x90` attempts a one-byte store there.
+    //    The PTE has R/W = 0 and CR0.WP = 1, so the CPU raises #PF with
+    //    error code P = 1, W = 1 and CR2 = target (SDM Vol. 3 section 5.6,
+    //    Figure 7-11). The store does not happen.
+    // 2. `ud2` is a backstop: if the store succeeded, #UD ends the test in
+    //    the fatal path with the wrong vector, so the test fails.
+    // Exit state: none; control never returns (`noreturn`).
+    // SAFETY: the store is expected to fault and is only issued from the
+    // `write_kernel_text` self-test scenario, which ends the kernel.
+    unsafe {
+        asm!("mov byte ptr [{target}], 0x90", "ud2", target = in(reg) target, options(noreturn));
+    }
+}
+
+/// One `ret` instruction (opcode C3) placed in writable, non-executable
+/// kernel data.
+#[used]
+static mut DATA_RET: [u8; 16] = [0xC3; 16];
+
+/// Calls into kernel data, which must raise #PF with the instruction-fetch
+/// bit set: data pages carry XD = 1 (SR-12). Never returns.
+pub fn execute_kernel_data() -> ! {
+    let target = &raw const DATA_RET as u64;
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: kernel page tables active, EFER.NXE = 1; `{target}`
+    //   holds the address of DATA_RET in the data segment (XD = 1).
+    // 1. `call {target}` pushes a return address and jumps there. The
+    //    instruction fetch from an XD page raises #PF with P = 1 and I/D = 1,
+    //    CR2 = target (SDM Vol. 3 section 5.6, Figure 7-11).
+    // 2. If the fetch were allowed, the `ret` there would return here and
+    //    `ud2` would end the test with the wrong vector, failing it.
+    // Exit state: none (`noreturn`).
+    // SAFETY: the call is expected to fault and is only issued from the
+    // `execute_data` self-test scenario, which ends the kernel.
+    unsafe {
+        asm!("call {target}", "ud2", target = in(reg) target, options(noreturn));
+    }
+}

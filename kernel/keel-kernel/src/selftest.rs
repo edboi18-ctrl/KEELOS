@@ -11,7 +11,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use keel_hal::arch::x86_64::gdt::{self, IstSlot};
-use keel_hal::arch::x86_64::{cpu, idt, selftest as hw};
+use keel_hal::arch::x86_64::{cpu, idt, paging, selftest as hw};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
 use keel_hal::{console, kprintln, memory};
@@ -39,6 +39,8 @@ pub fn requested_phase(cmdline: &str) -> Option<u32> {
 pub enum Scenario {
     None = 0,
     DoubleFault = 1,
+    WriteKernelText = 2,
+    ExecuteData = 3,
     Unknown = 255,
 }
 
@@ -50,6 +52,8 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
     {
         None => Scenario::None,
         Some("double_fault") => Scenario::DoubleFault,
+        Some("write_kernel_text") => Scenario::WriteKernelText,
+        Some("execute_data") => Scenario::ExecuteData,
         Some(_) => Scenario::Unknown,
     }
 }
@@ -61,18 +65,36 @@ static ACTIVE_SCENARIO: AtomicU8 = AtomicU8::new(Scenario::None as u8);
 /// expected exactly this fatal exception, report PASS and exit QEMU;
 /// otherwise return so the normal panic path reports a failure.
 pub fn judge_expected_fault() {
-    if ACTIVE_SCENARIO.load(Ordering::Relaxed) != Scenario::DoubleFault as u8 {
-        return;
-    }
+    use idt::page_fault::{INSTRUCTION_FETCH, PRESENT, WRITE};
     let Some(fault) = idt::last_fatal_exception() else {
         return;
     };
-    let on_ist1 = idt::ist_containing(fault.frame_address) == Some(IstSlot::DoubleFault);
-    if fault.vector == 8 && on_ist1 {
+    let (name, passed, detail) = match ACTIVE_SCENARIO.load(Ordering::Relaxed) {
+        s if s == Scenario::DoubleFault as u8 => (
+            "idt.double_fault",
+            fault.vector == 8
+                && idt::ist_containing(fault.frame_address) == Some(IstSlot::DoubleFault),
+            "#DF delivered on the IST1 stack",
+        ),
+        s if s == Scenario::WriteKernelText as u8 => (
+            "paging.text_read_only",
+            fault.vector == 14
+                && fault.error_code & (PRESENT | WRITE | INSTRUCTION_FETCH) == PRESENT | WRITE
+                && fault.fault_address == hw::write_to_kernel_text as *const () as u64,
+            "a kernel write to its own text raised #PF (present, write) at the target (SR-12)",
+        ),
+        s if s == Scenario::ExecuteData as u8 => (
+            "paging.data_no_execute",
+            fault.vector == 14
+                && fault.error_code & (PRESENT | INSTRUCTION_FETCH) == PRESENT | INSTRUCTION_FETCH
+                && paging::translate(fault.fault_address).is_some_and(|t| !t.flags.executable),
+            "an instruction fetch from kernel data raised #PF (present, fetch) (SR-12)",
+        ),
+        _ => return,
+    };
+    if passed {
         console::emergency_print(format_args!(
-            "TEST idt.double_fault PASS #DF delivered on the IST1 stack (frame at {:#x})\n\
-             TEST SUMMARY passed=1 failed=0\n",
-            fault.frame_address
+            "TEST {name} PASS {detail}\nTEST SUMMARY passed=1 failed=0\n"
         ));
         exit_qemu(ExitCode::Success);
     }
@@ -109,6 +131,16 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
             hw::trigger_double_fault();
+        }
+        (1, Scenario::WriteKernelText) => {
+            ACTIVE_SCENARIO.store(Scenario::WriteKernelText as u8, Ordering::Relaxed);
+            kprintln!("selftest: writing to kernel text");
+            hw::write_to_kernel_text();
+        }
+        (1, Scenario::ExecuteData) => {
+            ACTIVE_SCENARIO.store(Scenario::ExecuteData as u8, Ordering::Relaxed);
+            kprintln!("selftest: executing kernel data");
+            hw::execute_kernel_data();
         }
         _ => runner.check(
             "selftest.phase",
@@ -239,6 +271,7 @@ fn phase1(t: &mut Runner) {
         "INT3 reaches the handler once and returns with all registers intact",
     );
     phase1_frames(t);
+    phase1_paging(t);
     t.check(
         "cpu.interrupts_off",
         !cpu::interrupts_enabled(),
@@ -317,5 +350,79 @@ pub fn phase1_frames(t: &mut Runner) {
             && memory::release(stale).is_err()
             && memory::with_frame_bytes(stale, |_| ()).is_err(),
         "freeing restores the count; a freed frame can be neither freed again nor read",
+    );
+}
+
+/// P1-T4, SR-12, SR-13, SR-17: the active page tables and CPU protections.
+pub fn phase1_paging(t: &mut Runner) {
+    let walk = paging::walk();
+    t.check(
+        "paging.wx_walk",
+        walk.is_some_and(|w| {
+            w.writable_and_executable == 0 && w.giant_pages == 0 && w.small_pages > 0
+        }),
+        "no page in the kernel's tables is both writable and executable (SR-12)",
+    );
+
+    let [start, rodata, data, end] = paging::kernel_segments();
+    let text = paging::translate(start);
+    let ro = paging::translate(rodata);
+    let rw = paging::translate(data);
+    let segments_ok = text
+        .is_some_and(|t| t.flags.executable && !t.flags.writable && !t.flags.user)
+        && ro.is_some_and(|t| !t.flags.executable && !t.flags.writable)
+        && rw.is_some_and(|t| !t.flags.executable && t.flags.writable)
+        && paging::translate(end - 1).is_some_and(|t| t.flags.writable && !t.flags.executable);
+    t.check(
+        "paging.kernel_segments",
+        segments_ok,
+        "text is read+execute, rodata read-only, data read+write no-execute",
+    );
+
+    let guards = gdt::ist_guard_pages();
+    let guarded = guards.iter().all(|&g| paging::translate(g).is_none())
+        && [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck]
+            .into_iter()
+            .all(|slot| {
+                let r = gdt::ist_stack_range(slot);
+                paging::translate(r.start).is_some_and(|t| t.flags.writable)
+                    && paging::translate(r.end - 1).is_some_and(|t| t.flags.writable)
+            });
+    t.check(
+        "paging.ist_guard_pages",
+        guarded,
+        "each IST stack is mapped and the page below it is not (SR-17)",
+    );
+
+    let alias_hidden = match (paging::translate(start), boot::hhdm_offset()) {
+        (Some(text), Some(hhdm)) => paging::translate(hhdm + text.phys).is_none(),
+        _ => false,
+    };
+    t.check(
+        "paging.no_kernel_alias",
+        alias_hidden,
+        "the kernel image has no writable alias in the direct map",
+    );
+
+    let lower_half_empty = [0u64, 0x1000, 0x40_0000, 0x7fff_ffff_f000]
+        .iter()
+        .all(|&a| paging::translate(a).is_none());
+    t.check(
+        "paging.lower_half_empty",
+        lower_half_empty,
+        "nothing is mapped in the user half of the address space",
+    );
+
+    let features = cpu::features();
+    let cr4 = cpu::read_cr4();
+    let protections = cpu::read_cr0() & cpu::CR0_WP != 0
+        && (cr4 & cpu::CR4_SMEP != 0) == features.smep
+        && (cr4 & cpu::CR4_SMAP != 0) == features.smap
+        && (cr4 & cpu::CR4_UMIP != 0) == features.umip
+        && features.nx;
+    t.check(
+        "cpu.protections",
+        protections,
+        "NX, WP, and every reported one of SMEP, SMAP and UMIP are on (SR-13)",
     );
 }

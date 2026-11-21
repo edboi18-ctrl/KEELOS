@@ -36,7 +36,7 @@ pub const PHASES: &[Phase] = &[
     Phase {
         number: 1,
         complete: false,
-        scenarios: &["double_fault"],
+        scenarios: &["double_fault", "write_kernel_text", "execute_data"],
     },
 ];
 

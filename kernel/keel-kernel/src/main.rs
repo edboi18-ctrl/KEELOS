@@ -9,7 +9,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use keel_hal::arch::x86_64::cpu::halt_forever;
-use keel_hal::arch::x86_64::init_descriptor_tables;
+use keel_hal::arch::x86_64::{init_descriptor_tables, paging};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
 use keel_hal::{console, kprintln, memory};
@@ -68,6 +68,21 @@ extern "C" fn kmain() -> ! {
         Err(error) => panic!("frame allocator setup failed: {error:?}"),
     }
 
+    match paging::init() {
+        Ok(report) => kprintln!(
+            "paging: own tables active; {} x 4 KiB + {} x 2 MiB pages; NX {}, WP on, SMEP {}, SMAP {}, UMIP {}",
+            report.summary.small_pages,
+            report.summary.large_pages,
+            on_off(report.features.nx),
+            on_off(report.features.smep),
+            on_off(report.features.smap),
+            on_off(report.features.umip),
+        ),
+        // Running on the bootloader's tables would mean no W^X and no
+        // guard pages; stop instead (SR-12).
+        Err(error) => panic!("page table setup failed: {error:?}"),
+    }
+
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {
         TEST_MODE.store(true, Ordering::Relaxed);
@@ -81,6 +96,10 @@ extern "C" fn kmain() -> ! {
 
     kprintln!("Keel: nothing more to run yet; halting.");
     halt_forever();
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "unsupported" }
 }
 
 fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {

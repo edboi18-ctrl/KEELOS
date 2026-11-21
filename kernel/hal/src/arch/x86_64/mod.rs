@@ -3,6 +3,8 @@
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+#[cfg(target_os = "none")]
+pub mod paging;
 pub mod port;
 #[cfg(target_os = "none")]
 pub mod selftest;

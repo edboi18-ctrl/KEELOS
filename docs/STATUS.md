@@ -40,15 +40,29 @@ to `main` with PR #1.
 | P1-T1 | GDT, TSS with RSP0 and IST stacks | Done. Linux-compatible selectors; no 32-bit user code segment; no I/O bitmap (SR-9). IST stacks lack guard pages until P1-T4. |
 | P1-T2 | IDT, exception handlers with register dump, double fault on its own stack | Done. Tests: `idt.breakpoint` (INT3 round trip preserves registers), scenario `double_fault` (#DF lands on IST1). |
 | P1-T3 | Physical frame allocator with per-frame reference counts | Done. Logic in `kernel/core` (`#![forbid(unsafe_code)]`), host unit tests; `hal::memory` zeroes every frame on allocation (SR-18). Boots with 256 MB to 13 GB of RAM; bookkeeping is about 0.06% of RAM (8 MB at 13 GB). |
-| P1-T4 to P1-T14 | | Not started |
-| P1-S1 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
+| P1-T4 | Kernel page tables with W^X; NX, WP, SMEP, SMAP, UMIP | Done. Table logic in `keel-core` (host tests); `hal::paging` builds a fresh PML4 (kernel text RX, rodata R, data RW+NX, direct map RW+NX with the framebuffer write-combining, nothing in the lower half), switches CR3 and enables every protection CPUID reports. The kernel image has no alias in the direct map. IST stacks now have unmapped guard pages (SR-17). |
+| P1-T5 to P1-T14 | | Not started |
+| P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Protections done with P1-T4. The user-copy API arrives with user mode (P1-T10). |
+| P1-S1, P1-S3 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
+
+Phase 1 security acceptance progress: item 1 (page-table self-test) is
+covered for kernel tables by `paging.wx_walk`; the user-table half needs
+user mode. Item 3's kernel half is covered by the `write_kernel_text`
+scenario, plus `execute_data` for NX; the user-program half needs user
+mode.
+
+Hardening notes for later Phase 1 work:
+- `.data.rel.ro` and `.got` stay writable after the bootloader relocates
+  them. Making them read-only after boot (RELRO) is a small follow-up.
+- The kernel still runs on Limine's boot stack, which has no guard page;
+  kernel threads (P1-T8) get their own guarded stacks.
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
-- `cargo test`: 55 host unit tests pass (6 `keel-core`, 21 `keel-hal`, 28 `xtask`).
+- `cargo test`: 64 host unit tests pass (14 `keel-core`, 22 `keel-hal`, 28 `xtask`).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.
@@ -78,13 +92,15 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 46 | 177 | 14 | 13 |
+| `kernel/hal` | 56 | 215 | 20 | 13 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
 the CPU register reads, and the self-test triggers, each with its
 reasoning block; then three blocks in `hal::memory` (carving the
-allocator's bookkeeping, zeroing frames, frame access for tests). The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+allocator's bookkeeping, zeroing frames, frame access for tests); then
+P1-T4: control-register and MSR access, the page-table memory accessor,
+the CR3/CR4 switch, and two fault-triggering self-tests. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes

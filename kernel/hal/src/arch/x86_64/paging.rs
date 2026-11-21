@@ -1,0 +1,251 @@
+//! The kernel's own page tables (P1-T4; SR-12, SR-13, SR-17).
+//!
+//! `init` builds a fresh PML4 that maps:
+//!  - the kernel image with per-segment rights: text read+execute, rodata
+//!    read-only, data and bss read+write and not executable (W^X, SR-12),
+//!    leaving the IST guard pages unmapped (SR-17);
+//!  - the higher-half direct map (HHDM) over the same memory-map regions
+//!    Limine maps for base revision 4 and later (PROTOCOL.md, "Memory
+//!    Layout at Entry"), read+write and never executable; the framebuffer
+//!    write-combining, everything else write-back ("Caching");
+//!  - nothing in the lower half.
+//!
+//! Hardening beyond Limine's layout: the kernel image's own physical pages
+//! are left out of the direct map, so kernel text and rodata cannot be
+//! written through a second, writable alias.
+//!
+//! It then switches CR3 and turns on the CPU protections the processor
+//! reports: EFER.NXE, CR0.WP, CR4.SMEP, CR4.SMAP and CR4.UMIP (SR-13).
+//!
+//! The table logic lives in `keel_core::paging` (safe Rust, host tested);
+//! this module supplies table memory and the register writes.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use keel_core::frame::Frame;
+use keel_core::paging::{self, Flags, PageSize, TableAccess, Translation, WalkSummary};
+
+use super::cpu::{self, Features};
+use super::gdt;
+use crate::boot::{self, RegionKind};
+use crate::memory;
+
+const PAGE: u64 = 4096;
+
+unsafe extern "C" {
+    // Defined in kernel/keel-kernel/linker.ld. Only their addresses are
+    // used; the "objects" are never read.
+    static __kernel_start: u8;
+    static __rodata_start: u8;
+    static __data_start: u8;
+    static __kernel_end: u8;
+}
+
+/// Page tables built from frames of the frame allocator, reached through
+/// the direct map.
+struct DirectMapTables;
+
+impl TableAccess for DirectMapTables {
+    fn allocate_table(&mut self) -> Option<Frame> {
+        // Zeroed, so every entry starts not-present.
+        memory::allocate_zeroed()
+    }
+
+    fn table(&mut self, frame: Frame) -> &mut [u64; 512] {
+        // SAFETY: `keel_core::paging` only passes frames that came from
+        // `allocate_table` above (or the root, which did too); they belong
+        // to the page tables alone, are mapped read-write in the direct map
+        // (usable RAM), and are 4096-byte aligned, which satisfies the
+        // alignment of `[u64; 512]`. The `&mut self` receiver means at most
+        // one such reference exists at a time.
+        unsafe { &mut *memory::frame_pointer(frame).cast::<[u64; 512]>() }
+    }
+}
+
+/// Physical address of the active PML4, or 0 before `init`.
+static ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// What `init` set up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagingReport {
+    pub features: Features,
+    pub summary: WalkSummary,
+}
+
+/// Why `init` failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagingError {
+    AlreadyInitialised,
+    /// The CPU lacks the execute-disable bit, without which W^X cannot be
+    /// enforced (SR-12). Every x86-64 CPU Keel targets has it.
+    NoExecuteDisable,
+    NoBootInformation,
+    Map(paging::MapError),
+}
+
+impl From<paging::MapError> for PagingError {
+    fn from(error: paging::MapError) -> Self {
+        PagingError::Map(error)
+    }
+}
+
+fn kernel_layout() -> [u64; 4] {
+    [
+        &raw const __kernel_start as u64,
+        &raw const __rodata_start as u64,
+        &raw const __data_start as u64,
+        &raw const __kernel_end as u64,
+    ]
+}
+
+/// Builds the kernel's page tables, switches to them, and enables the
+/// CPU protections. Call once, after `memory::init`, with interrupts off.
+pub fn init() -> Result<PagingReport, PagingError> {
+    if ROOT.load(Ordering::Acquire) != 0 {
+        return Err(PagingError::AlreadyInitialised);
+    }
+    let features = cpu::features();
+    if !features.nx {
+        return Err(PagingError::NoExecuteDisable);
+    }
+    let hhdm = boot::hhdm_offset().ok_or(PagingError::NoBootInformation)?;
+    let kernel = boot::kernel_address().ok_or(PagingError::NoBootInformation)?;
+
+    let mut tables = DirectMapTables;
+    let root = tables
+        .allocate_table()
+        .ok_or(paging::MapError::OutOfMemory)?;
+
+    // Kernel image, one 4 KiB page at a time, with per-segment rights. The
+    // image is physically contiguous (PROTOCOL.md, "Memory Layout at
+    // Entry"), so physical = virtual - virtual_base + physical_base.
+    let [start, rodata, data, end] = kernel_layout();
+    let guards = gdt::ist_guard_pages();
+    let to_phys = |virt: u64| virt - kernel.virtual_base + kernel.physical_base;
+    let mut virt = start;
+    while virt < end {
+        let flags = if virt < rodata {
+            Flags::TEXT
+        } else if virt < data {
+            Flags::READ_ONLY
+        } else {
+            Flags::DATA
+        };
+        if !guards.contains(&virt) {
+            paging::map(
+                &mut tables,
+                root,
+                virt,
+                to_phys(virt),
+                PageSize::Small,
+                flags,
+            )?;
+        }
+        virt += PAGE;
+    }
+    let image_phys = to_phys(start)..to_phys(end);
+
+    // Direct map. Framebuffer regions go first so that write-combining
+    // wins where a firmware region overlaps them.
+    let wc = Flags {
+        write_combining: true,
+        ..Flags::DATA
+    };
+    let regions = || {
+        boot::memory_map().filter(|r| {
+            matches!(
+                r.kind,
+                RegionKind::Usable
+                    | RegionKind::BootloaderReclaimable
+                    | RegionKind::ExecutableAndModules
+                    | RegionKind::Framebuffer
+                    | RegionKind::ReservedMapped
+                    | RegionKind::AcpiReclaimable
+                    | RegionKind::AcpiNvs
+            )
+        })
+    };
+    let framebuffers = regions().filter(|r| r.kind == RegionKind::Framebuffer);
+    let others = regions().filter(|r| r.kind != RegionKind::Framebuffer);
+    for (region, flags, allow_large) in framebuffers
+        .map(|r| (r, wc, false))
+        .chain(others.map(|r| (r, Flags::DATA, true)))
+    {
+        // Limine rounds unaligned regions outward to whole pages when it
+        // builds the direct map ("Memory Layout at Entry"); so does Keel.
+        let base = region.base & !(PAGE - 1);
+        let top = region
+            .base
+            .saturating_add(region.length)
+            .next_multiple_of(PAGE);
+        // Leave the kernel image out (see the module documentation).
+        for (from, to) in [
+            (base, top.min(image_phys.start).max(base)),
+            (base.max(image_phys.end).min(top), top),
+        ] {
+            if from < to {
+                paging::map_range_skipping_present(
+                    &mut tables,
+                    root,
+                    hhdm + from,
+                    from,
+                    to - from,
+                    flags,
+                    allow_large,
+                )?;
+            }
+        }
+    }
+
+    let summary = paging::walk(&mut tables, root, |_, _| {});
+
+    // SAFETY: (1) EFER.NXE is supported (checked above) and must be on
+    // before CR3 points at tables that use the XD bit, which is reserved
+    // while NXE is 0. (2) The new tables map the code running now (kernel
+    // text), its stack (Limine's stack is in bootloader-reclaimable memory,
+    // which the direct map covers), the GDT, IDT, TSS and IST stacks
+    // (kernel data/bss), the framebuffer and all boot information. (3) CR0
+    // keeps PE and PG; WP only adds checks. (4) Only CR4 bits the CPU
+    // reports are set, and nothing is mapped in the lower half, so SMEP and
+    // SMAP cannot break any access the kernel makes. Interrupts are off
+    // (caller contract), so nothing runs between the steps.
+    unsafe {
+        let efer = cpu::rdmsr(cpu::IA32_EFER);
+        cpu::wrmsr(cpu::IA32_EFER, efer | cpu::EFER_NXE);
+        cpu::write_cr0(cpu::read_cr0() | cpu::CR0_WP);
+        cpu::write_cr3(root.address());
+        let mut cr4 = cpu::read_cr4();
+        if features.smep {
+            cr4 |= cpu::CR4_SMEP;
+        }
+        if features.smap {
+            cr4 |= cpu::CR4_SMAP;
+        }
+        if features.umip {
+            cr4 |= cpu::CR4_UMIP;
+        }
+        cpu::write_cr4(cr4);
+    }
+    ROOT.store(root.address(), Ordering::Release);
+    Ok(PagingReport { features, summary })
+}
+
+/// Looks up `virt` in the kernel's page tables.
+pub fn translate(virt: u64) -> Option<Translation> {
+    let root = ROOT.load(Ordering::Acquire);
+    if root == 0 {
+        return None;
+    }
+    paging::translate(&mut DirectMapTables, Frame::containing(root), virt)
+}
+
+/// Walks the kernel's page tables (the page-table self-test).
+pub fn walk() -> Option<WalkSummary> {
+    let root = ROOT.load(Ordering::Acquire);
+    (root != 0).then(|| paging::walk(&mut DirectMapTables, Frame::containing(root), |_, _| {}))
+}
+
+/// The kernel image's virtual layout: start, rodata, data, end.
+pub fn kernel_segments() -> [u64; 4] {
+    kernel_layout()
+}

@@ -51,6 +51,7 @@ SECTIONS
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_start = .;
 
     .rodata : {
         *(.rodata .rodata.*)
@@ -64,6 +65,7 @@ SECTIONS
     .rela.dyn : { *(.rela.dyn .rela.*) } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __data_start = .;
 
     .data : {
         __entry_data_start = .;

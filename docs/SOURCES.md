@@ -37,6 +37,11 @@ against copies downloaded from the vendors:
 | Intel SDM Vol. 3, Table 7-1 (vectors and error codes); section 7.14.1 and Figure 7-8 (64-bit gates); sections 7.14.2-7.14.5 and Figure 7-9 (stack frame, IRET, IST); Table 7-5 (double-fault conditions) | `kernel/hal/src/arch/x86_64/idt.rs`; double-fault self-test in `selftest.rs` |
 | AMD64 APM Vol. 2 rev. 3.46, Table 8-1 and sections 15.28, 15.35 (#SX and #VC push error codes) | Error-code vector list in `idt.rs` |
 | Linux `arch/x86/include/asm/segment.h` at tag v6.18 (GDT entry numbers on x86-64), read for the selector values only | Selector values in `gdt.rs` |
+| Intel SDM Vol. 3, Tables 5-15 to 5-20 (4-level paging entries); section 5.6 (combined access rights); section 5.1.4 (CPUID enumeration of NX, SMEP, SMAP, PCID, PGE); Table 14-11 (PAT entry selection); section 2.5 (CR0.WP, CR4.SMEP/SMAP/UMIP bit positions); Table 2-1 (IA32_EFER.NXE bit 11); Figure 7-11 (page-fault error code) | `kernel/core/src/paging.rs`, `kernel/hal/src/arch/x86_64/paging.rs`, `cpu.rs`, `idt.rs` |
+| Intel SDM Vol. 2 (325383-093, file SHA-256 `d137a7887787bbb06c1a8b8bafd51958d8d2e16b4dff987a03226c845cca1516`): MOV to/from control registers, RDMSR, WRMSR | Reasoning blocks in `cpu.rs`. This revision no longer contains the CPUID leaf tables. |
+| Linux `arch/x86/include/asm/cpufeatures.h` at v6.18 (X86_FEATURE_UMIP is leaf 7 ECX bit 2) | UMIP detection in `cpu.rs` |
+| AMD64 APM Vol. 2, Table A-1 (EFER at MSR C000_0080h); section 5 (SMEP/SMAP CPUID bits, which agree with Intel's) | `cpu.rs` |
+| Limine PROTOCOL.md, "Caching" (PAT0 = WB, PAT5 = WC; framebuffer mapped WC) and "Memory Layout at Entry" (which regions the HHDM covers; outward rounding to 4 KiB) | `hal::paging::init` |
 | Rust platform-support page for `x86_64-unknown-none` (soft-float, no red zone) | Why the exception stub saves only general registers (`idt.rs`) |
 | Intel SDM Vol. 2A, "IN - Input from Port"; Vol. 2B, "OUT - Output to Port" | `kernel/hal/src/arch/x86_64/port.rs` |
 | Intel SDM Vol. 2A, "CLI - Clear Interrupt Flag", "HLT - Halt" | `kernel/hal/src/arch/x86_64/cpu.rs` |

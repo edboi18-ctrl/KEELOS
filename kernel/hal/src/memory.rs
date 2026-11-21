@@ -113,7 +113,7 @@ pub fn init() -> Result<MemoryStats, MemoryInitError> {
 }
 
 /// Pointer to a frame's first byte through the direct map.
-fn frame_pointer(frame: Frame) -> *mut u8 {
+pub(crate) fn frame_pointer(frame: Frame) -> *mut u8 {
     (HHDM.load(Ordering::Acquire) + frame.address()) as *mut u8
 }
 
