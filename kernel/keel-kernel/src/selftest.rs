@@ -42,6 +42,7 @@ pub enum Scenario {
     WriteKernelText = 2,
     ExecuteData = 3,
     StackOverflow = 4,
+    Smap = 5,
     Unknown = 255,
 }
 
@@ -56,9 +57,13 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
         Some("write_kernel_text") => Scenario::WriteKernelText,
         Some("execute_data") => Scenario::ExecuteData,
         Some("stack_overflow") => Scenario::StackOverflow,
+        Some("smap") => Scenario::Smap,
         Some(_) => Scenario::Unknown,
     }
 }
+
+/// User page the `smap` scenario reads directly.
+const SMAP_TARGET: u64 = 0x60_0000;
 
 /// The scenario that is running, for the panic handler.
 static ACTIVE_SCENARIO: AtomicU8 = AtomicU8::new(Scenario::None as u8);
@@ -98,6 +103,13 @@ pub fn judge_expected_fault() {
                 && idt::ist_containing(fault.frame_address) == Some(IstSlot::DoubleFault)
                 && paging::is_kernel_stack_guard(fault.fault_address),
             "a kernel thread overflowing its stack hit its guard page and was caught on IST1 (SR-17)",
+        ),
+        s if s == Scenario::Smap as u8 => (
+            "vm.smap",
+            fault.vector == 14
+                && fault.error_code & (PRESENT | WRITE | INSTRUCTION_FETCH) == PRESENT
+                && fault.fault_address == SMAP_TARGET,
+            "a direct kernel read of a present user page faulted (SMAP, SR-13)",
         ),
         _ => return,
     };
@@ -155,6 +167,27 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
             loop {
                 sched::sleep_ms(1000);
             }
+        }
+        (1, Scenario::Smap) => {
+            use keel_core::vm::{Placement, Prot};
+            use keel_hal::vm::{AddressSpace, copy_to_user, with_address_space};
+            ACTIVE_SCENARIO.store(Scenario::Smap as u8, Ordering::Relaxed);
+            kprintln!("selftest: kernel reading user memory without the copy routine");
+            let space = AddressSpace::new().expect("address space");
+            space
+                .map(Placement::Fixed(SMAP_TARGET), 4096, Prot::READ_WRITE)
+                .expect("mapping");
+            with_address_space(&space, || {
+                // Populate the page legitimately first, so the direct read
+                // below hits a present page and only SMAP can stop it.
+                let _ = copy_to_user(SMAP_TARGET, b"user data");
+                let _ = hw::read_user_directly(SMAP_TARGET);
+            });
+            runner.check(
+                "vm.smap",
+                false,
+                "the direct read of user memory did not fault",
+            );
         }
         (1, Scenario::ExecuteData) => {
             ACTIVE_SCENARIO.store(Scenario::ExecuteData as u8, Ordering::Relaxed);
@@ -294,6 +327,7 @@ fn phase1(t: &mut Runner) {
     phase1_heap(t);
     phase1_interrupts(t);
     phase1_sched(t);
+    phase1_vm(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -671,5 +705,150 @@ pub fn phase1_sched(t: &mut Runner) {
         "sched.reclaim",
         sched::thread_count() == 2 && memory::free_frames() + 64 >= frames_before,
         "exited threads are removed and their stack frames returned",
+    );
+}
+
+/// P1-T9 and P1-S2: user address spaces, demand paging, copy-on-write,
+/// and the checked user-copy routines.
+pub fn phase1_vm(t: &mut Runner) {
+    use keel_core::vm::{Placement, Prot, USER_END};
+    use keel_hal::vm::{AddressSpace, copy_from_user, copy_to_user, with_address_space};
+
+    let frames_at_start = memory::free_frames();
+    let Ok(space) = AddressSpace::new() else {
+        t.check(
+            "vm.address_space",
+            false,
+            "could not create an address space",
+        );
+        return;
+    };
+
+    // Phase 1 acceptance item 4: a 64 GiB PROT_NONE reservation costs no
+    // physical memory.
+    let before = memory::free_frames();
+    let reserve = space.map(Placement::Anywhere { hint: 0 }, 64 << 30, Prot::NONE);
+    let after = memory::free_frames();
+    let reserve_denied = reserve.is_ok_and(|start| {
+        with_address_space(&space, || {
+            copy_from_user(&mut [0u8; 8], start + (1 << 30)).is_err()
+        })
+    });
+    t.check(
+        "vm.reservation",
+        reserve.is_ok() && before == after && space.resident_bytes() == 0 && reserve_denied,
+        "a 64 GiB PROT_NONE reservation uses no frames and refuses access",
+    );
+
+    // Demand paging: only touched pages get frames, and they start zeroed.
+    let region = space.map(Placement::Anywhere { hint: 0 }, 16 << 20, Prot::READ_WRITE);
+    let demand_ok = region.is_ok_and(|start| {
+        let target = start + (5 << 20) + 123;
+        with_address_space(&space, || {
+            let mut first = [0xFFu8; 16];
+            let read_zero = copy_from_user(&mut first, target).is_ok() && first == [0; 16];
+            let wrote = copy_to_user(target, b"demand paged!").is_ok();
+            let mut back = [0u8; 13];
+            let read_back = copy_from_user(&mut back, target).is_ok() && &back == b"demand paged!";
+            read_zero && wrote && read_back
+        })
+    });
+    t.check(
+        "vm.demand_paging",
+        demand_ok && space.resident_bytes() == 4096,
+        "touching 16 bytes of a 16 MiB mapping backs exactly one zeroed page",
+    );
+
+    // Bad user pointers are refused without touching kernel memory.
+    let kernel_address = &raw const COUNTER as u64;
+    let bad_pointers = with_address_space(&space, || {
+        let mut buf = [0u8; 16];
+        copy_to_user(kernel_address, b"x").is_err()
+            && copy_from_user(&mut buf, 0).is_err()
+            && copy_from_user(&mut buf, 0x50_0000).is_err()
+            && copy_from_user(&mut buf, USER_END - 8).is_err()
+            && copy_from_user(&mut buf, u64::MAX - 4).is_err()
+    });
+    t.check(
+        "vm.user_copy_bounds",
+        bad_pointers,
+        "kernel, null, unmapped, boundary-straddling and wrapping pointers give EFAULT (SR-19)",
+    );
+
+    // mprotect to read-only: a write through the copy routine is refused.
+    let protect_ok = region.is_ok_and(|start| {
+        space
+            .protect(
+                start,
+                16 << 20,
+                Prot {
+                    read: true,
+                    write: false,
+                    exec: false,
+                },
+            )
+            .is_ok()
+            && with_address_space(&space, || copy_to_user(start + (5 << 20), b"no").is_err())
+    });
+    t.check(
+        "vm.protect",
+        protect_ok,
+        "after mprotect(PROT_READ) the page can no longer be written",
+    );
+    let wx_refused = space
+        .map(
+            Placement::Anywhere { hint: 0 },
+            4096,
+            Prot {
+                read: true,
+                write: true,
+                exec: true,
+            },
+        )
+        .is_err();
+    t.check(
+        "vm.no_write_exec",
+        wx_refused,
+        "a writable and executable user mapping is refused (SR-12)",
+    );
+
+    // Copy-on-write: duplicate, then write in each copy.
+    let cow_ok = (|| {
+        let parent = AddressSpace::new().ok()?;
+        let page = parent
+            .map(Placement::Fixed(0x40_0000), 4096, Prot::READ_WRITE)
+            .ok()?;
+        with_address_space(&parent, || copy_to_user(page, b"parent")).ok()?;
+        let child = parent.duplicate().ok()?;
+        let shared = !parent.page_flags(page)?.writable && !child.page_flags(page)?.writable;
+        with_address_space(&child, || copy_to_user(page, b"child!")).ok()?;
+        let mut p = [0u8; 6];
+        let mut c = [0u8; 6];
+        with_address_space(&parent, || copy_from_user(&mut p, page)).ok()?;
+        with_address_space(&child, || copy_from_user(&mut c, page)).ok()?;
+        // The parent's page is exclusive again after the child copied, so
+        // its next write takes it over without copying.
+        with_address_space(&parent, || copy_to_user(page, b"PARENT")).ok()?;
+        let parent_writable = parent.page_flags(page)?.writable;
+        Some(
+            shared
+                && &p == b"parent"
+                && &c == b"child!"
+                && child.page_flags(page)?.writable
+                && parent_writable,
+        )
+    })()
+    .unwrap_or(false);
+    t.check(
+        "vm.copy_on_write",
+        cow_ok,
+        "after duplicate, a write in either copy gets a private page; the other copy is unchanged",
+    );
+
+    drop(space);
+    t.check(
+        "vm.teardown",
+        memory::free_frames() + 8 >= frames_at_start,
+        "dropping address spaces returns their pages and page tables",
     );
 }

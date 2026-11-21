@@ -43,7 +43,7 @@ unsafe extern "C" {
 
 /// Page tables built from frames of the frame allocator, reached through
 /// the direct map.
-struct DirectMapTables;
+pub(crate) struct DirectMapTables;
 
 impl TableAccess for DirectMapTables {
     fn allocate_table(&mut self) -> Option<Frame> {
@@ -201,6 +201,12 @@ pub fn init() -> Result<PagingReport, PagingError> {
         }
     }
 
+    // Create every upper-half top-level entry now. User address spaces
+    // copy these 256 entries, so any kernel mapping made later (heap,
+    // stacks, devices) lands in shared lower-level tables and is visible
+    // in every address space.
+    paging::ensure_top_level(&mut tables, root, 256..512)?;
+
     let summary = paging::walk(&mut tables, root, |_, _| {});
 
     // SAFETY: (1) EFER.NXE is supported (checked above) and must be on
@@ -231,7 +237,14 @@ pub fn init() -> Result<PagingReport, PagingError> {
         cpu::write_cr4(cr4);
     }
     ROOT.store(root.address(), Ordering::Release);
+    crate::vm::set_smap_enabled(features.smap);
     Ok(PagingReport { features, summary })
+}
+
+/// The kernel's top-level table.
+pub fn kernel_root() -> Option<Frame> {
+    let root = ROOT.load(Ordering::Acquire);
+    (root != 0).then(|| Frame::containing(root))
 }
 
 /// Looks up `virt` in the kernel's page tables.

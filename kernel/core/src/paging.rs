@@ -231,6 +231,106 @@ pub fn unmap_small<A: TableAccess>(access: &mut A, root: Frame, virt: u64) -> Op
     Some(phys)
 }
 
+/// Replaces the 4 KiB leaf at `virt` with a mapping of `phys` and
+/// returns the physical address it pointed to before. The intermediate
+/// tables must already exist (the page must have been mapped). The caller
+/// must invalidate the TLB entry for `virt` afterwards.
+pub fn replace_small<A: TableAccess>(
+    access: &mut A,
+    root: Frame,
+    virt: u64,
+    phys: u64,
+    flags: Flags,
+) -> Result<u64, MapError> {
+    if !virt.is_multiple_of(PageSize::Small.bytes())
+        || !phys.is_multiple_of(PageSize::Small.bytes())
+        || !is_canonical(virt)
+    {
+        return Err(MapError::Misaligned);
+    }
+    if flags.writable && flags.executable {
+        return Err(MapError::WritableAndExecutable);
+    }
+    let mut table = root;
+    for level in 0..3 {
+        let entry = access.table(table)[index(virt, level)];
+        if entry & PRESENT == 0 || (level > 0 && entry & HUGE != 0) {
+            return Err(MapError::AlreadyMapped);
+        }
+        table = Frame::containing(entry & ADDRESS_MASK);
+    }
+    let slot = &mut access.table(table)[index(virt, 3)];
+    if *slot & PRESENT == 0 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let old = *slot & ADDRESS_MASK;
+    *slot = leaf_entry(phys, PageSize::Small, flags);
+    Ok(old)
+}
+
+/// Makes sure the top-level entries `indices` exist, allocating empty
+/// next-level tables where needed. The kernel does this for the whole
+/// upper half at boot, so that every address space can share those
+/// entries and later kernel mappings appear in all of them.
+pub fn ensure_top_level<A: TableAccess>(
+    access: &mut A,
+    root: Frame,
+    indices: core::ops::Range<usize>,
+) -> Result<(), MapError> {
+    for i in indices {
+        if access.table(root)[i] & PRESENT == 0 {
+            let table = access.allocate_table().ok_or(MapError::OutOfMemory)?;
+            access.table(root)[i] = table_entry(table, false);
+        }
+    }
+    Ok(())
+}
+
+/// Removes everything below top-level entry 256 (the user half) and
+/// returns the page-table frames that held it plus every leaf's physical
+/// address, so the caller can release them. The caller must not have
+/// `root` active, or must flush the TLB.
+pub fn clear_user_half<A: TableAccess>(
+    access: &mut A,
+    root: Frame,
+) -> (alloc::vec::Vec<Frame>, alloc::vec::Vec<u64>) {
+    let mut tables = alloc::vec::Vec::new();
+    let mut leaves = alloc::vec::Vec::new();
+    fn visit<A: TableAccess>(
+        access: &mut A,
+        table: Frame,
+        level: usize,
+        tables: &mut alloc::vec::Vec<Frame>,
+        leaves: &mut alloc::vec::Vec<u64>,
+    ) {
+        for i in 0..512 {
+            let entry = access.table(table)[i];
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let is_leaf = level == 3 || (level >= 1 && entry & HUGE != 0);
+            if is_leaf {
+                leaves.push(entry & ADDRESS_MASK);
+            } else {
+                let next = Frame::containing(entry & ADDRESS_MASK);
+                visit(access, next, level + 1, tables, leaves);
+                tables.push(next);
+            }
+        }
+    }
+    for i in 0..256 {
+        let entry = access.table(root)[i];
+        if entry & PRESENT == 0 {
+            continue;
+        }
+        let next = Frame::containing(entry & ADDRESS_MASK);
+        visit(access, next, 1, &mut tables, &mut leaves);
+        tables.push(next);
+        access.table(root)[i] = 0;
+    }
+    (tables, leaves)
+}
+
 /// A resolved mapping with its effective rights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Translation {
@@ -746,6 +846,35 @@ mod tests {
         assert!(translate(&mut t, root, KERNEL + 0x20_0000).is_some());
         // The slot can be reused.
         map(&mut t, root, KERNEL, 0x6000, PageSize::Small, Flags::DATA).unwrap();
+    }
+
+    #[test]
+    fn replacing_and_clearing_the_user_half() {
+        let (mut t, root) = HeapTables::new();
+        let user = Flags {
+            user: true,
+            ..Flags::READ_ONLY
+        };
+        map(&mut t, root, 0x40_0000, 0x5000, PageSize::Small, user).unwrap();
+        map(&mut t, root, KERNEL, 0x6000, PageSize::Small, Flags::DATA).unwrap();
+        let rw = Flags {
+            writable: true,
+            ..user
+        };
+        assert_eq!(
+            replace_small(&mut t, root, 0x40_0000, 0x7000, rw),
+            Ok(0x5000)
+        );
+        assert_eq!(translate(&mut t, root, 0x40_0000).unwrap().phys, 0x7000);
+        assert!(translate(&mut t, root, 0x40_0000).unwrap().flags.writable);
+        assert!(replace_small(&mut t, root, 0x40_1000, 0x7000, rw).is_err());
+        let (tables, leaves) = clear_user_half(&mut t, root);
+        assert_eq!(leaves, alloc::vec![0x7000]);
+        assert_eq!(tables.len(), 3); // PDPT, PD, PT
+        assert_eq!(translate(&mut t, root, 0x40_0000), None);
+        assert!(translate(&mut t, root, KERNEL).is_some());
+        ensure_top_level(&mut t, root, 256..512).unwrap();
+        assert!((256..512).all(|i| t.table(root)[i] & PRESENT != 0));
     }
 
     #[test]

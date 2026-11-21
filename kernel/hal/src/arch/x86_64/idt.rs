@@ -362,8 +362,12 @@ extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
     // the current stack. It is valid, aligned, and exclusively ours until
     // this function returns.
     let frame = unsafe { &mut *frame };
-    match frame.vector {
-        32..=255 => crate::interrupts::dispatch(frame.vector as u8),
+    let vector = frame.vector;
+    if vector == 14 && crate::vm::handle_page_fault(frame, super::cpu::read_cr2()) {
+        return;
+    }
+    match vector {
+        32..=255 => crate::interrupts::dispatch(vector as u8),
         3 => {
             // #BP is a trap: the saved RIP already points after INT3, so
             // returning resumes execution (SDM section 7.15, Interrupt 3).

@@ -10,3 +10,4 @@ pub mod acpi;
 
 pub mod frame;
 pub mod paging;
+pub mod vm;

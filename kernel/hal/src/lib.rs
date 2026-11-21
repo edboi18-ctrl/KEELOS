@@ -27,3 +27,5 @@ pub mod sched;
 pub mod sync;
 #[cfg(target_os = "none")]
 pub mod time;
+#[cfg(target_os = "none")]
+pub mod vm;

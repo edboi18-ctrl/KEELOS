@@ -169,3 +169,23 @@ pub fn with_frame_bytes<R>(
     let bytes = unsafe { &mut *frame_pointer(frame).cast::<[u8; 4096]>() };
     Ok(f(bytes))
 }
+
+/// Reference count of a frame (0 if not allocated).
+pub fn references(frame: Frame) -> u16 {
+    FRAMES.lock().as_ref().map_or(0, |a| a.references(frame))
+}
+
+/// Copies the contents of allocated frame `from` into allocated frame `to`.
+pub fn copy_frame(from: Frame, to: Frame) -> Result<(), FrameError> {
+    let guard = FRAMES.lock();
+    let allocator = guard.as_ref().ok_or(FrameError::NotAllocated)?;
+    if allocator.references(from) == 0 || allocator.references(to) == 0 || from == to {
+        return Err(FrameError::NotAllocated);
+    }
+    // SAFETY: both frames are allocated (checked under the lock), distinct,
+    // and mapped read-write in the direct map; each is exactly 4096 bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame_pointer(from), frame_pointer(to), FRAME_SIZE as usize);
+    }
+    Ok(())
+}

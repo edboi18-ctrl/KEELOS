@@ -183,3 +183,15 @@ pub fn overflow_stack(depth: u64) -> u64 {
         frame[0]
     }
 }
+
+/// Reads a user address directly, outside the user-copy routines. With
+/// CR4.SMAP = 1 and RFLAGS.AC = 0 this must raise #PF even though the
+/// page is present (SDM Vol. 3 section 5.6, supervisor-mode access
+/// prevention). Used by the `smap` scenario; on a CPU without SMAP the
+/// read succeeds and the scenario reports failure.
+pub fn read_user_directly(address: u64) -> u8 {
+    // SAFETY: the read is expected to fault; it targets a mapped page of
+    // the active address space, so if SMAP were off it would read a valid
+    // byte. Only the `smap` scenario calls this.
+    unsafe { (address as *const u8).read_volatile() }
+}

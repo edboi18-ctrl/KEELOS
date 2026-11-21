@@ -41,6 +41,7 @@ pub const PHASES: &[Phase] = &[
             "write_kernel_text",
             "execute_data",
             "stack_overflow",
+            "smap",
         ],
     },
 ];

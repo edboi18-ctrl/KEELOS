@@ -45,8 +45,9 @@ to `main` with PR #1.
 | P1-T6 | ACPI MADT; local APIC and I/O APIC; legacy PIC masked | Done. Own ACPI parser in `keel-core` (ADR 0004), fed only byte ranges inside ACPI memory regions. Local APIC in xAPIC (MMIO) or x2APIC (MSR) mode, whichever the firmware left; I/O APICs mapped with all inputs masked; ISA IRQ routing honours MADT overrides. Device registers are mapped uncached through `paging::map_mmio`, which refuses addresses that overlap RAM (SR-20). The x2APIC path is untested: OVMF leaves xAPIC mode on. |
 | P1-T7 | Timer and monotonic clock | Done. HPET as reference; APIC timer and TSC calibrated against it over 10 ms; 1 kHz periodic tick; monotonic clock from the TSC when invariant, else the HPET. Under QEMU TCG no invariant TSC is reported, so the TSC path runs only under KVM and on real hardware. No PIT fallback yet if a machine has no HPET (to check on the OptiPlex in Phase 6). |
 | P1-T8 | Kernel threads, context switch, preemptive round-robin scheduler, sleep and wait queues, FPU/SSE/AVX state | Done. Each thread has a 64 KiB kernel stack with an unmapped guard page and its own XSAVE area (FXSAVE where XSAVE is missing), sized from CPUID; XCR0 enables x87, SSE, AVX, and AVX-512 when complete. 10 ms time slices from the 1 kHz tick; switches happen after the EOI. The heap, page-table, frame and scheduler locks disable interrupts while held, so no thread is preempted holding one. Tests: round robin, preemption of a non-yielding thread, sleep accuracy, wait-queue wake-up, XMM isolation across 400 switches (checked to fail when save/restore is removed), reclamation of exited threads, and a stack-overflow scenario caught on the guard page. |
-| P1-T9 to P1-T14 | | Not started |
-| P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Protections done with P1-T4. The user-copy API arrives with user mode (P1-T10). |
+| P1-T9 | Address spaces: VMAs, demand paging, copy-on-write, free PROT_NONE reservations | Done for anonymous memory. VMA bookkeeping (mmap/munmap/mprotect semantics incl. MAP_FIXED, MAP_FIXED_NOREPLACE and splitting) in `keel-core::vm` with host tests; page-table side in `hal::vm`. Writable+executable user mappings refused (SR-12). Every address space shares the kernel's upper half (all 256 entries pre-created at boot). File-backed and shared mappings come with the VFS (P1-T12, P3-T7). Tests: 64 GiB reservation costs no frames (acceptance item 4), demand paging, mprotect, copy-on-write isolation, teardown returns all frames. |
+| P1-T10 to P1-T14 | | Not started |
+| P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Done. `hal::vm::copy_to_user`/`copy_from_user` are the only code that touches user memory: they check the range against the user half with checked arithmetic, lift SMAP (STAC/CLAC) only around one `rep movsb`, resolve demand-paging faults, and turn anything else into EFAULT through a fixup. Tests: bad-pointer sweep (kernel, null, unmapped, straddling, wrapping) and a `smap` scenario proving a direct kernel read of a present user page faults. Both the SMAP and no-SMAP routines are exercised. |
 | P1-S1, P1-S3 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
 
 Phase 1 security acceptance progress: item 1 (page-table self-test) is
@@ -67,7 +68,7 @@ Hardening notes for later Phase 1 work:
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
-- `cargo test`: 77 host unit tests pass (23 `keel-core`, 26 `keel-hal`, 28 `xtask`).
+- `cargo test`: 84 host unit tests pass (30 `keel-core`, 26 `keel-hal`, 28 `xtask`).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.
@@ -97,7 +98,7 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 101 | 321 | 33 | 13 |
+| `kernel/hal` | 106 | 334 | 34 | 13 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
@@ -113,7 +114,9 @@ register access, the ACPI physical-memory reader, interrupt-flag
 instructions, RDTSC, and the interrupt handler table; then P1-T8: the
 context switch and new-thread frame, XSAVE/FXSAVE save and restore,
 XSETBV, the save-area allocation, the interrupt-disabling lock, and
-three self-test helpers (XMM0 access, stack overflow). The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+three self-test helpers (XMM0 access, stack overflow); then P1-T9: the
+user-copy routines (the one sanctioned place for user-memory access),
+frame copying, and the SMAP self-test read. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes

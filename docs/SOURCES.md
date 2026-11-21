@@ -49,6 +49,8 @@ against copies downloaded from the vendors:
 | Linux `arch/x86/include/asm/i8259.h` at v6.18 (PIC mask ports 21h and A1h) | `apic::mask_legacy_pic` |
 | Intel SDM Vol. 1, section 13.2 (CPUID.01H:ECX.XSAVE[26]; CPUID.0DH.00H EDX:EAX supported components, EBX area size), section 13.4 (64-byte alignment, header at offset 512), section 13.8.1 (XRSTOR loads MXCSR when RFBM[1] or RFBM[2] is set), Table 10-2 (FXSAVE layout: FCW byte 0, MXCSR byte 24), reset values FCW 037FH and MXCSR 1F80H; Vol. 3 section 2.5 and Figure 2-8 (CR0.MP/EM/TS, CR4.OSFXSR/OSXMMEXCPT/OSXSAVE, XCR0 bits) | `kernel/hal/src/arch/x86_64/fpu.rs` |
 | System V AMD64 ABI, section 3.2.1 (callee-saved rbx, rbp, r12-r15; stack 16-byte aligned at a call) | `kernel/hal/src/arch/x86_64/switch.rs` |
+| Linux man-pages `mmap(2)`, `munmap(2)`, `mprotect(2)` (MAP_FIXED, MAP_FIXED_NOREPLACE/EEXIST, ENOMEM for mprotect over holes, page granularity) | `kernel/core/src/vm.rs` |
+| Intel SDM Vol. 2B "STAC" (#UD when CPUID.07H.00H:EBX.SMAP[20] = 0) and "REP" (an interrupted string instruction resumes with RSI/RDI/RCX describing the remaining work); Vol. 3 section 5.6 (SMAP) | `kernel/hal/src/vm.rs` user-copy routines |
 | Rust platform-support page for `x86_64-unknown-none` (soft-float, no red zone) | Why the exception stub saves only general registers (`idt.rs`) |
 | Intel SDM Vol. 2A, "IN - Input from Port"; Vol. 2B, "OUT - Output to Port" | `kernel/hal/src/arch/x86_64/port.rs` |
 | Intel SDM Vol. 2A, "CLI - Clear Interrupt Flag", "HLT - Halt" | `kernel/hal/src/arch/x86_64/cpu.rs` |
