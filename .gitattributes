@@ -1,0 +1,14 @@
+# Check every text file out with LF line endings, on Windows too.
+#
+# Git for Windows defaults to core.autocrlf=true, which rewrites LF as
+# CRLF on checkout. That changes file bytes, and several build inputs are
+# checked byte for byte:
+#   - vendor/: Cargo verifies every file against .cargo-checksum.json
+#     (SR-29) and refuses to build if one differs;
+#   - initramfs/ and the license texts: they are packed into the image
+#     and release artifacts, which must be identical on every host (SR-30).
+# Attributes in this file override the user's core.autocrlf setting.
+* text=auto eol=lf
+
+# Vendored crates are third-party bytes: never convert anything in them.
+vendor/** -text
