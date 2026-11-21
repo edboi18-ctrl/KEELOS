@@ -1,5 +1,7 @@
 //! x86-64 primitives.
 
+#[cfg(target_os = "none")]
+pub mod apic;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;

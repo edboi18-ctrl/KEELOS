@@ -14,7 +14,7 @@ use keel_hal::arch::x86_64::cpu::halt_forever;
 use keel_hal::arch::x86_64::{init_descriptor_tables, paging};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, kprintln, memory};
+use keel_hal::{console, interrupts, kprintln, memory, time};
 
 /// Set once the command line asked for self-tests, so that a panic can
 /// report failure to the test harness instead of hanging until timeout.
@@ -84,6 +84,34 @@ extern "C" fn kmain() -> ! {
         // guard pages; stop instead (SR-12).
         Err(error) => panic!("page table setup failed: {error:?}"),
     }
+
+    match interrupts::init() {
+        Ok(r) => kprintln!(
+            "apic: {} mode, boot CPU APIC ID {}, {} CPU(s) in MADT, {} I/O APIC(s) with {} inputs; legacy PIC masked",
+            if r.x2apic { "x2APIC" } else { "xAPIC" },
+            r.bsp_apic_id,
+            r.enabled_cpus,
+            r.io_apics,
+            r.gsis
+        ),
+        Err(error) => panic!("interrupt controller setup failed: {error:?}"),
+    }
+    match time::init() {
+        Ok(r) => kprintln!(
+            "time: HPET period {} fs; APIC timer {} kHz, ticking at {} Hz; TSC {} MHz ({})",
+            r.hpet_period_fs,
+            r.lapic_timer_hz / 1000,
+            time::TICK_HZ,
+            r.tsc_hz / 1_000_000,
+            if r.invariant_tsc {
+                "invariant"
+            } else {
+                "not invariant: clock uses the HPET"
+            }
+        ),
+        Err(error) => panic!("timer setup failed: {error:?}"),
+    }
+    interrupts::enable();
 
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {

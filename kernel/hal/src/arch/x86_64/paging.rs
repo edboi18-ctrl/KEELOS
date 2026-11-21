@@ -265,6 +265,80 @@ pub const KERNEL_HEAP_BASE: u64 = 0xffff_c000_0000_0000;
 /// Size of the kernel-heap virtual region (64 GiB).
 pub const KERNEL_HEAP_SIZE: u64 = 64 << 30;
 
+/// Start of the region where device registers are mapped.
+pub const MMIO_BASE: u64 = 0xffff_d000_0000_0000;
+const MMIO_SIZE: u64 = 1 << 30;
+static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
+
+/// Why `map_mmio` refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmioError {
+    /// Paging is not set up yet.
+    NotReady,
+    /// The range is empty, overflows, or exhausts the MMIO region.
+    BadRange,
+    /// The range overlaps RAM, the kernel, or boot data. Firmware tables
+    /// are untrusted (SR-20); a device address pointing into RAM would
+    /// create an uncached alias of memory the kernel uses.
+    OverlapsMemory,
+    Map(paging::MapError),
+}
+
+/// Maps the physical device registers `[phys, phys + length)` uncached,
+/// read+write and not executable, and returns the virtual address that
+/// corresponds to `phys`.
+pub fn map_mmio(phys: u64, length: u64) -> Result<u64, MmioError> {
+    let root = ROOT.load(Ordering::Acquire);
+    if root == 0 {
+        return Err(MmioError::NotReady);
+    }
+    let end = phys
+        .checked_add(length)
+        .filter(|_| length > 0)
+        .ok_or(MmioError::BadRange)?;
+    let first = phys & !(PAGE - 1);
+    let last = end.next_multiple_of(PAGE);
+    let overlaps = boot::memory_map().any(|r| {
+        let is_memory = matches!(
+            r.kind,
+            RegionKind::Usable
+                | RegionKind::BootloaderReclaimable
+                | RegionKind::ExecutableAndModules
+                | RegionKind::AcpiReclaimable
+                | RegionKind::AcpiNvs
+                | RegionKind::Framebuffer
+        );
+        is_memory && r.base < last && first < r.base.saturating_add(r.length)
+    });
+    if overlaps {
+        return Err(MmioError::OverlapsMemory);
+    }
+    let pages = (last - first) / PAGE;
+    let size = pages * PAGE;
+    // One unmapped page between mappings.
+    let virt = MMIO_NEXT.fetch_add(size + PAGE, Ordering::AcqRel);
+    if virt + size > MMIO_BASE + MMIO_SIZE {
+        return Err(MmioError::BadRange);
+    }
+    let flags = Flags {
+        uncached: true,
+        ..Flags::DATA
+    };
+    let _guard = TABLES.lock();
+    for i in 0..pages {
+        paging::map(
+            &mut DirectMapTables,
+            Frame::containing(root),
+            virt + i * PAGE,
+            first + i * PAGE,
+            PageSize::Small,
+            flags,
+        )
+        .map_err(MmioError::Map)?;
+    }
+    Ok(virt + (phys - first))
+}
+
 /// Maps fresh zeroed frames, read+write and not executable, at the 4 KiB
 /// pages `[virt, virt + pages * 4096)` inside the kernel-heap region.
 /// On failure nothing stays mapped.

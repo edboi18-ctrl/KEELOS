@@ -12,7 +12,8 @@
 //! Memory type (SDM Table 14-11): the PAT, PCD and PWT bits select a PAT
 //! entry. Limine programs PAT entry 0 as write-back and entry 5 as
 //! write-combining (PROTOCOL.md, "Caching", x86-64); entry 5 is selected by
-//! PAT = 1, PCD = 0, PWT = 1.
+//! PAT = 1, PCD = 0, PWT = 1. Entry 3 is uncacheable (UC), selected by
+//! PAT = 0, PCD = 1, PWT = 1; it is used for device registers.
 
 use crate::frame::Frame;
 
@@ -20,6 +21,7 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const PWT: u64 = 1 << 3;
+const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7; // PS in PDPTEs and PDEs
 const PAT_4K: u64 = 1 << 7;
 const PAT_2M: u64 = 1 << 12;
@@ -60,9 +62,11 @@ pub struct Flags {
     pub writable: bool,
     pub executable: bool,
     pub user: bool,
-    /// Write-combining memory type (for the framebuffer); write-back
-    /// otherwise.
+    /// Write-combining memory type (for the framebuffer).
     pub write_combining: bool,
+    /// Uncacheable memory type (for device registers). Write-back when
+    /// neither this nor `write_combining` is set.
+    pub uncached: bool,
 }
 
 impl Flags {
@@ -72,6 +76,7 @@ impl Flags {
         executable: false,
         user: false,
         write_combining: false,
+        uncached: false,
     };
     /// Read and execute, kernel only (kernel text).
     pub const TEXT: Flags = Flags {
@@ -142,6 +147,8 @@ pub fn leaf_entry(phys: u64, size: PageSize, flags: Flags) -> u64 {
                 PageSize::Small => PAT_4K,
                 PageSize::Large => PAT_2M,
             };
+    } else if flags.uncached {
+        entry |= PCD | PWT;
     }
     entry
 }
@@ -169,6 +176,9 @@ pub fn map<A: TableAccess>(
     }
     if flags.writable && flags.executable {
         return Err(MapError::WritableAndExecutable);
+    }
+    if flags.write_combining && flags.uncached {
+        return Err(MapError::Misaligned);
     }
     let mut table = root;
     for level in 0..size.leaf_level() {
@@ -247,6 +257,7 @@ pub fn translate<A: TableAccess>(access: &mut A, root: Frame, virt: u64) -> Opti
         executable: true,
         user: true,
         write_combining: false,
+        uncached: false,
     };
     let mut table = root;
     for level in 0..4 {
@@ -266,6 +277,7 @@ pub fn translate<A: TableAccess>(access: &mut A, root: Frame, virt: u64) -> Opti
                 PageSize::Large => PAT_2M,
             };
             rights.write_combining = entry & PWT != 0 && entry & pat != 0;
+            rights.uncached = entry & PWT != 0 && entry & PCD != 0 && entry & pat == 0;
             let offset = virt % size.bytes();
             return Some(Translation {
                 phys: (entry & ADDRESS_MASK & !(size.bytes() - 1)) + offset,
@@ -306,6 +318,7 @@ pub fn walk<A: TableAccess>(
         executable: true,
         user: true,
         write_combining: false,
+        uncached: false,
     };
     walk_level(access, root, 0, 0, all, &mut summary, &mut visit);
     summary
@@ -355,6 +368,7 @@ fn walk_level<A: TableAccess>(
                     PAT_2M
                 };
                 here.write_combining = entry & PWT != 0 && entry & pat != 0;
+                here.uncached = entry & PWT != 0 && entry & PCD != 0 && entry & pat == 0;
                 visit(
                     virt,
                     Translation {
@@ -478,6 +492,26 @@ mod tests {
             leaf_entry(0x1000, PageSize::Small, wc),
             0x8000_0000_0000_108B
         );
+    }
+
+    #[test]
+    fn uncached_entries_select_pat_entry_3() {
+        let mmio = Flags {
+            uncached: true,
+            ..Flags::DATA
+        };
+        assert_eq!(
+            leaf_entry(0xFEE0_0000, PageSize::Small, mmio),
+            0x8000_0000_FEE0_001B
+        );
+        let (mut t, root) = HeapTables::new();
+        map(&mut t, root, KERNEL, 0xFEE0_0000, PageSize::Small, mmio).unwrap();
+        assert_eq!(translate(&mut t, root, KERNEL).unwrap().flags, mmio);
+        let both = Flags {
+            write_combining: true,
+            ..mmio
+        };
+        assert!(map(&mut t, root, KERNEL + 0x1000, 0, PageSize::Small, both).is_err());
     }
 
     #[test]

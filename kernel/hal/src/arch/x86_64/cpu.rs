@@ -300,3 +300,70 @@ pub fn invalidate_page(virt: u64) {
         core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
     }
 }
+
+/// Enables maskable interrupts.
+///
+/// # Safety
+///
+/// Every interrupt that can arrive must have a working handler, and no
+/// spinlock that an interrupt handler takes may be held.
+pub unsafe fn enable_interrupts() {
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: CPL 0.
+    // Instruction: `sti` sets RFLAGS.IF (SDM Vol. 2B "STI"). Interrupts are
+    //   recognised after the next instruction. RFLAGS changes, so
+    //   `preserves_flags` is not claimed; interrupt handlers may run
+    //   afterwards and touch memory, so `nomem` is not claimed either.
+    // SAFETY: the caller guarantees handlers exist and no handler lock is held.
+    unsafe { core::arch::asm!("sti", options(nostack)) }
+}
+
+/// Disables maskable interrupts and returns whether they were enabled.
+pub fn disable_interrupts() -> bool {
+    let was = interrupts_enabled();
+    // Assembly reasoning (spec section 1, rule 4)
+    // Instruction: `cli` clears RFLAGS.IF (SDM Vol. 2A "CLI"). Only makes
+    //   the kernel run without interruption; memory is unaffected but the
+    //   compiler must not move memory accesses across it, so `nomem` is not
+    //   claimed.
+    // SAFETY: disabling interrupts at CPL 0 cannot violate memory safety.
+    unsafe { core::arch::asm!("cli", options(nostack)) }
+    was
+}
+
+/// Enables interrupts and halts until one arrives, as one step.
+///
+/// # Safety
+///
+/// As for `enable_interrupts`.
+pub unsafe fn enable_and_wait() {
+    // Assembly reasoning (spec section 1, rule 4)
+    // `sti` delays interrupt recognition until after the next instruction
+    // (SDM Vol. 2B "STI"), so an interrupt cannot slip in between `sti` and
+    // `hlt` and leave the CPU halted with nothing to wake it. `hlt` then
+    // waits for an interrupt (SDM Vol. 2A "HLT"); after the handler's IRETQ,
+    // execution continues after `hlt` with IF = 1.
+    // SAFETY: as for `enable_interrupts`.
+    unsafe { core::arch::asm!("sti", "hlt", options(nostack)) }
+}
+
+/// Reads the time-stamp counter.
+pub fn read_tsc() -> u64 {
+    let (low, high): (u32, u32);
+    // Assembly reasoning (spec section 1, rule 4)
+    // Instruction: `rdtsc` loads EDX:EAX with the TSC (SDM Vol. 2B
+    //   "RDTSC"); allowed at CPL 0 regardless of CR4.TSD. No memory, stack
+    //   or flags are touched.
+    // SAFETY: reading the TSC has no side effects.
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+    }
+    u64::from(high) << 32 | u64::from(low)
+}
+
+/// Whether the TSC runs at a constant rate in all P-, C- and T-states:
+/// CPUID.80000007H:EDX[8] (SDM Vol. 3 section 20.17.1, "Invariant TSC").
+pub fn invariant_tsc() -> bool {
+    let (max_extended, ..) = cpuid(0x8000_0000, 0);
+    max_extended >= 0x8000_0007 && cpuid(0x8000_0007, 0).3 & (1 << 8) != 0
+}

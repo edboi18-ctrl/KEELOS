@@ -14,7 +14,7 @@ use keel_hal::arch::x86_64::gdt::{self, IstSlot};
 use keel_hal::arch::x86_64::{cpu, idt, paging, selftest as hw};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, kprintln, memory};
+use keel_hal::{console, interrupts, kprintln, memory, time};
 
 /// Lowest address of the canonical higher half with 4-level paging
 /// (Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing").
@@ -273,11 +273,7 @@ fn phase1(t: &mut Runner) {
     phase1_frames(t);
     phase1_paging(t);
     phase1_heap(t);
-    t.check(
-        "cpu.interrupts_off",
-        !cpu::interrupts_enabled(),
-        "maskable interrupts stay disabled until the APIC is set up",
-    );
+    phase1_interrupts(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -487,4 +483,65 @@ pub fn phase1_heap(t: &mut Runner) {
         "1 MiB allocation: own RW+NX pages, guard page after, frames returned and unmapped on free",
     );
     drop(numbers);
+}
+
+/// P1-T6, P1-T7: interrupt controllers, the periodic timer and the clock.
+pub fn phase1_interrupts(t: &mut Runner) {
+    let madt = keel_hal::acpi::madt();
+    t.check(
+        "acpi.madt",
+        madt.as_ref().is_ok_and(|m| {
+            m.entries
+                .iter()
+                .any(|e| matches!(e, keel_core::acpi::MadtEntry::IoApic { .. }))
+                && m.entries.iter().any(|e| {
+                    matches!(
+                        e,
+                        keel_core::acpi::MadtEntry::LocalApic { enabled: true, .. }
+                            | keel_core::acpi::MadtEntry::LocalX2Apic { enabled: true, .. }
+                    )
+                })
+        }),
+        "the MADT validates and lists an enabled CPU and an I/O APIC",
+    );
+    t.check(
+        "cpu.interrupts_on",
+        cpu::interrupts_enabled(),
+        "maskable interrupts are enabled after the APIC and timer are set up",
+    );
+
+    // 100 timer interrupts must take about 100 ms by the HPET. The bounds
+    // are wide because emulated time under TCG is not exact.
+    let start_ticks = time::ticks();
+    let start_ns = time::hpet_nanos();
+    while time::ticks() < start_ticks + 100 {
+        interrupts::wait();
+    }
+    let elapsed_ms = (time::hpet_nanos() - start_ns) / 1_000_000;
+    t.check(
+        "time.periodic_tick",
+        (50..=250).contains(&elapsed_ms),
+        "100 APIC timer interrupts took 50-250 ms by the HPET (1 kHz nominal)",
+    );
+
+    let mut previous = time::monotonic_nanos();
+    let mut monotonic = true;
+    for _ in 0..10_000 {
+        let now = time::monotonic_nanos();
+        monotonic &= now >= previous;
+        previous = now;
+    }
+    let (clock, reference) = (time::monotonic_nanos(), time::hpet_nanos());
+    let agrees = clock.abs_diff(reference) <= reference / 20 + 1_000_000;
+    t.check(
+        "time.monotonic",
+        monotonic && agrees,
+        "the monotonic clock never goes backwards and agrees with the HPET within 5%",
+    );
+
+    t.check(
+        "interrupts.no_strays",
+        interrupts::unexpected_count() == 0,
+        "no interrupt arrived on a vector without a handler",
+    );
 }

@@ -42,7 +42,9 @@ to `main` with PR #1.
 | P1-T3 | Physical frame allocator with per-frame reference counts | Done. Logic in `kernel/core` (`#![forbid(unsafe_code)]`), host unit tests; `hal::memory` zeroes every frame on allocation (SR-18). Boots with 256 MB to 13 GB of RAM; bookkeeping is about 0.06% of RAM (8 MB at 13 GB). |
 | P1-T4 | Kernel page tables with W^X; NX, WP, SMEP, SMAP, UMIP | Done. Table logic in `keel-core` (host tests); `hal::paging` builds a fresh PML4 (kernel text RX, rodata R, data RW+NX, direct map RW+NX with the framebuffer write-combining, nothing in the lower half), switches CR3 and enables every protection CPUID reports. The kernel image has no alias in the direct map. IST stacks now have unmapped guard pages (SR-17). |
 | P1-T5 | Kernel heap allocator | Done. `hal::heap`: eight power-of-two size classes (16 B to 2 KiB) plus whole-page allocations in a dedicated RW+NX region, each large allocation followed by an unmapped guard page; frames go back to the allocator on free. Host tests for the allocator core; in-kernel test with 22,000 live objects and a 1 MiB allocation. Virtual addresses of freed large allocations are not reused yet (64 GiB region). |
-| P1-T6 to P1-T14 | | Not started |
+| P1-T6 | ACPI MADT; local APIC and I/O APIC; legacy PIC masked | Done. Own ACPI parser in `keel-core` (ADR 0004), fed only byte ranges inside ACPI memory regions. Local APIC in xAPIC (MMIO) or x2APIC (MSR) mode, whichever the firmware left; I/O APICs mapped with all inputs masked; ISA IRQ routing honours MADT overrides. Device registers are mapped uncached through `paging::map_mmio`, which refuses addresses that overlap RAM (SR-20). The x2APIC path is untested: OVMF leaves xAPIC mode on. |
+| P1-T7 | Timer and monotonic clock | Done. HPET as reference; APIC timer and TSC calibrated against it over 10 ms; 1 kHz periodic tick; monotonic clock from the TSC when invariant, else the HPET. Under QEMU TCG no invariant TSC is reported, so the TSC path runs only under KVM and on real hardware. No PIT fallback yet if a machine has no HPET (to check on the OptiPlex in Phase 6). |
+| P1-T8 to P1-T14 | | Not started |
 | P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Protections done with P1-T4. The user-copy API arrives with user mode (P1-T10). |
 | P1-S1, P1-S3 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
 
@@ -63,7 +65,7 @@ Hardening notes for later Phase 1 work:
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
-- `cargo test`: 69 host unit tests pass (15 `keel-core`, 26 `keel-hal`, 28 `xtask`).
+- `cargo test`: 77 host unit tests pass (23 `keel-core`, 26 `keel-hal`, 28 `xtask`).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.
@@ -93,7 +95,7 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 65 | 241 | 26 | 13 |
+| `kernel/hal` | 83 | 270 | 28 | 13 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
@@ -103,7 +105,10 @@ allocator's bookkeeping, zeroing frames, frame access for tests); then
 P1-T4: control-register and MSR access, the page-table memory accessor,
 the CR3/CR4 switch, and two fault-triggering self-tests; then P1-T5:
 TLB invalidation and the heap's free-list and GlobalAlloc code (the
-`unsafe impl GlobalAlloc` is unavoidable for a Rust allocator). The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+`unsafe impl GlobalAlloc` is unavoidable for a Rust allocator); then
+P1-T6/T7: APIC register access (MMIO and MSR), I/O APIC and HPET
+register access, the ACPI physical-memory reader, interrupt-flag
+instructions, RDTSC, and the interrupt handler table. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes

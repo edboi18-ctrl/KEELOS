@@ -42,6 +42,11 @@ against copies downloaded from the vendors:
 | Linux `arch/x86/include/asm/cpufeatures.h` at v6.18 (X86_FEATURE_UMIP is leaf 7 ECX bit 2) | UMIP detection in `cpu.rs` |
 | AMD64 APM Vol. 2, Table A-1 (EFER at MSR C000_0080h); section 5 (SMEP/SMAP CPUID bits, which agree with Intel's) | `cpu.rs` |
 | Limine PROTOCOL.md, "Caching" (PAT0 = WB, PAT5 = WC; framebuffer mapped WC) and "Memory Layout at Entry" (which regions the HHDM covers; outward rounding to 4 KiB) | `hal::paging::init` |
+| ACPI Specification 6.6, chapter 5 (https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html, read 2026-11-21): Table 5.1 (Generic Address Structure), Table 5.3 (RSDP), section 5.2.6 (table header), Table 5.8 (XSDT), Tables 5.19-5.28 and section 5.2.12.12 (MADT and its entries, MPS INTI flags, PCAT_COMPAT) | `kernel/core/src/acpi.rs`, `kernel/hal/src/interrupts.rs` |
+| IA-PC HPET Specification 1.0a (file `hpet-spec-1-0a.pdf`, kib.kiev.ua mirror): section 2.3 register map and bit definitions; HPET description table | `kernel/hal/src/time.rs`, `kernel/core/src/acpi.rs` |
+| Intel 82093AA I/O APIC datasheet, order number 290566-001 (kib.kiev.ua mirror): sections 3.1, 3.2.2, 3.2.4 | `kernel/hal/src/arch/x86_64/apic.rs` |
+| Intel SDM Vol. 3 chapter 13: Table 13-1, Figures 13-5, 13-8, 13-10, 13-23, sections 13.5.4, 13.8.5, 13.9, 13.12; section 20.17.1 (invariant TSC) | `apic.rs`, `time.rs`, `cpu.rs` |
+| Linux `arch/x86/include/asm/i8259.h` at v6.18 (PIC mask ports 21h and A1h) | `apic::mask_legacy_pic` |
 | Rust platform-support page for `x86_64-unknown-none` (soft-float, no red zone) | Why the exception stub saves only general registers (`idt.rs`) |
 | Intel SDM Vol. 2A, "IN - Input from Port"; Vol. 2B, "OUT - Output to Port" | `kernel/hal/src/arch/x86_64/port.rs` |
 | Intel SDM Vol. 2A, "CLI - Clear Interrupt Flag", "HLT - Halt" | `kernel/hal/src/arch/x86_64/cpu.rs` |
