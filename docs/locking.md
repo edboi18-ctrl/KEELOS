@@ -5,11 +5,11 @@ spinlock. Update this file whenever a lock is added.
 
 | Order | Lock | Crate | Protects |
 | --- | --- | --- | --- |
-| 4 | `console::SERIAL` | `keel-hal` | The COM1 UART. Takes no lock except `FRAMEBUFFER`. |
-| 5 | `console::FRAMEBUFFER` | `keel-hal` | The framebuffer text console |
 | 1 | `heap::KERNEL_HEAP` | `keel-hal` | Kernel heap free lists. May take `paging::TABLES` (to map pages), which takes `memory::FRAMES`. |
 | 2 | `paging::TABLES` | `keel-hal` | The kernel's page tables after boot. May take `memory::FRAMES`. |
 | 3 | `memory::FRAMES` | `keel-hal` | The physical frame allocator. Takes no other lock. |
+| 4 | `console::SERIAL` | `keel-hal` | The COM1 UART. Takes no lock except `FRAMEBUFFER`. |
+| 5 | `console::FRAMEBUFFER` | `keel-hal` | The framebuffer text console |
 
 Notes:
 
