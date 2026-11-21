@@ -149,3 +149,37 @@ pub fn execute_kernel_data() -> ! {
         asm!("call {target}", "ud2", target = in(reg) target, options(noreturn));
     }
 }
+
+/// Puts `value` in the low 64 bits of XMM0.
+pub fn set_xmm0(value: u64) {
+    // Assembly reasoning (spec section 1, rule 4)
+    // `movq xmm0, {}` copies a general register into XMM0 (SDM Vol. 2B
+    // "MOVQ"). CR4.OSFXSR is set by fpu::init, so SSE instructions are
+    // allowed. The kernel is built without SSE, so no compiler-generated
+    // code relies on XMM0; this is how the FPU-isolation test plants a
+    // per-thread value. No memory, stack or flags are touched.
+    // SAFETY: changes only XMM0, which kernel code never uses.
+    unsafe { asm!("movq xmm0, {}", in(reg) value, options(nomem, nostack, preserves_flags)) }
+}
+
+/// Reads the low 64 bits of XMM0.
+pub fn get_xmm0() -> u64 {
+    let value: u64;
+    // Assembly reasoning (spec section 1, rule 4)
+    // `movq {}, xmm0` copies XMM0's low quadword out (SDM Vol. 2B "MOVQ").
+    // SAFETY: reading XMM0 has no side effects.
+    unsafe { asm!("movq {}, xmm0", out(reg) value, options(nomem, nostack, preserves_flags)) }
+    value
+}
+
+/// Recurses with 512-byte frames until the stack runs into its guard page
+/// (the `stack_overflow` scenario). Never returns.
+#[inline(never)]
+pub fn overflow_stack(depth: u64) -> u64 {
+    let frame = core::hint::black_box([depth; 64]);
+    if core::hint::black_box(true) {
+        overflow_stack(depth + 1).wrapping_add(frame[63])
+    } else {
+        frame[0]
+    }
+}

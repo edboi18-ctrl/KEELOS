@@ -52,8 +52,10 @@ pub(crate) fn dispatch(vector: u8) {
         let handler: fn() = unsafe { core::mem::transmute::<usize, fn()>(handler) };
         handler();
     }
-    // EOI before IRETQ (SDM 13.8.5).
+    // EOI before IRETQ (SDM 13.8.5), and before any thread switch, so the
+    // timer keeps interrupting whichever thread runs next.
     apic::end_of_interrupt();
+    crate::sched::preempt_if_needed();
 }
 
 /// Installs `handler` for `vector` (32-254). Returns false if the vector
@@ -210,4 +212,14 @@ pub fn wait() {
     );
     // SAFETY: as for `enable`; `sti; hlt` cannot miss a wake-up.
     unsafe { crate::arch::x86_64::cpu::enable_and_wait() }
+}
+
+/// Re-enables interrupts after a thread switch. Only the scheduler calls
+/// this, on behalf of a thread that had interrupts enabled when it gave up
+/// the CPU, or that is starting for the first time.
+pub(crate) fn enable_after_switch() {
+    // SAFETY: called only after `enable` (the scheduler starts after it)
+    // and with no spinlock held: the scheduler releases its locks before
+    // switching and before calling this.
+    unsafe { crate::arch::x86_64::cpu::enable_interrupts() }
 }

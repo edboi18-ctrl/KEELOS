@@ -23,4 +23,7 @@ pub mod heap;
 pub mod interrupts;
 pub mod memory;
 #[cfg(target_os = "none")]
+pub mod sched;
+pub mod sync;
+#[cfg(target_os = "none")]
 pub mod time;

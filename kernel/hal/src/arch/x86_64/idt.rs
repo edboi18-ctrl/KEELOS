@@ -375,7 +375,9 @@ extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
 
 #[cfg(target_os = "none")]
 fn fatal(frame: &TrapFrame) -> ! {
-    let cr2 = if frame.vector == 14 {
+    // CR2 matters for #PF and for a #DF caused by a page fault (such as a
+    // stack running into its guard page).
+    let cr2 = if matches!(frame.vector, 8 | 14) {
         super::cpu::read_cr2()
     } else {
         0

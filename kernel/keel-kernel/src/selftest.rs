@@ -14,7 +14,7 @@ use keel_hal::arch::x86_64::gdt::{self, IstSlot};
 use keel_hal::arch::x86_64::{cpu, idt, paging, selftest as hw};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, interrupts, kprintln, memory, time};
+use keel_hal::{console, interrupts, kprintln, memory, sched, time};
 
 /// Lowest address of the canonical higher half with 4-level paging
 /// (Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing").
@@ -41,6 +41,7 @@ pub enum Scenario {
     DoubleFault = 1,
     WriteKernelText = 2,
     ExecuteData = 3,
+    StackOverflow = 4,
     Unknown = 255,
 }
 
@@ -54,6 +55,7 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
         Some("double_fault") => Scenario::DoubleFault,
         Some("write_kernel_text") => Scenario::WriteKernelText,
         Some("execute_data") => Scenario::ExecuteData,
+        Some("stack_overflow") => Scenario::StackOverflow,
         Some(_) => Scenario::Unknown,
     }
 }
@@ -89,6 +91,13 @@ pub fn judge_expected_fault() {
                 && fault.error_code & (PRESENT | INSTRUCTION_FETCH) == PRESENT | INSTRUCTION_FETCH
                 && paging::translate(fault.fault_address).is_some_and(|t| !t.flags.executable),
             "an instruction fetch from kernel data raised #PF (present, fetch) (SR-12)",
+        ),
+        s if s == Scenario::StackOverflow as u8 => (
+            "sched.stack_guard",
+            fault.vector == 8
+                && idt::ist_containing(fault.frame_address) == Some(IstSlot::DoubleFault)
+                && paging::is_kernel_stack_guard(fault.fault_address),
+            "a kernel thread overflowing its stack hit its guard page and was caught on IST1 (SR-17)",
         ),
         _ => return,
     };
@@ -136,6 +145,16 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
             ACTIVE_SCENARIO.store(Scenario::WriteKernelText as u8, Ordering::Relaxed);
             kprintln!("selftest: writing to kernel text");
             hw::write_to_kernel_text();
+        }
+        (1, Scenario::StackOverflow) => {
+            ACTIVE_SCENARIO.store(Scenario::StackOverflow as u8, Ordering::Relaxed);
+            kprintln!("selftest: overflowing a kernel thread's stack");
+            let _ = sched::spawn("overflow", || {
+                let _ = hw::overflow_stack(0);
+            });
+            loop {
+                sched::sleep_ms(1000);
+            }
         }
         (1, Scenario::ExecuteData) => {
             ACTIVE_SCENARIO.store(Scenario::ExecuteData as u8, Ordering::Relaxed);
@@ -274,6 +293,7 @@ fn phase1(t: &mut Runner) {
     phase1_paging(t);
     phase1_heap(t);
     phase1_interrupts(t);
+    phase1_sched(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -543,5 +563,113 @@ pub fn phase1_interrupts(t: &mut Runner) {
         "interrupts.no_strays",
         interrupts::unexpected_count() == 0,
         "no interrupt arrived on a vector without a handler",
+    );
+}
+
+static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static WAKE: sched::WaitQueue = sched::WaitQueue::new();
+static XMM_OK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn counting_worker() {
+    for _ in 0..1000 {
+        COUNTER.fetch_add(1, Ordering::Relaxed);
+        sched::yield_now();
+    }
+}
+
+fn xmm_worker(pattern: u64) {
+    hw::set_xmm0(pattern);
+    let mut ok = true;
+    for _ in 0..200 {
+        sched::yield_now();
+        ok &= hw::get_xmm0() == pattern;
+    }
+    if ok {
+        XMM_OK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// P1-T8: threads, preemption, sleeping, wait queues, FPU isolation.
+pub fn phase1_sched(t: &mut Runner) {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    let frames_before = memory::free_frames();
+    let switches_before = sched::switch_count();
+    let mut ids = alloc::vec::Vec::new();
+    for _ in 0..4 {
+        ids.extend(sched::spawn("counter", counting_worker).ok());
+    }
+    for id in &ids {
+        sched::join(*id);
+    }
+    t.check(
+        "sched.round_robin",
+        ids.len() == 4
+            && COUNTER.load(Relaxed) == 4000
+            && sched::switch_count() >= switches_before + 4000,
+        "four threads yielding to each other all ran to completion",
+    );
+
+    // A thread that never yields: the boot thread only gets the CPU back
+    // to set STOP if the timer preempts it.
+    let spinner = sched::spawn("spinner", || {
+        while !STOP.load(Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    });
+    sched::sleep_ms(30);
+    STOP.store(true, Relaxed);
+    if let Ok(id) = spinner {
+        sched::join(id);
+    }
+    t.check(
+        "sched.preemption",
+        spinner.is_ok(),
+        "a thread spinning without yielding was preempted by the timer",
+    );
+
+    let start = time::monotonic_nanos();
+    sched::sleep_ms(50);
+    let slept_ms = (time::monotonic_nanos() - start) / 1_000_000;
+    t.check(
+        "sched.sleep",
+        (50..=200).contains(&slept_ms),
+        "sleep_ms(50) slept between 50 and 200 ms",
+    );
+
+    let producer = sched::spawn("producer", || {
+        sched::sleep_ms(10);
+        READY.store(true, Ordering::Relaxed);
+        WAKE.wake_all();
+    });
+    WAKE.wait_until(|| READY.load(Ordering::Relaxed));
+    if let Ok(id) = producer {
+        sched::join(id);
+    }
+    t.check(
+        "sched.wait_queue",
+        producer.is_ok() && READY.load(Relaxed),
+        "a thread blocked on a wait queue was woken by another thread",
+    );
+
+    let a = sched::spawn("xmm-a", || xmm_worker(0x1111_2222_3333_4444));
+    let b = sched::spawn("xmm-b", || xmm_worker(0x5555_6666_7777_8888));
+    for id in [a, b].into_iter().flatten() {
+        sched::join(id);
+    }
+    t.check(
+        "sched.fpu_isolation",
+        XMM_OK.load(Relaxed) == 2,
+        "two threads kept their own XMM0 across 200 switches each",
+    );
+
+    // All those threads have exited; their stacks must be gone again.
+    sched::yield_now();
+    t.check(
+        "sched.reclaim",
+        sched::thread_count() == 2 && memory::free_frames() + 64 >= frames_before,
+        "exited threads are removed and their stack frames returned",
     );
 }

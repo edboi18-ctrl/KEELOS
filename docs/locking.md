@@ -5,6 +5,8 @@ spinlock. Update this file whenever a lock is added.
 
 | Order | Lock | Crate | Protects |
 | --- | --- | --- | --- |
+| 0 | `sched::WaitQueue::waiters` (each queue) | `keel-hal` | Threads blocked on that queue. Taken before `sched::SCHED`. |
+| 0.5 | `sched::SCHED` | `keel-hal` | Thread table, run queue, current thread. May take the heap lock (queue growth) and, when reaping, the page-table and frame locks. |
 | 1 | `heap::KERNEL_HEAP` | `keel-hal` | Kernel heap free lists. May take `paging::TABLES` (to map pages), which takes `memory::FRAMES`. |
 | 2 | `paging::TABLES` | `keel-hal` | The kernel's page tables after boot. May take `memory::FRAMES`. |
 | 3 | `memory::FRAMES` | `keel-hal` | The physical frame allocator. Takes no other lock. |
@@ -19,6 +21,10 @@ Notes:
 - Never allocate from an interrupt or exception handler: the interrupted
   code may hold the heap lock. The fatal-exception path does not allocate.
 
+- `heap::KERNEL_HEAP`, `paging::TABLES`, `memory::FRAMES`, `sched::SCHED`
+  and every `WaitQueue` are `sync::IrqMutex`es: interrupts are disabled
+  while one is held, so the scheduler never preempts a thread inside
+  them. Keep those critical sections short.
 - Interrupts are enabled from P1-T7 on. Interrupt handlers take no lock
   at all (the timer handler only increments an atomic counter), so no
   lock above can be re-entered by an interrupt. Any future handler that

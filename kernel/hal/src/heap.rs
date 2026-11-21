@@ -19,7 +19,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
 
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 const PAGE: usize = 4096;
 const MIN_CLASS_SHIFT: u32 = 4; // 16 bytes: room for the free-list link
@@ -148,7 +148,7 @@ impl<P: PageSource> Heap<P> {
 }
 
 /// [`Heap`] behind a spinlock, usable as `#[global_allocator]`.
-pub struct LockedHeap<P: PageSource>(Mutex<Heap<P>>);
+pub struct LockedHeap<P: PageSource>(IrqMutex<Heap<P>>);
 
 // SAFETY: all access to the raw free-list pointers goes through the
 // mutex, and the memory they point to belongs to the heap alone.
@@ -159,7 +159,7 @@ unsafe impl<P: PageSource + Send> Send for Heap<P> {}
 impl<P: PageSource> LockedHeap<P> {
     /// An empty heap.
     pub const fn new(source: P) -> Self {
-        Self(Mutex::new(Heap::new(source)))
+        Self(IrqMutex::new(Heap::new(source)))
     }
 }
 

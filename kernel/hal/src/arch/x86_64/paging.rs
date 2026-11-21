@@ -67,7 +67,7 @@ static ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// Serialises every change to, and walk of, the kernel's page tables after
 /// `init`. Lock order: see docs/locking.md.
-static TABLES: spin::Mutex<()> = spin::Mutex::new(());
+static TABLES: crate::sync::IrqMutex<()> = crate::sync::IrqMutex::new(());
 
 /// What `init` set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,11 +343,25 @@ pub fn map_mmio(phys: u64, length: u64) -> Result<u64, MmioError> {
 /// pages `[virt, virt + pages * 4096)` inside the kernel-heap region.
 /// On failure nothing stays mapped.
 pub fn map_heap_pages(virt: u64, pages: u64) -> Result<(), paging::MapError> {
-    let in_region = virt >= KERNEL_HEAP_BASE
+    map_fresh_pages(
+        virt,
+        pages,
+        KERNEL_HEAP_BASE..KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE,
+    )
+}
+
+/// Maps `pages` fresh zeroed frames RW+NX at `virt`, which must lie with
+/// its whole length inside `region`. On failure nothing stays mapped.
+fn map_fresh_pages(
+    virt: u64,
+    pages: u64,
+    region: core::ops::Range<u64>,
+) -> Result<(), paging::MapError> {
+    let in_region = virt >= region.start
         && pages
             .checked_mul(PAGE)
             .and_then(|len| virt.checked_add(len))
-            .is_some_and(|end| end <= KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE);
+            .is_some_and(|end| end <= region.end);
     let root = ROOT.load(Ordering::Acquire);
     // Before `init` there are no kernel tables to map into.
     if !in_region || root == 0 {
@@ -380,6 +394,70 @@ pub fn map_heap_pages(virt: u64, pages: u64) -> Result<(), paging::MapError> {
         }
     }
     Ok(())
+}
+
+/// Start of the kernel-stack region.
+pub const KERNEL_STACKS_BASE: u64 = 0xffff_e000_0000_0000;
+const KERNEL_STACKS_SIZE: u64 = 64 << 30;
+static NEXT_STACK: AtomicU64 = AtomicU64::new(KERNEL_STACKS_BASE);
+
+/// A kernel stack: mapped pages with an unmapped guard page directly
+/// below them (SR-17). Overflowing it faults on the guard page; the fault
+/// cannot be delivered on the exhausted stack, so it becomes a double
+/// fault, which runs on its own IST stack and reports cleanly.
+#[derive(Debug)]
+pub struct KernelStack {
+    /// Lowest mapped address.
+    pub base: u64,
+    /// One past the highest mapped address; 16-byte aligned.
+    pub top: u64,
+}
+
+impl KernelStack {
+    /// The unmapped guard page below the stack.
+    pub fn guard_page(&self) -> u64 {
+        self.base - PAGE
+    }
+}
+
+/// Allocates a kernel stack of `pages` pages. Virtual space is not reused
+/// yet (64 GiB is far more than Phase 1 needs); frames are.
+pub fn map_kernel_stack(pages: u64) -> Option<KernelStack> {
+    let slot = pages.checked_add(1)?.checked_mul(PAGE)?;
+    let guard = NEXT_STACK.fetch_add(slot, Ordering::AcqRel);
+    let base = guard + PAGE;
+    map_fresh_pages(
+        base,
+        pages,
+        KERNEL_STACKS_BASE..KERNEL_STACKS_BASE + KERNEL_STACKS_SIZE,
+    )
+    .ok()?;
+    Some(KernelStack {
+        base,
+        top: base + pages * PAGE,
+    })
+}
+
+/// Unmaps a kernel stack and frees its frames. The caller must not be
+/// running on it.
+pub fn unmap_kernel_stack(stack: KernelStack) {
+    let root = ROOT.load(Ordering::Acquire);
+    if root == 0 {
+        return;
+    }
+    let root = Frame::containing(root);
+    let _guard = TABLES.lock();
+    let mut page = stack.base;
+    while page < stack.top {
+        unmap_locked(root, page);
+        page += PAGE;
+    }
+}
+
+/// Whether `address` is in the guard page of some kernel stack.
+pub fn is_kernel_stack_guard(address: u64) -> bool {
+    (KERNEL_STACKS_BASE..NEXT_STACK.load(Ordering::Acquire)).contains(&address)
+        && translate(address).is_none()
 }
 
 /// Unmaps heap pages mapped by `map_heap_pages` and frees their frames.

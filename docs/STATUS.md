@@ -44,7 +44,8 @@ to `main` with PR #1.
 | P1-T5 | Kernel heap allocator | Done. `hal::heap`: eight power-of-two size classes (16 B to 2 KiB) plus whole-page allocations in a dedicated RW+NX region, each large allocation followed by an unmapped guard page; frames go back to the allocator on free. Host tests for the allocator core; in-kernel test with 22,000 live objects and a 1 MiB allocation. Virtual addresses of freed large allocations are not reused yet (64 GiB region). |
 | P1-T6 | ACPI MADT; local APIC and I/O APIC; legacy PIC masked | Done. Own ACPI parser in `keel-core` (ADR 0004), fed only byte ranges inside ACPI memory regions. Local APIC in xAPIC (MMIO) or x2APIC (MSR) mode, whichever the firmware left; I/O APICs mapped with all inputs masked; ISA IRQ routing honours MADT overrides. Device registers are mapped uncached through `paging::map_mmio`, which refuses addresses that overlap RAM (SR-20). The x2APIC path is untested: OVMF leaves xAPIC mode on. |
 | P1-T7 | Timer and monotonic clock | Done. HPET as reference; APIC timer and TSC calibrated against it over 10 ms; 1 kHz periodic tick; monotonic clock from the TSC when invariant, else the HPET. Under QEMU TCG no invariant TSC is reported, so the TSC path runs only under KVM and on real hardware. No PIT fallback yet if a machine has no HPET (to check on the OptiPlex in Phase 6). |
-| P1-T8 to P1-T14 | | Not started |
+| P1-T8 | Kernel threads, context switch, preemptive round-robin scheduler, sleep and wait queues, FPU/SSE/AVX state | Done. Each thread has a 64 KiB kernel stack with an unmapped guard page and its own XSAVE area (FXSAVE where XSAVE is missing), sized from CPUID; XCR0 enables x87, SSE, AVX, and AVX-512 when complete. 10 ms time slices from the 1 kHz tick; switches happen after the EOI. The heap, page-table, frame and scheduler locks disable interrupts while held, so no thread is preempted holding one. Tests: round robin, preemption of a non-yielding thread, sleep accuracy, wait-queue wake-up, XMM isolation across 400 switches (checked to fail when save/restore is removed), reclamation of exited threads, and a stack-overflow scenario caught on the guard page. |
+| P1-T9 to P1-T14 | | Not started |
 | P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Protections done with P1-T4. The user-copy API arrives with user mode (P1-T10). |
 | P1-S1, P1-S3 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
 
@@ -57,8 +58,9 @@ mode.
 Hardening notes for later Phase 1 work:
 - `.data.rel.ro` and `.got` stay writable after the bootloader relocates
   them. Making them read-only after boot (RELRO) is a small follow-up.
-- The kernel still runs on Limine's boot stack, which has no guard page;
-  kernel threads (P1-T8) get their own guarded stacks.
+- The boot thread still runs on Limine's boot stack, which has no guard
+  page; every other kernel thread has a guarded stack (P1-T8). Moving the
+  boot thread onto a guarded stack is a small follow-up.
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
@@ -95,7 +97,7 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 83 | 270 | 28 | 13 |
+| `kernel/hal` | 101 | 321 | 33 | 13 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
@@ -108,7 +110,10 @@ TLB invalidation and the heap's free-list and GlobalAlloc code (the
 `unsafe impl GlobalAlloc` is unavoidable for a Rust allocator); then
 P1-T6/T7: APIC register access (MMIO and MSR), I/O APIC and HPET
 register access, the ACPI physical-memory reader, interrupt-flag
-instructions, RDTSC, and the interrupt handler table. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+instructions, RDTSC, and the interrupt handler table; then P1-T8: the
+context switch and new-thread frame, XSAVE/FXSAVE save and restore,
+XSETBV, the save-area allocation, the interrupt-disabling lock, and
+three self-test helpers (XMM0 access, stack overflow). The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes

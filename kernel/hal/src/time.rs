@@ -80,7 +80,8 @@ pub fn ticks() -> u64 {
 }
 
 fn on_tick() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::sched::on_tick(tick);
 }
 
 /// What `init` measured.

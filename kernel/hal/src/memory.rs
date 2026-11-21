@@ -12,8 +12,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::sync::IrqMutex;
 use keel_core::frame::{FRAME_SIZE, Frame, FrameAllocator, FrameError, bookkeeping_len};
-use spin::Mutex;
 
 use crate::boot::{self, RegionKind};
 
@@ -22,7 +22,7 @@ use crate::boot::{self, RegionKind};
 /// reports a nonsensical region (SR-20: hardware input is untrusted).
 const MAX_PHYSICAL: u64 = 1 << 40;
 
-static FRAMES: Mutex<Option<FrameAllocator<'static>>> = Mutex::new(None);
+static FRAMES: IrqMutex<Option<FrameAllocator<'static>>> = IrqMutex::new(None);
 static HHDM: AtomicU64 = AtomicU64::new(0);
 
 /// What `init` found.
