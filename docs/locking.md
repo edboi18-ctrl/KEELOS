@@ -7,6 +7,7 @@ spinlock. Update this file whenever a lock is added.
 | --- | --- | --- | --- |
 | 1 | `console::SERIAL` | `keel-hal` | The COM1 UART |
 | 2 | `console::FRAMEBUFFER` | `keel-hal` | The framebuffer text console |
+| 3 | `memory::FRAMES` | `keel-hal` | The physical frame allocator. Never held while printing; nothing else is locked while it is held. |
 
 Notes:
 

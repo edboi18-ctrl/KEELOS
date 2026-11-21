@@ -14,3 +14,4 @@ pub mod arch;
 pub mod boot;
 pub mod console;
 pub mod drivers;
+pub mod memory;

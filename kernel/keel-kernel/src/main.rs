@@ -12,7 +12,7 @@ use keel_hal::arch::x86_64::cpu::halt_forever;
 use keel_hal::arch::x86_64::init_descriptor_tables;
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, kprintln};
+use keel_hal::{console, kprintln, memory};
 
 /// Set once the command line asked for self-tests, so that a panic can
 /// report failure to the test harness instead of hanging until timeout.
@@ -54,6 +54,19 @@ extern "C" fn kmain() -> ! {
     let fb_size = console::init_framebuffer();
     kprintln!("Keel {} booting", env!("CARGO_PKG_VERSION"));
     report_boot_info(serial_ok, fb_size);
+
+    match memory::init() {
+        Ok(stats) => kprintln!(
+            "mem: {} frames managed, {} free ({} MiB); bookkeeping at {:#x}..{:#x}",
+            stats.frames_managed,
+            stats.frames_free,
+            stats.frames_free * 4096 / (1024 * 1024),
+            stats.bookkeeping.start,
+            stats.bookkeeping.end
+        ),
+        // Nothing past this point can work without physical memory.
+        Err(error) => panic!("frame allocator setup failed: {error:?}"),
+    }
 
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {

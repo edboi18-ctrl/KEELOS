@@ -116,10 +116,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-core"
+version = "0.0.0"
+
+[[package]]
 name = "keel-hal"
 version = "0.0.0"
 dependencies = [
  "font8x8",
+ "keel-core",
  "spin",
 ]
 
@@ -127,6 +132,7 @@ dependencies = [
 name = "keel-kernel"
 version = "0.0.0"
 dependencies = [
+ "keel-core",
  "keel-hal",
 ]
 

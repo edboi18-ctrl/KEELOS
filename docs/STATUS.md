@@ -32,7 +32,8 @@ the Phase 0 pull request (#1) awaits the owner's merge.
 | --- | --- | --- |
 | P1-T1 | GDT, TSS with RSP0 and IST stacks | Done. Linux-compatible selectors; no 32-bit user code segment; no I/O bitmap (SR-9). IST stacks lack guard pages until P1-T4. |
 | P1-T2 | IDT, exception handlers with register dump, double fault on its own stack | Done. Tests: `idt.breakpoint` (INT3 round trip preserves registers), scenario `double_fault` (#DF lands on IST1). |
-| P1-T3 to P1-T14 | | Not started |
+| P1-T3 | Physical frame allocator with per-frame reference counts | Done. Logic in `kernel/core` (`#![forbid(unsafe_code)]`), host unit tests; `hal::memory` zeroes every frame on allocation (SR-18). Boots with 256 MB to 13 GB of RAM; bookkeeping is about 0.06% of RAM (8 MB at 13 GB). |
+| P1-T4 to P1-T14 | | Not started |
 | P1-S1 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
@@ -40,7 +41,7 @@ the Phase 0 pull request (#1) awaits the owner's merge.
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
-- `cargo test`: 42 host unit tests pass (15 `keel-hal`, 27 `xtask`).
+- `cargo test`: 55 host unit tests pass (6 `keel-core`, 21 `keel-hal`, 28 `xtask`).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.
@@ -70,12 +71,13 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 43 | 169 | 14 | 13 |
+| `kernel/hal` | 46 | 177 | 14 | 13 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
 the CPU register reads, and the self-test triggers, each with its
-reasoning block. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+reasoning block; then three blocks in `hal::memory` (carving the
+allocator's bookkeeping, zeroing frames, frame access for tests). The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes

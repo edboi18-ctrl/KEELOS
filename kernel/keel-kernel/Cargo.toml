@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 keel-hal = { path = "../hal" }
+keel-core = { path = "../core" }
 
 [lints]
 workspace = true

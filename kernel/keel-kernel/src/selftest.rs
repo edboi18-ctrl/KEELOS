@@ -14,7 +14,7 @@ use keel_hal::arch::x86_64::gdt::{self, IstSlot};
 use keel_hal::arch::x86_64::{cpu, idt, selftest as hw};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, kprintln};
+use keel_hal::{console, kprintln, memory};
 
 /// Lowest address of the canonical higher half with 4-level paging
 /// (Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing").
@@ -78,7 +78,7 @@ pub fn judge_expected_fault() {
     }
 }
 
-struct Runner {
+pub struct Runner {
     passed: u32,
     failed: u32,
 }
@@ -238,9 +238,84 @@ fn phase1(t: &mut Runner) {
         preserved && idt::breakpoint_count() == before + 1,
         "INT3 reaches the handler once and returns with all registers intact",
     );
+    phase1_frames(t);
     t.check(
         "cpu.interrupts_off",
         !cpu::interrupts_enabled(),
         "maskable interrupts stay disabled until the APIC is set up",
+    );
+}
+
+/// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
+/// memory and zero-filled, even after a previous owner dirtied them; and
+/// freeing returns the allocator to its starting count.
+pub fn phase1_frames(t: &mut Runner) {
+    const COUNT: usize = 64;
+    let baseline = memory::free_frames();
+    let mut frames = [None; COUNT];
+    for slot in frames.iter_mut() {
+        *slot = memory::allocate_zeroed();
+    }
+    let all = frames.iter().all(Option::is_some);
+    let frames = frames.map(|f| f.unwrap_or(keel_core::frame::Frame::containing(0)));
+
+    let mut distinct = all;
+    for (i, a) in frames.iter().enumerate() {
+        distinct &= frames[i + 1..].iter().all(|b| a != b);
+    }
+    let in_usable = frames.iter().all(|f| {
+        f.address() != 0
+            && f.address() % 4096 == 0
+            && boot::memory_map().any(|r| {
+                r.kind == RegionKind::Usable
+                    && r.base <= f.address()
+                    && f.address() < r.base + r.length
+            })
+    });
+    t.check(
+        "frames.allocate",
+        all && distinct && in_usable && memory::free_frames() == baseline - COUNT,
+        "64 frames are distinct, aligned, in usable RAM, and counted",
+    );
+
+    let zeroed = frames
+        .iter()
+        .all(|&f| memory::with_frame_bytes(f, |bytes| bytes.iter().all(|&b| b == 0)) == Ok(true));
+    // Dirty every frame, free it, and allocate again: the allocator hands
+    // frames back out, and each must arrive zeroed (SR-18).
+    for &f in &frames {
+        let _ = memory::with_frame_bytes(f, |bytes| bytes.fill(0xA5));
+        let _ = memory::release(f);
+    }
+    let mut reused_zeroed = true;
+    let mut again = [None; COUNT];
+    for slot in again.iter_mut() {
+        let frame = memory::allocate_zeroed();
+        reused_zeroed &= frame.is_some_and(|f| {
+            memory::with_frame_bytes(f, |bytes| bytes.iter().all(|&b| b == 0)) == Ok(true)
+        });
+        *slot = frame;
+    }
+    let reused = again
+        .iter()
+        .flatten()
+        .filter(|f| frames.contains(f))
+        .count();
+    t.check(
+        "frames.zeroed",
+        zeroed && reused_zeroed && reused > 0,
+        "new frames read as zero, including frames a previous owner filled (SR-18)",
+    );
+
+    for frame in again.iter().flatten() {
+        let _ = memory::release(*frame);
+    }
+    let stale = frames[0];
+    t.check(
+        "frames.release",
+        memory::free_frames() == baseline
+            && memory::release(stale).is_err()
+            && memory::with_frame_bytes(stale, |_| ()).is_err(),
+        "freeing restores the count; a freed frame can be neither freed again nor read",
     );
 }
