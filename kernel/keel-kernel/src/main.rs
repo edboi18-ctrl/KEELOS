@@ -9,6 +9,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use keel_hal::arch::x86_64::cpu::halt_forever;
+use keel_hal::arch::x86_64::init_descriptor_tables;
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
 use keel_hal::{console, kprintln};
@@ -33,6 +34,9 @@ static TEST_MODE: AtomicBool = AtomicBool::new(false);
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     let serial_ok = console::init_serial();
+    // Own GDT, TSS and IDT before anything can fault, so that a fault is
+    // reported with a register dump instead of resetting the machine.
+    init_descriptor_tables();
 
     let revision = boot::base_revision();
     if !revision.supported {
@@ -54,7 +58,7 @@ extern "C" fn kmain() -> ! {
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {
         TEST_MODE.store(true, Ordering::Relaxed);
-        let passed = selftest::run(phase);
+        let passed = selftest::run(phase, selftest::requested_scenario(boot::cmdline()));
         exit_qemu(if passed {
             ExitCode::Success
         } else {
@@ -124,6 +128,11 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
 /// stops. In self-test mode the failure is reported to QEMU first.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    if TEST_MODE.load(Ordering::Relaxed) {
+        // A scenario that ends in a deliberate fatal exception judges the
+        // outcome here and exits QEMU itself.
+        selftest::judge_expected_fault();
+    }
     console::emergency_print(format_args!("\n*** KEEL KERNEL PANIC ***\n{info}\n"));
     if TEST_MODE.load(Ordering::Relaxed) {
         exit_qemu(ExitCode::Failure);

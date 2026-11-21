@@ -14,8 +14,9 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 pub enum BootMode {
     /// Normal boot.
     Normal,
-    /// Run the self-tests of a phase, then exit QEMU.
-    Test(u32),
+    /// Run the self-tests of a phase (or one named scenario of it), then
+    /// exit QEMU.
+    Test(u32, Option<&'static str>),
 }
 
 /// The files of a finished build, in the order they sit on the boot volume.
@@ -95,8 +96,12 @@ pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
         "    module_path: boot():/{INITRAMFS_PATH}#{}\n",
         util::blake2b_hex(initramfs)
     ));
-    if let BootMode::Test(phase) = mode {
-        conf.push_str(&format!("    cmdline: test={phase}\n"));
+    match mode {
+        BootMode::Normal => {}
+        BootMode::Test(phase, None) => conf.push_str(&format!("    cmdline: test={phase}\n")),
+        BootMode::Test(phase, Some(scenario)) => {
+            conf.push_str(&format!("    cmdline: test={phase} scenario={scenario}\n"))
+        }
     }
     conf
 }
@@ -154,7 +159,9 @@ mod tests {
         assert!(conf.contains("hash_mismatch_panic: yes\n"));
         assert!(!conf.contains("cmdline"));
 
-        let conf = limine_conf(b"kernel", b"initramfs", BootMode::Test(0));
+        let conf = limine_conf(b"kernel", b"initramfs", BootMode::Test(0, None));
         assert!(conf.contains("    cmdline: test=0\n"));
+        let conf = limine_conf(b"k", b"i", BootMode::Test(1, Some("double_fault")));
+        assert!(conf.contains("    cmdline: test=1 scenario=double_fault\n"));
     }
 }

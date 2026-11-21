@@ -35,7 +35,18 @@ SECTIONS
     . = 0xffffffff80000000;
     __kernel_start = .;
 
+    /*
+     * Entry trampoline (SR-14). Exception and (later) syscall entry code
+     * and the data the processor reads while entering the kernel (GDT,
+     * IDT, TSS, IST stacks) are grouped into their own page-aligned ranges
+     * so that page-table isolation can map exactly these pages into user
+     * page tables and nothing else from the kernel image.
+     */
     .text : {
+        __entry_text_start = .;
+        KEEP(*(.text.keel_entry))
+        . = ALIGN(4096);
+        __entry_text_end = .;
         *(.text .text.*)
     } :text
 
@@ -55,6 +66,10 @@ SECTIONS
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .data : {
+        __entry_data_start = .;
+        KEEP(*(.data.keel_entry))
+        . = ALIGN(4096);
+        __entry_data_end = .;
         *(.data .data.*)
 
         /* Limine request block: markers must enclose every request. */
@@ -71,6 +86,11 @@ SECTIONS
     .dynamic : { *(.dynamic) } :data :dynamic
 
     .bss : {
+        . = ALIGN(4096);
+        __entry_bss_start = .;
+        *(.bss.keel_entry)
+        . = ALIGN(4096);
+        __entry_bss_end = .;
         *(.bss .bss.*)
         *(COMMON)
     } :data

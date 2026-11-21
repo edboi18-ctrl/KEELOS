@@ -8,7 +8,12 @@
 //! The test flag only adds checks; it disables no security control
 //! (SR-21).
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use keel_hal::arch::x86_64::gdt::{self, IstSlot};
+use keel_hal::arch::x86_64::{cpu, idt, selftest as hw};
 use keel_hal::boot::{self, RegionKind};
+use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
 use keel_hal::{console, kprintln};
 
 /// Lowest address of the canonical higher half with 4-level paging
@@ -25,6 +30,52 @@ pub fn requested_phase(cmdline: &str) -> Option<u32> {
         .split_ascii_whitespace()
         .find_map(|word| word.strip_prefix("test="))
         .and_then(|value| value.parse().ok())
+}
+
+/// Scenarios: boots that test one behaviour which ends the kernel, such as
+/// a double fault. Selected with `scenario=<name>` next to `test=<n>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Scenario {
+    None = 0,
+    DoubleFault = 1,
+    Unknown = 255,
+}
+
+/// Extracts the scenario from a `scenario=<name>` word on the command line.
+pub fn requested_scenario(cmdline: &str) -> Scenario {
+    match cmdline
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("scenario="))
+    {
+        None => Scenario::None,
+        Some("double_fault") => Scenario::DoubleFault,
+        Some(_) => Scenario::Unknown,
+    }
+}
+
+/// The scenario that is running, for the panic handler.
+static ACTIVE_SCENARIO: AtomicU8 = AtomicU8::new(Scenario::None as u8);
+
+/// Called from the panic handler in test mode. If the running scenario
+/// expected exactly this fatal exception, report PASS and exit QEMU;
+/// otherwise return so the normal panic path reports a failure.
+pub fn judge_expected_fault() {
+    if ACTIVE_SCENARIO.load(Ordering::Relaxed) != Scenario::DoubleFault as u8 {
+        return;
+    }
+    let Some(fault) = idt::last_fatal_exception() else {
+        return;
+    };
+    let on_ist1 = idt::ist_containing(fault.frame_address) == Some(IstSlot::DoubleFault);
+    if fault.vector == 8 && on_ist1 {
+        console::emergency_print(format_args!(
+            "TEST idt.double_fault PASS #DF delivered on the IST1 stack (frame at {:#x})\n\
+             TEST SUMMARY passed=1 failed=0\n",
+            fault.frame_address
+        ));
+        exit_qemu(ExitCode::Success);
+    }
 }
 
 struct Runner {
@@ -44,15 +95,26 @@ impl Runner {
     }
 }
 
-/// Runs the self-tests for `phase` and returns whether all passed.
-pub fn run(phase: u32) -> bool {
+/// Runs the self-tests for `phase` (or one scenario) and returns whether
+/// all passed. A scenario may not return at all.
+pub fn run(phase: u32, scenario: Scenario) -> bool {
     let mut runner = Runner {
         passed: 0,
         failed: 0,
     };
-    match phase {
-        0 => phase0(&mut runner),
-        _ => runner.check("selftest.phase", false, "unknown phase requested"),
+    match (phase, scenario) {
+        (0, Scenario::None) => phase0(&mut runner),
+        (1, Scenario::None) => phase1(&mut runner),
+        (1, Scenario::DoubleFault) => {
+            ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
+            kprintln!("selftest: forcing a double fault");
+            hw::trigger_double_fault();
+        }
+        _ => runner.check(
+            "selftest.phase",
+            false,
+            "unknown phase or scenario requested",
+        ),
     }
     kprintln!(
         "TEST SUMMARY passed={} failed={}",
@@ -146,5 +208,39 @@ fn phase0(t: &mut Runner) {
         "fb.marker",
         shown,
         "framebuffer pixels show the acceptance marker",
+    );
+}
+
+fn phase1(t: &mut Runner) {
+    // P1-T1: our GDT and TSS are live.
+    let segments = cpu::segment_state();
+    t.check(
+        "gdt.selectors",
+        segments.cs == gdt::KERNEL_CS
+            && segments.ss == gdt::KERNEL_DS
+            && segments.tr == gdt::TSS_SELECTOR,
+        "CS, SS and TR hold Keel's kernel selectors",
+    );
+    let ist_aligned = [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck]
+        .into_iter()
+        .all(|slot| gdt::ist_stack_top(slot).is_multiple_of(16));
+    t.check(
+        "tss.ist_stacks",
+        ist_aligned,
+        "IST stack tops are 16-byte aligned",
+    );
+
+    // P1-T2: a #BP round trip through the IDT returns and preserves state.
+    let before = idt::breakpoint_count();
+    let preserved = hw::breakpoint_preserves_registers();
+    t.check(
+        "idt.breakpoint",
+        preserved && idt::breakpoint_count() == before + 1,
+        "INT3 reaches the handler once and returns with all registers intact",
+    );
+    t.check(
+        "cpu.interrupts_off",
+        !cpu::interrupts_enabled(),
+        "maskable interrupts stay disabled until the APIC is set up",
     );
 }

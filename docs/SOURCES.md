@@ -16,8 +16,28 @@ enters the code (spec section 1, rule 3).
 
 ## CPU
 
+Intel's website refuses connections from the agent's environment, so the
+manuals were fetched from the kib.kiev.ua x86 documentation mirror on
+2026-11-21. The files carry Intel's and AMD's own titles, order numbers
+and dates; their SHA-256 values are recorded so they can be checked
+against copies downloaded from the vendors:
+
+- Intel SDM Vol. 3 (3A-3D), order number 325384-093US, September 2026,
+  file `325384-093.pdf`, SHA-256
+  `77919be320f35da2782771ef2cb65a868cf68e62c8f8279f2ca61199cb70d1f8`.
+- Intel SDM Vol. 1, order number 253665-093US, file `253665-093.pdf`.
+- AMD64 APM Vol. 2 (System Programming), 24593 rev. 3.46, October 2026,
+  file `24593_APM_v2-r3.46.pdf`.
+
 | Source | Used for |
 | --- | --- |
+| Intel SDM Vol. 3, section 3.4.5 and Figure 3-8 (segment descriptors); Table 3-2 (system descriptor types); Figure 10-4 (64-bit TSS descriptor); section 10.7 and Figure 10-11 (64-bit TSS) | `kernel/hal/src/arch/x86_64/gdt.rs` |
+| Intel SDM Vol. 3, section 6.8.8 (SYSCALL/SYSRET selector derivation from IA32_STAR) | GDT order in `gdt.rs` |
+| Intel SDM Vol. 1, section 20.5.2 (no I/O permission bitmap when the map base is at or beyond the TSS limit) | `io_map_base` in `gdt.rs` (SR-9) |
+| Intel SDM Vol. 3, Table 7-1 (vectors and error codes); section 7.14.1 and Figure 7-8 (64-bit gates); sections 7.14.2-7.14.5 and Figure 7-9 (stack frame, IRET, IST); Table 7-5 (double-fault conditions) | `kernel/hal/src/arch/x86_64/idt.rs`; double-fault self-test in `selftest.rs` |
+| AMD64 APM Vol. 2 rev. 3.46, Table 8-1 and sections 15.28, 15.35 (#SX and #VC push error codes) | Error-code vector list in `idt.rs` |
+| Linux `arch/x86/include/asm/segment.h` at tag v6.18 (GDT entry numbers on x86-64), read for the selector values only | Selector values in `gdt.rs` |
+| Rust platform-support page for `x86_64-unknown-none` (soft-float, no red zone) | Why the exception stub saves only general registers (`idt.rs`) |
 | Intel SDM Vol. 2A, "IN - Input from Port"; Vol. 2B, "OUT - Output to Port" | `kernel/hal/src/arch/x86_64/port.rs` |
 | Intel SDM Vol. 2A, "CLI - Clear Interrupt Flag", "HLT - Halt" | `kernel/hal/src/arch/x86_64/cpu.rs` |
 | Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing" | Higher-half bound in `kernel/keel-kernel/src/selftest.rs` |
@@ -27,6 +47,7 @@ enters the code (spec section 1, rule 3).
 | Source | Used for |
 | --- | --- |
 | PC16550D UART datasheet (register summary); OSDev wiki, "Serial Ports" | `kernel/hal/src/drivers/serial.rs` |
+| QEMU behaviour observed with QEMU 8.2.2: vvfat `rw` refuses `snapshot=on`; AHCI refuses read-only media | ADR 0003 |
 | QEMU source, `hw/misc/debugexit.c` (exit status is `(value << 1) \| 1`) | `kernel/hal/src/drivers/debug_exit.rs`, `xtask/src/qemu.rs` |
 | `font8x8` crate documentation (bit order of `BASIC_LEGACY`) | `kernel/hal/src/drivers/framebuffer.rs` |
 

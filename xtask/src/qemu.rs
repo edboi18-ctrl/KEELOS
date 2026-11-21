@@ -15,8 +15,30 @@ use crate::util::{self, Result};
 /// (QEMU `hw/misc/debugexit.c`).
 const EXIT_SUCCESS: i32 = 33;
 
-/// Phases whose acceptance tests exist. `cargo xtask test` runs them all.
-pub const COMPLETED_PHASES: &[u32] = &[0];
+/// A phase with in-guest tests.
+pub struct Phase {
+    pub number: u32,
+    /// Whether the phase's acceptance tests are all implemented. Only then
+    /// must the run print the `KEEL P<n> OK` marker.
+    pub complete: bool,
+    /// Extra boots, each testing one behaviour that ends the kernel.
+    pub scenarios: &'static [&'static str],
+}
+
+/// Every phase with tests. `cargo xtask test` runs them all, so work on an
+/// unfinished phase is regression-tested in CI as it lands.
+pub const PHASES: &[Phase] = &[
+    Phase {
+        number: 0,
+        complete: true,
+        scenarios: &[],
+    },
+    Phase {
+        number: 1,
+        complete: false,
+        scenarios: &["double_fault"],
+    },
+];
 
 /// First line of the kernel's panic output (`keel-kernel/src/main.rs`).
 const PANIC_BANNER: &str = "*** KEEL KERNEL PANIC ***";
@@ -109,7 +131,14 @@ fn base_command(disk: BootDisk, options: &RunOptions) -> Result<Command> {
         BootDisk::Directory(esp) => {
             // A relative path keeps drive-letter colons out of the `fat:` spec.
             let esp = esp.strip_prefix(&root).unwrap_or(esp);
-            format!("format=raw,file=fat:rw:{}", esp.display())
+            // Read-only, so neither the firmware (which saves NvVars to
+            // the ESP) nor a QEMU killed mid-write can change the build
+            // output. QEMU's emulated SATA disk refuses read-only media,
+            // so the tree is attached as a virtio disk, which OVMF boots.
+            format!(
+                "if=virtio,format=raw,readonly=on,file=fat:{}",
+                esp.display()
+            )
         }
         BootDisk::Image(image) => format!("format=raw,snapshot=on,file={}", image.display()),
     };
@@ -200,7 +229,7 @@ pub fn parse_report<'a>(lines: impl IntoIterator<Item = &'a str>) -> TestReport 
 
 /// Decides whether a phase passed, given everything the run produced.
 pub fn verdict(
-    phase: u32,
+    marker: Option<&str>,
     lines: &[String],
     exit_code: Option<i32>,
 ) -> std::result::Result<(), String> {
@@ -220,8 +249,9 @@ pub fn verdict(
             report.passed.len()
         ));
     }
-    let marker = format!("KEEL P{phase} OK");
-    if !lines.iter().any(|line| line.trim_end() == marker) {
+    if let Some(marker) = marker
+        && !lines.iter().any(|line| line.trim_end() == marker)
+    {
         return Err(format!(
             "acceptance marker \"{marker}\" not found on serial"
         ));
@@ -377,15 +407,28 @@ fn print_tail(lines: &[String]) {
     }
 }
 
-/// Boots one phase's self-tests headless and judges the result.
-fn test_phase(phase: u32, options: &RunOptions, timeout: Duration) -> Result<()> {
-    println!("xtask: ---- phase {phase} ----");
-    let esp = build::build(BootMode::Test(phase))?;
+/// Boots one phase's self-tests, or one of its scenarios, headless and
+/// judges the result.
+fn test_boot(
+    phase: &Phase,
+    scenario: Option<&'static str>,
+    options: &RunOptions,
+    timeout: Duration,
+) -> Result<()> {
+    let number = phase.number;
+    match scenario {
+        None => println!("xtask: ---- phase {number} ----"),
+        Some(name) => println!("xtask: ---- phase {number}, scenario {name} ----"),
+    }
+    let esp = build::build(BootMode::Test(number, scenario))?;
     let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
+    // Scenarios end in a deliberate fault, so only the main boot of a
+    // complete phase prints the acceptance marker.
+    let marker = (phase.complete && scenario.is_none()).then(|| format!("KEEL P{number} OK"));
     let result = if capture.timed_out {
         Err(format!("timed out after {} s", timeout.as_secs()))
     } else {
-        verdict(phase, &capture.lines, capture.exit_code)
+        verdict(marker.as_deref(), &capture.lines, capture.exit_code)
     };
     match result {
         Ok(()) => {
@@ -396,7 +439,7 @@ fn test_phase(phase: u32, options: &RunOptions, timeout: Duration) -> Result<()>
         }
         Err(reason) => {
             print_tail(&capture.lines);
-            Err(format!("phase {phase} FAILED: {reason}").into())
+            Err(format!("phase {number} FAILED: {reason}").into())
         }
     }
 }
@@ -423,7 +466,7 @@ pub fn tamper_verdict(lines: &[String]) -> std::result::Result<(), String> {
 /// SR-27 negative test: flip one byte of the kernel, then of the
 /// initramfs, and check that the bootloader refuses each image.
 fn test_tampered_boot(options: &RunOptions, timeout: Duration) -> Result<()> {
-    let tree = build::build_tree(BootMode::Test(0))?;
+    let tree = build::build_tree(BootMode::Test(0, None))?;
     for (name, target) in [
         ("sr27.tamper.kernel", build::KERNEL_PATH),
         ("sr27.tamper.initramfs", build::INITRAMFS_PATH),
@@ -490,22 +533,34 @@ pub fn boot_image_until(image: &Path, options: &RunOptions, marker: &str) -> Res
 
 /// `cargo xtask test [--phase N]`.
 pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Result<()> {
-    let phases: Vec<u32> = match phase {
-        Some(phase) if COMPLETED_PHASES.contains(&phase) => vec![phase],
-        Some(phase) => {
-            return Err(format!(
-                "phase {phase} has no acceptance test yet (available: {COMPLETED_PHASES:?})"
-            )
-            .into());
-        }
-        None => COMPLETED_PHASES.to_vec(),
+    let selected: Vec<&Phase> = match phase {
+        None => PHASES.iter().collect(),
+        Some(n) => match PHASES.iter().find(|p| p.number == n) {
+            Some(p) => vec![p],
+            None => {
+                let available: Vec<u32> = PHASES.iter().map(|p| p.number).collect();
+                return Err(
+                    format!("phase {n} has no tests yet (available: {available:?})").into(),
+                );
+            }
+        },
     };
-    for phase in phases {
-        test_phase(phase, options, timeout)?;
-        if phase == 0 {
+    for phase in selected {
+        test_boot(phase, None, options, timeout)?;
+        for &scenario in phase.scenarios {
+            test_boot(phase, Some(scenario), options, timeout)?;
+        }
+        if phase.number == 0 {
             test_tampered_boot(options, timeout)?;
         }
-        println!("xtask: phase {phase} PASSED");
+        if phase.complete {
+            println!("xtask: phase {} PASSED", phase.number);
+        } else {
+            println!(
+                "xtask: phase {} tests PASSED (phase in progress; acceptance not yet complete)",
+                phase.number
+            );
+        }
     }
     Ok(())
 }
@@ -518,6 +573,15 @@ mod tests {
         text.lines().map(str::to_string).collect()
     }
 
+    const P0: Option<&str> = Some("KEEL P0 OK");
+
+    #[test]
+    fn in_progress_phases_need_no_marker() {
+        let no_marker = GOOD.replace("KEEL P0 OK\n", "");
+        assert_eq!(verdict(None, &lines(&no_marker), Some(33)), Ok(()));
+        assert!(verdict(None, &lines(&no_marker), Some(35)).is_err());
+    }
+
     const GOOD: &str = "Keel 0.0.0 booting\n\
         TEST boot.hhdm PASS HHDM offset is page-aligned\n\
         KEEL P0 OK\n\
@@ -526,39 +590,39 @@ mod tests {
 
     #[test]
     fn accepts_a_clean_run() {
-        assert_eq!(verdict(0, &lines(GOOD), Some(33)), Ok(()));
+        assert_eq!(verdict(P0, &lines(GOOD), Some(33)), Ok(()));
     }
 
     #[test]
     fn rejects_wrong_exit_status_or_missing_marker() {
-        assert!(verdict(0, &lines(GOOD), Some(35)).is_err());
-        assert!(verdict(0, &lines(GOOD), None).is_err());
-        assert!(verdict(1, &lines(GOOD), Some(33)).is_err());
+        assert!(verdict(P0, &lines(GOOD), Some(35)).is_err());
+        assert!(verdict(P0, &lines(GOOD), None).is_err());
+        assert!(verdict(Some("KEEL P1 OK"), &lines(GOOD), Some(33)).is_err());
         let no_marker = GOOD.replace("KEEL P0 OK\n", "");
-        assert!(verdict(0, &lines(&no_marker), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&no_marker), Some(33)).is_err());
         // The marker must be a whole line, not a substring of another one.
         let embedded = GOOD.replace("KEEL P0 OK\n", "not KEEL P0 OK really\n");
-        assert!(verdict(0, &lines(&embedded), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&embedded), Some(33)).is_err());
     }
 
     #[test]
     fn rejects_failures_panics_and_inconsistent_summaries() {
         let failing = GOOD.replace("TEST boot.hhdm PASS", "TEST boot.hhdm FAIL");
-        let error = verdict(0, &lines(&failing), Some(33)).unwrap_err();
+        let error = verdict(P0, &lines(&failing), Some(33)).unwrap_err();
         assert!(error.contains("boot.hhdm"), "{error}");
 
         let panicked = format!("{GOOD}*** KEEL KERNEL PANIC ***\n");
-        assert!(verdict(0, &lines(&panicked), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&panicked), Some(33)).is_err());
 
         let no_summary = GOOD.replace("TEST SUMMARY passed=2 failed=0\n", "");
-        assert!(verdict(0, &lines(&no_summary), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&no_summary), Some(33)).is_err());
 
         // A summary claiming more passes than PASS lines were seen.
         let inflated = GOOD.replace("passed=2", "passed=3");
-        assert!(verdict(0, &lines(&inflated), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&inflated), Some(33)).is_err());
 
         let empty = "KEEL P0 OK\nTEST SUMMARY passed=0 failed=0\n";
-        assert!(verdict(0, &lines(empty), Some(33)).is_err());
+        assert!(verdict(P0, &lines(empty), Some(33)).is_err());
     }
 
     #[test]

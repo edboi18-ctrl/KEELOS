@@ -23,6 +23,18 @@ need the owner (see "Open items").
 | P0-S1 | Verified downloads; BLAKE2B hashes in `limine.conf` | Done, with a tamper test for kernel and initramfs |
 | P0-S2 | `cargo xtask audit` | Done |
 
+## Phase 1 (kernel core): in progress
+
+Started 2026-11-21 at the owner's request, on the working branch, while
+the Phase 0 pull request (#1) awaits the owner's merge.
+
+| ID | Task | Status |
+| --- | --- | --- |
+| P1-T1 | GDT, TSS with RSP0 and IST stacks | Done. Linux-compatible selectors; no 32-bit user code segment; no I/O bitmap (SR-9). IST stacks lack guard pages until P1-T4. |
+| P1-T2 | IDT, exception handlers with register dump, double fault on its own stack | Done. Tests: `idt.breakpoint` (INT3 round trip preserves registers), scenario `double_fault` (#DF lands on IST1). |
+| P1-T3 to P1-T14 | | Not started |
+| P1-S1 to P1-S7 | | Not started. Entry code and data are already grouped in page-aligned sections for P1-S3. |
+
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
@@ -58,10 +70,12 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 29 | 75 | 7 | 10 |
+| `kernel/hal` | 43 | 169 | 14 | 13 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 
-The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
+the CPU register reads, and the self-test triggers, each with its
+reasoning block. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes
