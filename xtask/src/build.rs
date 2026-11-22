@@ -159,6 +159,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: false,
     },
     TestProgram {
+        path: "test/dirconfine",
+        binary: "dirconfine",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
         path: "test/conflood",
         binary: "conflood",
         args: &[],

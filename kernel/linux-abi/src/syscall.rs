@@ -491,16 +491,28 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         let process = p.lock();
         (process.root, process.cwd)
     };
-    let base = if dirfd == AT_FDCWD || path.first() == Some(&b'/') {
-        cwd
+    // Where the lookup starts and where `..` stops (ADR 0012). With
+    // AT_FDCWD or an absolute path: the process's working directory and
+    // root, its ambient authority until compartments exist. Relative to a
+    // directory handle: that directory, which is also the root, so `..`
+    // cannot climb above it (as Linux's openat2 RESOLVE_IN_ROOT; plain
+    // Linux openat would let it). A handle to /a/b then reaches only what
+    // is beneath /a/b (audit 2, A6).
+    let (root, base) = if dirfd == AT_FDCWD || path.first() == Some(&b'/') {
+        (root, cwd)
     } else {
-        // Lookup relative to a directory handle needs ENUMERATE on it.
-        let dir = file(p, dirfd, Rights::ENUMERATE)?;
+        // Lookup needs ENUMERATE on the directory; creating needs CREATE.
+        let needs = if flags & O_CREAT != 0 {
+            Rights::ENUMERATE | Rights::CREATE
+        } else {
+            Rights::ENUMERATE
+        };
+        let dir = file(p, dirfd, needs)?;
         let dir = dir.lock();
         if dir.kind != Kind::Directory {
             return Err(Errno::ENOTDIR);
         }
-        dir.node
+        (dir.node, dir.node)
     };
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);

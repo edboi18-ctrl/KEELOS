@@ -1642,6 +1642,17 @@ pub fn phase1_audit_small_items(t: &mut Runner) {
     );
     kprintln!("  exit statuses kept: {kept}");
 
+    // A6: a directory handle confines lookups made through it.
+    let confined = run_test_program(b"/test/dirconfine", &[b"/test/dirconfine"]);
+    t.check(
+        "fs.dirfd_confines",
+        confined == Some((0, None)),
+        "`..` through a directory handle stops at that directory; creating through it lands beneath it (A6)",
+    );
+    if confined != Some((0, None)) {
+        kprintln!("  dirconfine: exit {confined:?}");
+    }
+
     // A7.5: no global translations: CR4.PGE is clear.
     t.check(
         "paging.no_global_pages",
