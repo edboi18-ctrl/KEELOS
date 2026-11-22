@@ -133,18 +133,28 @@ Hardening notes for later Phase 1 work:
   results must travel on a channel user code cannot write (for example a
   second serial port, or the debug-exit code).
 
-## Phase 2 (toy PE loader): in progress
+## Phase 2 (toy PE loader): complete (2026-11-22)
 
 Started 2026-11-22, after the third Phase 1 audit cleared it
-(`docs/PHASE1-AUDIT-3.md`; C1 fixed first, C2 and C3 due before
-Phase 3). Spec section 9 lists the steps but no task IDs; these are
+(`docs/PHASE1-AUDIT-3.md`; C1 fixed first, C2 and C3 fixed at the end
+of Phase 2).
+
+Acceptance P2, all met:
+- `cargo xtask test --phase 2` boots Keel, runs `peldr /winetest/hello.exe`,
+  finds the exact line on serial and exit status 0 (`acceptance.peldr_hello`;
+  `KEEL P2 OK` required).
+- The same `.exe` runs unmodified on Windows and prints the same line:
+  confirmed by the owner on 2026-11-22 (exit status 0).
+- Security note: the PE parser is safe Rust with every offset checked, a
+  host fuzz target and a malformed-file corpus; the 30-minute fuzz run
+  passed (P2-S1). Spec section 9 lists the steps but no task IDs; these are
 Keel's.
 
 | ID | Task | Status |
 | --- | --- | --- |
 | P2-T1 | PE parser (`user/pe`, `#![forbid(unsafe_code)]`): headers, sections, base relocations, imports; every offset and size checked; host tests and a malformed-file corpus | Done. `no_std`, no allocation; one checked reader for every field; tables walked lazily with caps (96 sections, 256 DLLs, 4096 imports per DLL, 255-byte names). Refuses W+X sections, overlapping or misaligned sections, an entry point outside executable code, an image that does not fit the user half, and any relocation type other than ABSOLUTE and DIR64. Host tests: the real `hello.exe`, a builder for imports (by name and ordinal) and DIR64 relocations, one test per error class, 20,000 random inputs; `fuzz/pe-corpus/` holds 24 malformed files, each named after the error it must give. Removing the W+X or image-bounds check fails both the targeted test and the random-input test. |
 | P2-T2 | `peldr` (`user/peldr`): maps the image, relocates, resolves imports to the four stubs, applies section protections, fake TEB through `gs`, calls the entry point | Done; runs `hello.exe` on Linux (exact line, exit 0), at its preferred base and with `--relocate` (forced elsewhere; with relocation skipped it prints nothing and exits 1). Safe Rust over `keel-rt` and `pe`; `unsafe` only in `src/foreign.rs` (the four `extern "win64"` stubs and the entry call; ADR 0013). New `keel-rt` APIs: `Region::map_at` (MAP_FIXED_NOREPLACE), bounds-checked `write`/`read_u64`/`write_u64`/`protect_range`, `map_file` (read-only after reading, then borrowed as `&[u8]`), `set_gs_base`. Fake TEB: NT_TIB StackBase 0x08, StackLimit 0x10, Self 0x30 (Wine 10.0 `winnt.h`), PEB pointer at 0x60 (Microsoft `TEB`, `Reserved1[12]`). Bad input: one line on stderr, exit 1. On Keel: P2-T4. |
-| P2-T3 | `winetest/hello-console`: no-CRT Windows x64 `.exe` importing `GetStdHandle`, `WriteFile`, `ExitProcess` (`raw-dylib`), checked in as a pinned fixture with its build command | Done. Built with the pinned toolchain's `rust-lld` (lld-link mode), no Windows SDK. It writes its line through a static table of pointers, so it carries two DIR64 relocations and tests a loader's relocation code. 3072 bytes, SHA-256 `f603ceac...65e4`, reproducible (a clean rebuild gave the same hash). ADR 0013 records where `unsafe` may appear for Phase 2. Still to do by the owner: run it on Windows. |
+| P2-T3 | `winetest/hello-console`: no-CRT Windows x64 `.exe` importing `GetStdHandle`, `WriteFile`, `ExitProcess` (`raw-dylib`), checked in as a pinned fixture with its build command | Done. Built with the pinned toolchain's `rust-lld` (lld-link mode), no Windows SDK. It writes its line through a static table of pointers, so it carries two DIR64 relocations and tests a loader's relocation code. 3072 bytes, SHA-256 `f603ceac...65e4`, reproducible (a clean rebuild gave the same hash). ADR 0013 records where `unsafe` may appear for Phase 2. The owner ran it on Windows: it printed the line and exited with status 0. |
 | P2-T4 | `cargo xtask test --phase 2`: `peldr /winetest/hello.exe` under Linux and on Keel; the exact line on serial and exit status 0 | Done. Under Linux: `host.peldr.hello.exe` and `.relocated` (exact stdout, exit 0). On Keel: `acceptance.peldr_hello`, `peldr.relocated` and `peldr.refuses_non_pe`; xtask requires the exact line on serial. The serial log shows no unimplemented system call and no user fault. `KEEL P2 OK` is printed when all pass; xtask requires it once the phase is marked complete. |
 | P2-S1 | Host fuzz target for the PE parser; 30 minutes with no crash | Done. `cargo xtask fuzz-pe --minutes N --seed S` (engine in `fuzz/pe-fuzz`, a host-only crate so `pe` never needs std; overflow checks on; a panic writes the input to `target/fuzz-pe-crash.exe`, checked by breaking the parser on purpose). Acceptance run: `cargo xtask fuzz-pe --minutes 30 --seed 20261122` passed, 187,340,000 inputs, 13,291,167 accepted as images, no panic. |
 
@@ -155,17 +165,22 @@ Keel's.
   `sr27.tamper.initramfs` and `sr27.tamper.config` (Limine refuses a
   one-byte change to each; the config's hash is enrolled in
   `BOOTX64.EFI`).
-- `cargo xtask test --phase 1`: 96 in-kernel tests pass and `KEEL P1 OK`
+- `cargo xtask test --phase 1`: 98 in-kernel tests pass and `KEEL P1 OK`
   is on serial; the six fault scenarios (`double_fault`,
   `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`,
   `fault_in_panic`) pass; the
   boots land at different kernel addresses (KASLR); and the user test
   programs, `musl-hello` and `heap64` pass under Linux too. Checked to
   fail when the marker is not printed.
+- `cargo xtask test --phase 2`: 3 in-kernel tests pass and `KEEL P2 OK`
+  is on serial with the exact line `hello.exe` writes; under Linux,
+  `peldr` runs it at its preferred base and relocated.
 - `cargo xtask fuzz --minutes 60 --seed 20261122`: passes (see security
   acceptance item 6 above).
-- `cargo test`: 181 host tests pass (106 `keel-core`, 29 `keel-hal`,
-  5 `keel-linux-abi`, 37 `xtask`, and 4 `keel-hal` doctests).
+- `cargo xtask fuzz-pe --minutes 30 --seed 20261122`: passes (P2-S1).
+- `cargo test`: 191 host tests pass (108 `keel-core`, 29 `keel-hal`,
+  5 `keel-linux-abi`, 7 `pe`, 1 `pe-fuzz`, 37 `xtask`, and 4 `keel-hal`
+  doctests).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.

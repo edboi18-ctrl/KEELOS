@@ -21,6 +21,17 @@ pub fn usage() -> (usize, usize) {
     FS.lock().as_ref().map_or((0, 0), Fs::usage)
 }
 
+/// Whether the kernel may allocate a `bytes`-byte file buffer now: only if
+/// that leaves the frames user page faults may not take (the reserve,
+/// `memory::user_reserve`) untouched. One page more covers the heap's own
+/// bookkeeping. The admission check runs once per system call; this runs
+/// before every buffer, so one large write cannot take the reserve either
+/// (third Phase 1 audit, C3; ADR 0011).
+fn may_allocate(bytes: usize) -> bool {
+    let pages = bytes.div_ceil(4096) + 1;
+    keel_hal::memory::free_frames() > keel_hal::memory::user_reserve().saturating_add(pages)
+}
+
 /// What `init` found.
 #[derive(Clone, Copy, Debug)]
 pub struct Report {
@@ -67,6 +78,7 @@ pub fn init() -> Result<Report, InitError> {
         .ok_or(InitError::NoInitramfs)?;
     let entries = cpio::parse(module.data).map_err(InitError::Archive)?;
     let mut fs = Fs::new(TMPFS_LIMIT);
+    fs.set_allocation_check(may_allocate);
     let skipped = fs.unpack(ROOT, &entries).map_err(InitError::Unpack)?;
     let dev = match fs.lookup(ROOT, ROOT, b"/dev") {
         Ok(dev) => dev,

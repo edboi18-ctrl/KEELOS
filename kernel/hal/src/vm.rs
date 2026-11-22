@@ -439,13 +439,15 @@ impl Drop for AddressSpace {
         for (_, frame) in core::mem::take(&mut self.inner.lock().parked) {
             let _ = memory::release(frame);
         }
-        let (tables, leaves) = paging::clear_user_half(&mut DirectMapTables, self.root);
-        for phys in leaves {
-            let _ = memory::release(Frame::containing(phys));
-        }
-        for table in tables {
-            let _ = memory::release(table);
-        }
+        // Each frame is freed as the walk reaches it; nothing is collected,
+        // so tearing down a large process allocates nothing (audit 3, C2).
+        paging::clear_user_half(&mut DirectMapTables, self.root, |item| {
+            let frame = match item {
+                paging::Cleared::Leaf(phys) => Frame::containing(phys),
+                paging::Cleared::Table(table) => table,
+            };
+            let _ = memory::release(frame);
+        });
         let _ = memory::release(self.root);
         // The user view shares the (now freed) lower-level tables and the
         // permanent trampoline entry; only its own top-level frame is freed.

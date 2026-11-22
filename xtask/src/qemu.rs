@@ -63,7 +63,7 @@ pub const PHASES: &[Phase] = &[
     },
     Phase {
         number: 2,
-        complete: false,
+        complete: true,
         scenarios: &[],
         // Acceptance P2: the exact line hello.exe writes, through peldr.
         expect_lines: &["Hello from a Windows executable on Keel"],

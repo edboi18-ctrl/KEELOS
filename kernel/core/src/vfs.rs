@@ -121,24 +121,55 @@ pub struct Fs {
     byte_limit: usize,
     /// Cap on `nodes` (`NODE_LIMIT`; lower in tests).
     node_limit: usize,
+    /// Asked before a file buffer is allocated: may this many bytes be
+    /// allocated now? The kernel answers from its frame reserve
+    /// (`linux-abi::fs`), so one write cannot take the reserve that the
+    /// admission check protects (third Phase 1 audit, C3). Default: yes.
+    may_allocate: fn(usize) -> bool,
+}
+
+fn always(_: usize) -> bool {
+    true
 }
 
 /// Makes `file` uniquely owned and at least `len` bytes long, failing
 /// instead of aborting if memory runs out: copying a file that a reader
 /// still holds (`Fs::contents`) and growing it are both allocations a
 /// program controls the size of (F-0011).
-fn grow_file(file: &mut Arc<Vec<u8>>, len: usize) -> Result<&mut Vec<u8>, Errno> {
+///
+/// Every allocation is first put to `may_allocate` with its full size (a
+/// grown buffer is allocated whole before the old one is freed). Growth
+/// doubles the capacity when that is allowed, so appending stays cheap;
+/// otherwise it takes exactly what is needed; otherwise ENOMEM (C3).
+fn grow_file(
+    file: &mut Arc<Vec<u8>>,
+    len: usize,
+    may_allocate: fn(usize) -> bool,
+) -> Result<&mut Vec<u8>, Errno> {
     if Arc::get_mut(file).is_none() {
+        let size = file.len().max(len);
+        if !may_allocate(size) {
+            return Err(Errno::ENOMEM);
+        }
         let mut copy = Vec::new();
-        copy.try_reserve_exact(file.len().max(len))
-            .map_err(|_| Errno::ENOMEM)?;
+        copy.try_reserve_exact(size).map_err(|_| Errno::ENOMEM)?;
         copy.extend_from_slice(file);
         *file = Arc::new(copy);
     }
     let data = Arc::get_mut(file).ok_or(Errno::ENOMEM)?;
-    if data.len() < len {
-        data.try_reserve(len - data.len())
+    if len > data.capacity() {
+        let doubled = data.capacity().saturating_mul(2).max(len);
+        let target = if may_allocate(doubled) {
+            doubled
+        } else if may_allocate(len) {
+            len
+        } else {
+            return Err(Errno::ENOMEM);
+        };
+        data.try_reserve_exact(target - data.len())
             .map_err(|_| Errno::ENOMEM)?;
+    }
+    if data.len() < len {
         data.resize(len, 0);
     }
     Ok(data)
@@ -174,7 +205,13 @@ impl Fs {
             bytes_used: 0,
             byte_limit,
             node_limit: NODE_LIMIT,
+            may_allocate: always,
         }
+    }
+
+    /// Sets the check made before a file buffer is allocated (C3).
+    pub fn set_allocation_check(&mut self, check: fn(usize) -> bool) {
+        self.may_allocate = check;
     }
 
     /// Sets the cap on the number of nodes (tests use a small one) and
@@ -385,6 +422,7 @@ impl Fs {
         let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
         let end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
         let (bytes_used, byte_limit) = (self.bytes_used, self.byte_limit);
+        let may_allocate = self.may_allocate;
         let Contents::File(file) = &mut self.node_mut(ino)?.contents else {
             return Err(match self.kind(ino)? {
                 Kind::Directory => Errno::EISDIR,
@@ -398,7 +436,7 @@ impl Fs {
         {
             return Err(Errno::ENOSPC);
         }
-        let file = grow_file(file, end)?;
+        let file = grow_file(file, end, may_allocate)?;
         file[start..end].copy_from_slice(data);
         self.bytes_used += growth;
         Ok(data.len())
@@ -408,6 +446,7 @@ impl Fs {
     pub fn set_len(&mut self, ino: Ino, len: u64) -> Result<(), Errno> {
         let len = usize::try_from(len).map_err(|_| Errno::EFBIG)?;
         let (bytes_used, byte_limit) = (self.bytes_used, self.byte_limit);
+        let may_allocate = self.may_allocate;
         let Contents::File(file) = &mut self.node_mut(ino)?.contents else {
             return Err(Errno::EINVAL);
         };
@@ -415,7 +454,7 @@ impl Fs {
         if len > old && bytes_used + (len - old) > byte_limit {
             return Err(Errno::ENOSPC);
         }
-        grow_file(file, len)?.truncate(len);
+        grow_file(file, len, may_allocate)?.truncate(len);
         self.bytes_used = bytes_used - old + len;
         Ok(())
     }
@@ -619,6 +658,32 @@ mod tests {
         fs.write(f, 0, b"KEEL").unwrap();
         assert_eq!(&before[..], b"keel\n");
         assert_eq!(&fs.contents(f).unwrap()[..], b"KEEL\n");
+    }
+
+    /// A check that allows buffers of at most 64 bytes.
+    fn at_most_64(bytes: usize) -> bool {
+        bytes <= 64
+    }
+
+    #[test]
+    fn growth_asks_first_and_falls_back_from_doubling() {
+        let mut fs = Fs::new(1 << 20);
+        fs.set_allocation_check(at_most_64);
+        let ino = fs.create_file(ROOT, b"f", 0o644).unwrap();
+        assert_eq!(fs.write(ino, 0, &[1; 40]), Ok(40));
+        // 50 bytes: doubling would ask for 80; it falls back to exactly 50.
+        assert_eq!(fs.write(ino, 40, &[2; 10]), Ok(10));
+        // 65 bytes: more than the check allows at all.
+        assert_eq!(fs.write(ino, 50, &[3; 15]), Err(Errno::ENOMEM));
+        assert_eq!(
+            fs.stat(ino).unwrap().size,
+            50,
+            "a refused write changes nothing"
+        );
+        // Copying a file a reader holds asks too.
+        let _snapshot = fs.contents(ino).unwrap();
+        fs.set_allocation_check(|bytes| bytes < 50);
+        assert_eq!(fs.write(ino, 0, b"x"), Err(Errno::ENOMEM));
     }
 
     #[test]

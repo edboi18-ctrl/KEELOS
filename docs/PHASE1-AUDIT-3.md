@@ -13,8 +13,8 @@ system call lets a program choose a file to execute.
 | # | Status |
 | --- | --- |
 | C1 | Fixed before Phase 2 work began. `elf::Image::bias_for_base` computes the bias with `checked_sub` and then checks it; `exec::load` uses it. Host test `relocatable_image_above_the_base_is_refused` (the audit's 0x7000_0000_0000 case) and the parser's random-input test now also choose load addresses; with the plain subtraction back, both panic. |
-| C2 | Open; to be done before Phase 3 (per-compartment limits). |
-| C3 | Open; to be done before Phase 3, with ADR 0011 updated. |
+| C2 | Fixed. `paging::clear_user_half` hands each leaf and table to a callback as the walk reaches it (tables after everything below them); `AddressSpace::drop` frees them there. Test `vm.teardown_allocates_nothing`: 1024 pages, one every 2 MiB, torn down with 0 heap allocations and 2053 frames freed; collecting into a `Vec` again makes 11 allocations and the test fails. |
+| C3 | Fixed (ADR 0011 updated). Every tmpfs buffer is checked against the reserve at its full size before it is allocated: doubling if that leaves the reserve intact, else exactly what is needed, else ENOMEM. Test `fs.growth_keeps_reserve` (64 frames above the reserve): growth stops at 128 KiB with ENOMEM, never below the reserve; with the check always allowing, it went 32,833 frames below and the test fails. Host test for the fallback from doubling. |
 
 ## What was run (QEMU 8.2.2, TCG, no KVM, Ubuntu 24.04)
 

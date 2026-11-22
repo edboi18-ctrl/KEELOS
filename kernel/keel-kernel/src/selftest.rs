@@ -1663,6 +1663,78 @@ pub fn phase1_audit_small_items(t: &mut Runner) {
         kprintln!("  dirconfine: exit {confined:?}");
     }
 
+    // Audit 3, C2: tearing down a process allocates nothing, however
+    // large it is. 1024 pages, one every 2 MiB (so as many page tables),
+    // then the heap's allocation count across the drop.
+    {
+        use keel_core::vm::{Placement, Prot};
+        use keel_hal::vm::{AddressSpace, copy_to_user, with_address_space};
+        const BASE: u64 = 0x1000_0000_0000;
+        const PAGES: u64 = 1024;
+        const STRIDE: u64 = 2 << 20;
+        let result = AddressSpace::new().ok().and_then(|space| {
+            space
+                .map(Placement::Fixed(BASE), PAGES * STRIDE, Prot::READ_WRITE)
+                .ok()?;
+            let touched = with_address_space(&space, || {
+                (0..PAGES).all(|i| copy_to_user(BASE + i * STRIDE, &[1]).is_ok())
+            });
+            let alone = alloc::sync::Arc::strong_count(&space) == 1;
+            let frames_before = memory::free_frames();
+            let allocations_before = keel_hal::heap::allocations();
+            drop(space);
+            let allocated = keel_hal::heap::allocations() - allocations_before;
+            let freed = memory::free_frames() - frames_before;
+            Some((touched && alone, allocated, freed))
+        });
+        t.check(
+            "vm.teardown_allocates_nothing",
+            matches!(result, Some((true, 0, freed)) if freed >= 2 * PAGES as usize),
+            "dropping an address space with 1024 pages and 1024 page tables makes no heap allocation (audit 3, C2)",
+        );
+        if let Some((_, allocated, freed)) = result {
+            kprintln!("  teardown: {allocated} heap allocations, {freed} frames freed");
+        }
+    }
+
+    // Audit 3, C3: growing a file never takes the kernel's reserve. With
+    // only 64 frames free above the reserve, grow a file 4 KiB at a time:
+    // free memory must never fall below the reserve, and growth must end
+    // in ENOMEM.
+    {
+        use keel_core::errno::Errno;
+        use keel_core::vfs::ROOT;
+        let old = memory::set_user_reserve(memory::free_frames().saturating_sub(64));
+        let result = keel_linux_abi::fs::with(|fs| {
+            let ino = fs.create_file(ROOT, b"c3-growth", 0o644)?;
+            let chunk = [0u8; 4096];
+            let mut offset = 0u64;
+            let mut lowest = i64::MAX;
+            loop {
+                match fs.write(ino, offset, &chunk) {
+                    Ok(n) => offset += n as u64,
+                    Err(error) => return Ok((error, offset, lowest)),
+                }
+                let margin = memory::free_frames() as i64 - memory::user_reserve() as i64;
+                lowest = lowest.min(margin);
+                if offset > 64 << 20 {
+                    return Ok((Errno::EFBIG, offset, lowest));
+                }
+            }
+        });
+        memory::set_user_reserve(old);
+        t.check(
+            "fs.growth_keeps_reserve",
+            matches!(result, Ok((Errno::ENOMEM, _, lowest)) if lowest >= 0),
+            "growing a tmpfs file stops with ENOMEM before free memory reaches the kernel's reserve (audit 3, C3)",
+        );
+        if let Ok((error, offset, lowest)) = result {
+            kprintln!(
+                "  growth: {offset} bytes, then {error:?}; lowest margin over the reserve {lowest} frames"
+            );
+        }
+    }
+
     // A7.5: no global translations: CR4.PGE is clear.
     t.check(
         "paging.no_global_pages",
