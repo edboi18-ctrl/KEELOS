@@ -344,7 +344,7 @@ fn notices(root: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 }
 
 /// Accepts versions like `0.1.0` or `0.1.0-rc.1`; they become file names.
-fn validate_version(version: &str) -> Result<()> {
+pub fn validate_version(version: &str) -> Result<()> {
     let ok = !version.is_empty()
         && version
             .chars()

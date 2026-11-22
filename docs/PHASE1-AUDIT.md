@@ -18,7 +18,7 @@ finding was re-checked there before it was fixed.
 | --- | --- |
 | 1 | Open |
 | 2 | Open |
-| 3 | Open |
+| 3 | Fixed. `cargo xtask verify` derives `refs/tags/v<version>` from the artifact name (`verify::release_ref`: only `keel-<version>.img`, `-esp.zip`, `-notices.zip`, with `N.N.N` or `N.N.N-suffix` versions, as `release.yml`'s tag filters) and passes it as `--source-ref`; other names are refused before anything else. Unit tests for accepted and rejected names. Checked against `gh attestation verify --help` (gh 2.89.0). Still depends on the tag ruleset (finding 4). |
 | 4 | Open (settings: owner) |
 | 5 | Open |
 | 6 | Fixed. The same check over all 20 `asm!` blocks on the working branch that claim `preserves_flags` found two more: `xrstor64` and `fxrstor64` in `fpu.rs` load the x87 status word and MXCSR, which that option also covers (the Rust Reference, asm.rules.preserved-registers). All three no longer claim it. |
