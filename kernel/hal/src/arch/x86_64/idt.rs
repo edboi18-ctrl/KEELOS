@@ -29,13 +29,15 @@ use super::gdt::{self, IstSlot, KERNEL_CS};
 
 /// Register state saved by the exception entry stub, in memory order.
 ///
-/// The stub pushes the general registers in the order rax, rbx, ..., r15,
-/// so r15 ends up at the lowest address. Above them sit the vector and
+/// Built by the entry code in entry.rs: a pad word, the general
+/// registers (r15 lowest), the CR3 at entry, rax, then the vector and
 /// error code pushed by the per-vector stub, then the five words the
 /// processor pushed (Figure 7-9).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrapFrame {
+    /// Alignment padding (keeps the frame a multiple of 16 bytes).
+    pub pad: u64,
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -50,8 +52,10 @@ pub struct TrapFrame {
     pub rdx: u64,
     pub rcx: u64,
     pub rbx: u64,
+    /// CR3 at entry; restored on exit (entry.rs).
+    pub saved_cr3: u64,
     pub rax: u64,
-    /// Vector number pushed by the stub.
+    /// Vector number pushed by the stub (0x100 for a system call).
     pub vector: u64,
     /// Error code from the processor, or 0 pushed by the stub.
     pub error_code: u64,
@@ -62,11 +66,15 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 22 * 8);
-// The common stub reads the saved CS at [rsp + 24] before the general
-// registers are pushed: vector at +0, error code at +8, RIP at +16.
-const _: () =
-    assert!(core::mem::offset_of!(TrapFrame, cs) - core::mem::offset_of!(TrapFrame, vector) == 24);
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 24 * 8);
+// entry.rs reads CS at [rsp + 40] counting from saved_cr3, and the vector
+// at [rsp + 16].
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, cs) - core::mem::offset_of!(TrapFrame, saved_cr3) == 40
+);
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, vector) - core::mem::offset_of!(TrapFrame, saved_cr3) == 16
+);
 
 // Assembly reasoning (spec section 1, rule 4) for the entry stubs.
 //
@@ -147,50 +155,6 @@ global_asm!(
         KEEL_VECTOR_NO_ERROR_CODE \vector
     .endr
 
-    keel_exception_common:
-        test qword ptr [rsp + 24], 3
-        jz 2f
-        swapgs
-    2:
-        push rax
-        push rbx
-        push rcx
-        push rdx
-        push rsi
-        push rdi
-        push rbp
-        push r8
-        push r9
-        push r10
-        push r11
-        push r12
-        push r13
-        push r14
-        push r15
-        cld
-        mov rdi, rsp
-        call {dispatch}
-        pop r15
-        pop r14
-        pop r13
-        pop r12
-        pop r11
-        pop r10
-        pop r9
-        pop r8
-        pop rbp
-        pop rdi
-        pop rsi
-        pop rdx
-        pop rcx
-        pop rbx
-        pop rax
-        test qword ptr [rsp + 24], 3
-        jz 3f
-        swapgs
-    3:
-        add rsp, 16
-        iretq
 
     .popsection
 
@@ -202,7 +166,6 @@ global_asm!(
     .endr
     .popsection
     "#,
-    dispatch = sym exception_dispatch,
 );
 
 #[cfg(target_os = "none")]
@@ -355,17 +318,34 @@ pub fn last_fatal_exception() -> Option<FatalException> {
     })
 }
 
-/// Called by the common stub with interrupts disabled.
+/// Called by the common entry code (entry.rs) with interrupts disabled.
 #[cfg(target_os = "none")]
-extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
+pub(crate) extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
     // SAFETY: the stub passes the address of the TrapFrame it just built on
     // the current stack. It is valid, aligned, and exclusively ours until
     // this function returns.
     let frame = unsafe { &mut *frame };
     let vector = frame.vector;
-    if vector == 14 && crate::vm::handle_page_fault(frame, super::cpu::read_cr2()) {
-        return;
+    let from_user = frame.cs & 3 == 3;
+    if vector == super::entry::SYSCALL_VECTOR {
+        crate::syscall::dispatch(frame);
+    } else if vector == 14 && crate::vm::handle_page_fault(frame, super::cpu::read_cr2()) {
+        // Resolved (demand paging, copy-on-write, or a user-copy fixup).
+    } else if from_user && vector < 32 && !matches!(vector, 2 | 18) {
+        // A user program faulted. Until signals exist (Phase 3) that ends
+        // the thread; the kernel carries on.
+        crate::syscall::user_fault(frame);
+    } else {
+        dispatch_kernel(frame);
     }
+    if frame.cs & 3 == 3 && !super::entry::prepare_user_return(frame) {
+        panic!("returning to user mode without a user address space");
+    }
+}
+
+#[cfg(target_os = "none")]
+fn dispatch_kernel(frame: &mut TrapFrame) {
+    let vector = frame.vector;
     match vector {
         32..=255 => crate::interrupts::dispatch(vector as u8),
         3 => {

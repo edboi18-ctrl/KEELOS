@@ -328,6 +328,7 @@ fn phase1(t: &mut Runner) {
     phase1_interrupts(t);
     phase1_sched(t);
     phase1_vm(t);
+    phase1_user(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -850,5 +851,211 @@ pub fn phase1_vm(t: &mut Runner) {
         "vm.teardown",
         memory::free_frames() + 8 >= frames_at_start,
         "dropping address spaces returns their pages and page tables",
+    );
+}
+
+/// Loads a test program into a fresh address space and runs it as a user
+/// thread to completion. Returns its exit status and last user fault.
+fn run_user_program(
+    program: keel_hal::arch::x86_64::userprog::Program,
+) -> Option<(
+    i64,
+    Option<sched::UserFault>,
+    alloc::sync::Arc<keel_hal::vm::AddressSpace>,
+)> {
+    run_user_program_with(program, 0)
+}
+
+/// As `run_user_program`, with `argument` in RDI.
+fn run_user_program_with(
+    program: keel_hal::arch::x86_64::userprog::Program,
+    argument: u64,
+) -> Option<(
+    i64,
+    Option<sched::UserFault>,
+    alloc::sync::Arc<keel_hal::vm::AddressSpace>,
+)> {
+    use keel_core::vm::{Placement, Prot};
+    use keel_hal::vm::{AddressSpace, copy_to_user, with_address_space};
+    const CODE: u64 = 0x40_0000;
+    const STACK_TOP: u64 = 0x7000_0000_0000;
+    const STACK_SIZE: u64 = 16 * 1024;
+    let space = AddressSpace::new().ok()?;
+    space
+        .map(Placement::Fixed(CODE), 4096, Prot::READ_WRITE)
+        .ok()?;
+    with_address_space(&space, || copy_to_user(CODE, program.code())).ok()?;
+    space
+        .protect(
+            CODE,
+            4096,
+            Prot {
+                read: true,
+                write: false,
+                exec: true,
+            },
+        )
+        .ok()?;
+    space
+        .map(
+            Placement::Fixed(STACK_TOP - STACK_SIZE),
+            STACK_SIZE,
+            Prot::READ_WRITE,
+        )
+        .ok()?;
+    let id = sched::spawn_user("user-test", space.clone(), CODE, STACK_TOP, argument).ok()?;
+    sched::join(id);
+    let (status, fault) = sched::exit_status(id)?;
+    Some((status, fault, space))
+}
+
+/// P1-T10, P1-S3 and P1 security acceptance: user mode, system calls,
+/// privilege boundaries, and page-table isolation.
+pub fn phase1_user(t: &mut Runner) {
+    use idt::page_fault::{INSTRUCTION_FETCH, PRESENT, USER, WRITE};
+    use keel_hal::arch::x86_64::userprog::Program;
+
+    let add = run_user_program(Program::AddOne);
+    t.check(
+        "user.syscall",
+        add.as_ref()
+            .is_some_and(|(status, fault, _)| *status == 42 && fault.is_none()),
+        "a user program made two system calls and exited with status 42",
+    );
+    let regs = run_user_program(Program::Registers);
+    t.check(
+        "user.syscall_registers",
+        regs.as_ref().is_some_and(|(status, ..)| *status == 0),
+        "rbx, rbp and r12-r15 survive a system call and the result is in rax",
+    );
+    let enosys = run_user_program(Program::UnknownSyscall);
+    t.check(
+        "user.unknown_syscall",
+        enosys.as_ref().is_some_and(|(status, ..)| *status == 38),
+        "an unknown system call number returns -ENOSYS (SR-10)",
+    );
+
+    let gp = |program| {
+        run_user_program(program).is_some_and(|(status, fault, _)| {
+            status == 128 + 11 && fault.is_some_and(|f| f.vector == 13)
+        })
+    };
+    t.check(
+        "user.no_cli",
+        gp(Program::Cli),
+        "CLI in user mode raises #GP and ends only that thread",
+    );
+    t.check(
+        "user.no_port_io",
+        gp(Program::PortIo),
+        "port I/O from user mode raises #GP (SR-9)",
+    );
+
+    // Page-table isolation: the kernel is not merely protected but absent
+    // from the user view, so the fault reports a non-present page.
+    let absent = |address: u64| {
+        run_user_program_with(Program::ReadAddress, address).is_some_and(|(_, fault, _)| {
+            fault.is_some_and(|f| {
+                f.vector == 14 && f.error_code & (PRESENT | USER) == USER && f.address == address
+            })
+        })
+    };
+    // Kernel text just past the trampoline, kernel rodata, kernel data,
+    // the direct map, and the kernel heap.
+    // Moves a probe past any page the trampoline maps; those pages are
+    // meant to be present in the user view.
+    let off_trampoline = |mut address: u64| {
+        for (start, end, _) in paging::trampoline_ranges() {
+            if address < end.next_multiple_of(4096) && address >= start & !0xfff {
+                address = end.next_multiple_of(4096);
+            }
+        }
+        address
+    };
+    let [text, rodata, data, _] = paging::kernel_segments();
+    let heap_object = alloc::boxed::Box::new(0u64);
+    let probes = [
+        off_trampoline(text),
+        off_trampoline(rodata),
+        off_trampoline(data),
+        boot::hhdm_offset().unwrap_or(0) + 0x1000,
+        &raw const *heap_object as u64,
+    ];
+    t.check(
+        "pti.kernel_absent",
+        probes.iter().all(|&address| absent(address)),
+        "user reads of kernel text, rodata, data, the direct map and the heap find no page (SR-14)",
+    );
+
+    let write_code = run_user_program(Program::WriteCode);
+    t.check(
+        "user.code_read_only",
+        write_code.as_ref().is_some_and(|(_, fault, _)| {
+            fault.is_some_and(|f| {
+                f.vector == 14 && f.error_code & (PRESENT | WRITE | USER) == PRESENT | WRITE | USER
+            })
+        }),
+        "a user program writing its own code page faults (SR-12)",
+    );
+    let exec_stack = run_user_program(Program::ExecStack);
+    t.check(
+        "user.stack_no_execute",
+        exec_stack.as_ref().is_some_and(|(_, fault, _)| {
+            fault.is_some_and(|f| f.vector == 14 && f.error_code & INSTRUCTION_FETCH != 0)
+        }),
+        "a user program executing from its stack faults (SR-12)",
+    );
+
+    let umip = cpu::features().umip;
+    let sgdt = run_user_program(Program::Sgdt);
+    t.check(
+        "user.umip",
+        sgdt.as_ref().is_some_and(|(status, fault, _)| {
+            if umip {
+                fault.is_some_and(|f| f.vector == 13)
+            } else {
+                *status == 0
+            }
+        }),
+        "SGDT in user mode faults when the CPU has UMIP, and runs otherwise",
+    );
+
+    // A user thread that sets RFLAGS.AC must not switch SMAP off for the
+    // kernel code that handles its interrupts and exceptions (SR-13).
+    let ac = cpu::RFLAGS_AC;
+    t.check(
+        "user.ac_cleared_on_entry",
+        run_user_program(Program::SetAc).is_some_and(|(_, fault, _)| {
+            fault.is_some_and(|f| {
+                f.vector == 6 && f.user_rflags & ac != 0 && f.handler_rflags & ac == 0
+            })
+        }),
+        "a fault from user code with AC set is handled with AC clear",
+    );
+
+    // The user view of an address space maps nothing of the kernel but the
+    // entry trampoline, and nothing in it is writable and executable.
+    let user_view_ok = add.as_ref().is_some_and(|(_, _, space)| {
+        let ranges = paging::trampoline_ranges();
+        let mut only_trampoline = true;
+        let summary = space.user_view_walk(|virt, tr| {
+            if virt >= 0xffff_8000_0000_0000 {
+                let in_trampoline = ranges
+                    .iter()
+                    .any(|&(start, end, _)| (start..end).contains(&virt));
+                only_trampoline &= in_trampoline && !tr.flags.user;
+            }
+        });
+        only_trampoline && summary.writable_and_executable == 0
+    });
+    t.check(
+        "pti.user_view",
+        user_view_ok,
+        "a user address space maps only the entry trampoline of the kernel, and no W+X page (SR-12, SR-14)",
+    );
+    t.check(
+        "user.kernel_survives",
+        sched::thread_count() >= 2,
+        "the kernel kept running after every user fault",
     );
 }

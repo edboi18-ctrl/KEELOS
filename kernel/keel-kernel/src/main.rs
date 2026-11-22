@@ -84,6 +84,8 @@ extern "C" fn kmain() -> ! {
         // guard pages; stop instead (SR-12).
         Err(error) => panic!("page table setup failed: {error:?}"),
     }
+    // System calls and user-mode entry, with page-table isolation.
+    keel_hal::arch::x86_64::entry::init(paging::kernel_root().map_or(0, |r| r.address()));
 
     let fpu = fpu::init();
     match fpu.xcr0 {

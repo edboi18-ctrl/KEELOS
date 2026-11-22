@@ -39,6 +39,77 @@ unsafe extern "C" {
     static __rodata_start: u8;
     static __data_start: u8;
     static __kernel_end: u8;
+    static __entry_text_start: u8;
+    static __entry_text_end: u8;
+    static __entry_data_start: u8;
+    static __entry_data_end: u8;
+    static __entry_bss_start: u8;
+    static __entry_bss_end: u8;
+}
+
+/// Top-level entry 511 for user-view page tables: it maps only the entry
+/// trampoline (entry code, GDT, IDT, TSS, per-CPU entry data, IST and
+/// trampoline stacks), and none of the rest of the kernel (SR-14).
+static TRAMPOLINE_PML4E: AtomicU64 = AtomicU64::new(0);
+
+/// The user-view top-level entry for the kernel half (index 511).
+pub fn trampoline_pml4e() -> u64 {
+    TRAMPOLINE_PML4E.load(Ordering::Acquire)
+}
+
+/// The virtual ranges of the entry trampoline: (start, end, executable).
+pub fn trampoline_ranges() -> [(u64, u64, bool); 3] {
+    [
+        (
+            &raw const __entry_text_start as u64,
+            &raw const __entry_text_end as u64,
+            true,
+        ),
+        (
+            &raw const __entry_data_start as u64,
+            &raw const __entry_data_end as u64,
+            false,
+        ),
+        (
+            &raw const __entry_bss_start as u64,
+            &raw const __entry_bss_end as u64,
+            false,
+        ),
+    ]
+}
+
+/// Builds the trampoline-only top-level entry from the kernel's tables.
+fn build_trampoline(tables: &mut DirectMapTables, kernel_root: Frame) -> Result<(), PagingError> {
+    let scratch = tables
+        .allocate_table()
+        .ok_or(paging::MapError::OutOfMemory)?;
+    for (start, end, executable) in trampoline_ranges() {
+        let mut page = start;
+        while page < end {
+            // Guard pages inside the entry bss stay unmapped here too.
+            if let Some(t) = paging::translate(tables, kernel_root, page) {
+                let flags = if executable { Flags::TEXT } else { Flags::DATA };
+                paging::map(
+                    tables,
+                    scratch,
+                    page,
+                    t.phys & !(PAGE - 1),
+                    PageSize::Small,
+                    flags,
+                )?;
+            }
+            page += PAGE;
+        }
+    }
+    let entry = tables.table(scratch)[511];
+    // Every trampoline page is in the kernel image's top 2 GiB, so index
+    // 511 is the only top-level entry the scratch table used.
+    if tables.table(scratch)[..511].iter().any(|&e| e != 0) {
+        return Err(PagingError::Map(paging::MapError::Misaligned));
+    }
+    let _ = memory::release(scratch);
+    TRAMPOLINE_PML4E.store(entry, Ordering::Release);
+    Ok(())
 }
 
 /// Page tables built from frames of the frame allocator, reached through
@@ -206,6 +277,7 @@ pub fn init() -> Result<PagingReport, PagingError> {
     // stacks, devices) lands in shared lower-level tables and is visible
     // in every address space.
     paging::ensure_top_level(&mut tables, root, 256..512)?;
+    build_trampoline(&mut tables, root)?;
 
     let summary = paging::walk(&mut tables, root, |_, _| {});
 

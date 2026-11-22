@@ -55,6 +55,9 @@ against copies downloaded from the vendors:
 | Intel SDM Vol. 2A, "IN - Input from Port"; Vol. 2B, "OUT - Output to Port" | `kernel/hal/src/arch/x86_64/port.rs` |
 | Intel SDM Vol. 2A, "CLI - Clear Interrupt Flag", "HLT - Halt" | `kernel/hal/src/arch/x86_64/cpu.rs` |
 | Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing" | Higher-half bound in `kernel/keel-kernel/src/selftest.rs` |
+| Intel SDM Vol. 2B "SYSCALL" (RIP from IA32_LSTAR, RCX/R11 saved, RFLAGS masked by IA32_FMASK at C0000084H, RSP not saved) and "SYSRET" (#GP(0) at CPL 0 for non-canonical RCX; RFLAGS from R11, including IOPL); AMD64 APM Vol. 2 section 6.1.1 and Table A-1 (STAR C000_0081h, LSTAR C000_0082h, SFMASK C000_0084h), EFER.SCE bit 0 | `kernel/hal/src/arch/x86_64/entry.rs`; ADR 0005 |
+| Intel SDM Vol. 3 section 7.12.1.3 (interrupt delivery clears TF, VM, RF, NT and, for interrupt gates, IF; not AC); Vol. 2B "POPF" flag-update table (all flags writable at CPL 0, AC writable at CPL 3); Vol. 3 section 5.6 (SMAP applies while AC = 0) | `push 2; popfq` at handler entry in `entry.rs`; finding F-0001 |
+| Linux `arch/x86/entry/syscalls/syscall_64.tbl`, `include/uapi/asm-generic/errno.h`, `arch/x86/include/uapi/asm/signal.h` at v6.12 (exit 60, exit_group 231, ENOSYS 38, SIGILL 4, SIGTRAP 5, SIGBUS 7, SIGFPE 8, SIGSEGV 11), read 2026-11-22 | `kernel/hal/src/syscall.rs`, `docs/syscalls.md` |
 
 ## Devices
 

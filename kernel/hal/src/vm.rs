@@ -44,9 +44,18 @@ struct Inner {
     layout: Layout,
 }
 
-/// One user address space.
+/// One user address space, as two top-level tables:
+/// - the kernel view (`root`), active while the kernel runs on behalf of
+///   this process: user half plus the whole kernel;
+/// - the user view (`user_root`), active while user code runs: the same
+///   user half, and in the kernel half only the entry trampoline
+///   (page-table isolation, SR-14).
+///
+/// The user half is shared: both tables point at the same lower-level
+/// tables, and `sync_user_view` copies any new top-level entry across.
 pub struct AddressSpace {
     root: Frame,
+    user_root: Frame,
     inner: IrqMutex<Inner>,
 }
 
@@ -71,12 +80,48 @@ impl AddressSpace {
         let mut tables = DirectMapTables;
         let upper: [u64; 256] = tables.table(kernel)[256..].try_into().expect("256 entries");
         tables.table(root)[256..].copy_from_slice(&upper);
+        let Some(user_root) = memory::allocate_zeroed() else {
+            let _ = memory::release(root);
+            return Err(AsError::OutOfMemory);
+        };
+        tables.table(user_root)[511] = crate::arch::x86_64::paging::trampoline_pml4e();
         Ok(Arc::new(AddressSpace {
             root,
+            user_root,
             inner: IrqMutex::new(Inner {
                 layout: Layout::new(),
             }),
         }))
+    }
+
+    /// The user view's top-level table (CR3 while user code runs).
+    pub fn user_root(&self) -> Frame {
+        self.user_root
+    }
+
+    /// Copies the user-half top-level entries into the user view. Called
+    /// after any change that may have created a new top-level entry.
+    fn sync_user_view(&self) {
+        let mut tables = DirectMapTables;
+        let lower: [u64; 256] = tables.table(self.root)[..256]
+            .try_into()
+            .expect("256 entries");
+        tables.table(self.user_root)[..256].copy_from_slice(&lower);
+    }
+
+    /// Effective rights of `address` in the user view, if mapped there.
+    pub fn user_view_flags(&self, address: u64) -> Option<Flags> {
+        paging::translate(&mut DirectMapTables, self.user_root, address & !(PAGE - 1))
+            .map(|t| t.flags)
+    }
+
+    /// Walks the user view (the page-table self-test for user tables).
+    pub fn user_view_walk(
+        &self,
+        visit: impl FnMut(u64, paging::Translation),
+    ) -> paging::WalkSummary {
+        let _inner = self.inner.lock();
+        paging::walk(&mut DirectMapTables, self.user_root, visit)
     }
 
     /// Physical address of the top-level table (for CR3).
@@ -167,6 +212,7 @@ impl AddressSpace {
                 if mapped.is_err() {
                     let _ = memory::release(frame);
                 }
+                self.sync_user_view();
                 // AlreadyMapped means another path mapped it first: retry.
                 matches!(mapped, Ok(()) | Err(paging::MapError::AlreadyMapped))
             }
@@ -234,6 +280,7 @@ impl AddressSpace {
             let _ = paging::replace_small(&mut DirectMapTables, self.root, virt, phys, shared);
             cpu::invalidate_page(virt);
         }
+        child.sync_user_view();
         Ok(child)
     }
 
@@ -266,6 +313,9 @@ impl Drop for AddressSpace {
             let _ = memory::release(table);
         }
         let _ = memory::release(self.root);
+        // The user view shares the (now freed) lower-level tables and the
+        // permanent trampoline entry; only its own top-level frame is freed.
+        let _ = memory::release(self.user_root);
     }
 }
 
@@ -273,8 +323,15 @@ impl Drop for AddressSpace {
 /// per-thread with user mode (P1-T10).
 static CURRENT: IrqMutex<Option<Arc<AddressSpace>>> = IrqMutex::new(None);
 
+/// Sets the address space page faults resolve against. Called by the
+/// scheduler on every switch.
+pub(crate) fn set_current(space: Option<Arc<AddressSpace>>) {
+    *CURRENT.lock() = space;
+}
+
 /// Runs `f` with `space` active (CR3 switched), then switches back to the
-/// kernel tables. Used by the self-tests until threads own address spaces.
+/// kernel tables. Used by kernel threads (and self-tests) to work in
+/// another address space.
 pub fn with_address_space<R>(space: &Arc<AddressSpace>, f: impl FnOnce() -> R) -> R {
     let kernel = kernel_root().expect("paging is set up");
     *CURRENT.lock() = Some(space.clone());

@@ -85,8 +85,17 @@ pub fn segment_state() -> SegmentState {
 /// RFLAGS.IF, the interrupt-enable flag (SDM Vol. 1 section 3.4.3.3).
 const RFLAGS_IF: u64 = 1 << 9;
 
+/// RFLAGS.AC, the alignment-check / SMAP-override flag (SDM Vol. 1
+/// section 3.4.3.3; Vol. 3 section 5.6).
+pub const RFLAGS_AC: u64 = 1 << 18;
+
 /// Whether maskable interrupts are currently enabled.
 pub fn interrupts_enabled() -> bool {
+    rflags() & RFLAGS_IF != 0
+}
+
+/// The current RFLAGS.
+pub fn rflags() -> u64 {
     let rflags: u64;
     // Assembly reasoning (spec section 1, rule 4)
     // Entry state: any.
@@ -99,7 +108,7 @@ pub fn interrupts_enabled() -> bool {
     unsafe {
         asm!("pushfq", "pop {r}", r = out(reg) rflags, options(nomem, preserves_flags));
     }
-    rflags & RFLAGS_IF != 0
+    rflags
 }
 
 /// Executes CPUID for `leaf` and `subleaf`; returns (EAX, EBX, ECX, EDX).

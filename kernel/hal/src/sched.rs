@@ -15,14 +15,16 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::x86_64::fpu::FpuState;
 use crate::arch::x86_64::paging::{self, KernelStack};
-use crate::arch::x86_64::{gdt, switch};
+use crate::arch::x86_64::{cpu, entry, switch};
 use crate::sync::IrqMutex;
 use crate::time;
+use crate::vm::AddressSpace;
 
 /// Pages per kernel stack (64 KiB).
 pub const STACK_PAGES: u64 = 16;
@@ -50,7 +52,28 @@ struct Thread {
     /// `None` for the boot thread, which runs on the bootloader's stack.
     stack: Option<KernelStack>,
     fpu: FpuState,
+    /// The user address space, for threads that run user code.
+    space: Option<Arc<AddressSpace>>,
+    /// First user-mode RIP, RSP and RDI, consumed by `user_thread_start`.
+    user_entry: Option<(u64, u64, u64)>,
 }
+
+/// How a user thread's last exception looked, for tests and diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserFault {
+    pub vector: u64,
+    pub error_code: u64,
+    pub address: u64,
+    pub rip: u64,
+    /// RFLAGS of the user code at the fault.
+    pub user_rflags: u64,
+    /// RFLAGS of the kernel while it handled the fault.
+    pub handler_rflags: u64,
+}
+
+/// Exit status and last user fault of threads that have exited.
+static EXITED: IrqMutex<BTreeMap<u64, (i64, Option<UserFault>)>> = IrqMutex::new(BTreeMap::new());
+static FAULTS: IrqMutex<BTreeMap<u64, UserFault>> = IrqMutex::new(BTreeMap::new());
 
 struct Scheduler {
     /// Boxed so a thread's `rsp` field stays at a fixed address while the
@@ -92,6 +115,8 @@ pub fn init() -> Result<(), SchedError> {
         rsp: 0,
         stack: None,
         fpu: FpuState::new().ok_or(SchedError::OutOfMemory)?,
+        space: None,
+        user_entry: None,
     });
     let mut sched = Scheduler {
         threads: BTreeMap::new(),
@@ -124,7 +149,62 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         rsp,
         stack: Some(stack),
         fpu: FpuState::new().ok_or(SchedError::OutOfMemory)?,
+        space: None,
+        user_entry: None,
     }))
+}
+
+/// Starts a thread that runs user code in `space`, beginning at `rip` with
+/// stack pointer `rsp` and `argument` in RDI.
+pub fn spawn_user(
+    name: &'static str,
+    space: Arc<AddressSpace>,
+    rip: u64,
+    rsp: u64,
+    argument: u64,
+) -> Result<ThreadId, SchedError> {
+    let id = {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
+        let id = sched.next_id;
+        sched.next_id += 1;
+        id
+    };
+    let mut thread = new_thread(name, user_thread_start, id)?;
+    thread.space = Some(space);
+    thread.user_entry = Some((rip, rsp, argument));
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
+    sched.threads.insert(id, thread);
+    sched.ready.push_back(id);
+    Ok(ThreadId(id))
+}
+
+fn user_thread_start() {
+    let entry = {
+        let mut guard = SCHED.lock();
+        guard.as_mut().and_then(|s| {
+            let current = s.current;
+            s.threads
+                .get_mut(&current)
+                .and_then(|t| t.user_entry.take())
+        })
+    };
+    match entry {
+        Some((rip, rsp, argument)) => entry::enter_user(rip, rsp, argument),
+        None => exit_with(-1),
+    }
+}
+
+/// Records the user fault that is about to end the current thread.
+pub fn record_user_fault(fault: UserFault) {
+    let id = current().0;
+    FAULTS.lock().insert(id, fault);
+}
+
+/// Exit status of an exited thread, with its last user fault, if known.
+pub fn exit_status(id: ThreadId) -> Option<(i64, Option<UserFault>)> {
+    EXITED.lock().get(&id.0).copied()
 }
 
 /// Starts a new kernel thread running `entry`. It is scheduled after the
@@ -200,6 +280,14 @@ pub fn sleep_ms(ms: u64) {
 
 /// Ends the running thread.
 pub fn exit() -> ! {
+    exit_with(0)
+}
+
+/// Ends the running thread with an exit status.
+pub fn exit_with(status: i64) -> ! {
+    let id = current().0;
+    let fault = FAULTS.lock().remove(&id);
+    EXITED.lock().insert(id, (status, fault));
     schedule(State::Exited);
     unreachable!("an exited thread was scheduled again");
 }
@@ -283,12 +371,21 @@ fn schedule(next_state: State) {
     next.state = State::Running;
     next.fpu.restore();
     let load = next.rsp;
-    if let Some(stack) = &next.stack {
-        // Interrupts and exceptions from user mode will land on this
-        // thread's kernel stack (used from P1-T10 on).
-        // SAFETY: the stack is mapped and stays so while the thread lives;
-        // interrupts are disabled (the scheduler lock disables them).
-        unsafe { gdt::set_kernel_stack(stack.top) };
+    // Tell the entry code about the incoming thread, and switch to its
+    // kernel-view page tables (the kernel's own for kernel threads).
+    let kernel_root = paging::kernel_root().map_or(0, |r| r.address());
+    let kernel_cr3 = next
+        .space
+        .as_ref()
+        .map_or(kernel_root, |s| s.root().address());
+    let user_cr3 = next.space.as_ref().map_or(0, |s| s.user_root().address());
+    let stack_top = next.stack.as_ref().map_or(0, |s| s.top);
+    entry::set_current(kernel_cr3, user_cr3, stack_top);
+    crate::vm::set_current(next.space.clone());
+    if cpu::read_cr3() & !0xFFF != kernel_cr3 {
+        // SAFETY: every kernel view shares the kernel half, which maps all
+        // kernel code, data and stacks, including both threads' stacks.
+        unsafe { cpu::write_cr3(kernel_cr3) };
     }
     sched.current = next_id;
     SWITCHES.fetch_add(1, Ordering::Relaxed);
