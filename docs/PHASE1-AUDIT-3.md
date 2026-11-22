@@ -8,6 +8,14 @@ fixed and has a regression test that passed here. No new finding blocks.
 Three low-severity items are listed below; C1 must be fixed before any
 system call lets a program choose a file to execute.
 
+## Status on the working branch
+
+| # | Status |
+| --- | --- |
+| C1 | Fixed before Phase 2 work began. `elf::Image::bias_for_base` computes the bias with `checked_sub` and then checks it; `exec::load` uses it. Host test `relocatable_image_above_the_base_is_refused` (the audit's 0x7000_0000_0000 case) and the parser's random-input test now also choose load addresses; with the plain subtraction back, both panic. |
+| C2 | Open; to be done before Phase 3 (per-compartment limits). |
+| C3 | Open; to be done before Phase 3, with ADR 0011 updated. |
+
 ## What was run (QEMU 8.2.2, TCG, no KVM, Ubuntu 24.04)
 
 - `cargo test --locked --offline`: passed.

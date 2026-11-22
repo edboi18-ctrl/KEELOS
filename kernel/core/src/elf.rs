@@ -140,6 +140,19 @@ impl Image {
         (first, last)
     }
 
+    /// The bias that moves a relocatable image's first page to `base`,
+    /// checked like any bias. An image whose first page lies above `base`
+    /// needs a negative bias, which is refused rather than computed with an
+    /// unchecked subtraction (that panicked the kernel: third Phase 1 audit,
+    /// C1).
+    pub fn bias_for_base(&self, base: u64) -> Result<u64, ElfError> {
+        let bias = base
+            .checked_sub(self.span().0)
+            .ok_or(ElfError::OutOfRange)?;
+        self.check_bias(bias)?;
+        Ok(bias)
+    }
+
     /// Checks that the image, moved by `bias`, lies inside the user half.
     pub fn check_bias(&self, bias: u64) -> Result<(), ElfError> {
         let (first, last) = self.span();
@@ -470,6 +483,23 @@ mod tests {
         assert_eq!(image.check_bias(0x5555_0000_0000), Ok(()));
         assert_eq!(image.check_bias(USER_END), Err(ElfError::OutOfRange));
         assert_eq!(image.check_bias(u64::MAX), Err(ElfError::OutOfRange));
+        assert_eq!(image.bias_for_base(0x5555_0000_0000), Ok(0x5555_0000_0000));
+    }
+
+    /// Audit 3, C1: an ET_DYN image whose first segment lies above the load
+    /// base would need a negative bias. It is refused, not computed.
+    #[test]
+    fn relocatable_image_above_the_base_is_refused() {
+        let high = 0x7000_0000_0000;
+        let bytes = file(ET_DYN, high + 0x100, &[text(0, high, 0x800)], 0x1000);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.kind, Kind::Relocatable);
+        assert_eq!(
+            image.bias_for_base(0x5555_5555_4000),
+            Err(ElfError::OutOfRange)
+        );
+        // Loaded at its own address, the bias is zero.
+        assert_eq!(image.bias_for_base(high), Ok(0));
     }
 
     #[test]
@@ -642,6 +672,10 @@ mod tests {
                 }
                 for pair in image.segments.windows(2) {
                     assert!(pair[0].page_end() <= pair[1].page_start());
+                }
+                // Choosing a load address never panics (audit 3, C1).
+                for base in [0, 0x5555_5555_4000, USER_END, u64::MAX] {
+                    let _ = image.bias_for_base(base);
                 }
             }
         }
