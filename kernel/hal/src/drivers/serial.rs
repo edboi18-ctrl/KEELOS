@@ -11,6 +11,10 @@ use crate::arch::x86_64::port::{inb, outb};
 
 /// I/O base of the first PC serial port.
 pub const COM1_BASE: u16 = 0x3F8;
+/// COM2: the second ISA serial port. Under QEMU, the second `-serial`
+/// option is placed here (QEMU 8.2.2 `hw/char/serial-isa.c`,
+/// `isa_serial_io`: 0x3f8, 0x2f8, 0x3e8, 0x2e8).
+pub const COM2_BASE: u16 = 0x2F8;
 
 // Register offsets from the base port (PC16550D register summary).
 const REG_DATA: u16 = 0; // THR (write) / RBR (read); DLL when DLAB = 1

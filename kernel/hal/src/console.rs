@@ -10,7 +10,7 @@ use crate::sync::IrqMutex;
 
 use crate::boot;
 use crate::drivers::framebuffer::TextConsole;
-use crate::drivers::serial::{COM1_BASE, SerialPort};
+use crate::drivers::serial::{COM1_BASE, COM2_BASE, SerialPort};
 
 // SAFETY: 0x3F8 is the standard COM1 base (or undecoded when the port is
 // not fitted). This static is the only long-lived handle; the panic path
@@ -19,8 +19,46 @@ static SERIAL: IrqMutex<SerialPort> = IrqMutex::new(unsafe { SerialPort::new(COM
 
 static FRAMEBUFFER: IrqMutex<Option<TextConsole<'static>>> = IrqMutex::new(None);
 
-/// Initialises COM1. Returns whether a UART answered the loopback test.
+// SAFETY: 0x2F8 is the standard COM2 base, as for COM1 above. Only the
+// kernel's result lines go here: user programs cannot do port I/O (IOPL 0,
+// no I/O permission bitmap; SR-9), and no device node leads to it.
+static RESULTS: IrqMutex<SerialPort> = IrqMutex::new(unsafe { SerialPort::new(COM2_BASE) });
+
+/// Writes one line the test harness trusts (a `TEST` result, a summary,
+/// an acceptance marker, a layout line) to COM2, which only the kernel can
+/// write, and also to the normal console for people reading it. Programs
+/// share COM1 and the screen with the kernel, so a hostile one could print
+/// a forged result line there; `cargo xtask test` reads results from COM2
+/// only (Phase 2 audit, item 3). Without a COM2 nothing is lost: the line
+/// is still on the console.
+pub fn _result(args: fmt::Arguments) {
+    let _ = RESULTS.lock().write_fmt(args);
+    _print(args);
+}
+
+/// As [`_result`], from the panic and fatal-fault paths: no locks waited
+/// on, fresh port handles (see [`emergency_print`]).
+pub fn emergency_result(args: fmt::Arguments) {
+    // SAFETY: as in `emergency_print`, for COM2.
+    let mut results = unsafe { SerialPort::new(COM2_BASE) };
+    results.init();
+    let _ = results.write_fmt(args);
+    emergency_print(args);
+}
+
+/// As [`emergency_serial`], also on COM2: a fixed line from a nested panic.
+pub fn emergency_result_serial(text: &str) {
+    // SAFETY: as in `emergency_print`, for COM2.
+    let mut results = unsafe { SerialPort::new(COM2_BASE) };
+    results.init();
+    let _ = results.write_str(text);
+    emergency_serial(text);
+}
+
+/// Initialises COM1, and COM2 for result lines. Returns whether COM1
+/// answered the loopback test.
 pub fn init_serial() -> bool {
+    RESULTS.lock().init();
     SERIAL.lock().init()
 }
 
@@ -161,6 +199,15 @@ pub fn emergency_serial(text: &str) {
 macro_rules! kprint {
     ($($arg:tt)*) => {
         $crate::console::_print(::core::format_args!($($arg)*))
+    };
+}
+
+/// A line the test harness trusts, to COM2 and the console (see
+/// `console::_result`).
+#[macro_export]
+macro_rules! kresult {
+    ($($arg:tt)*) => {
+        $crate::console::_result(::core::format_args!("{}\n", ::core::format_args!($($arg)*)))
     };
 }
 

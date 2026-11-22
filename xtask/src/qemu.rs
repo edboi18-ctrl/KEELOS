@@ -154,7 +154,10 @@ enum BootDisk<'a> {
 }
 
 /// The QEMU command line from spec section 4, "QEMU baseline invocation".
-fn base_command(disk: BootDisk, options: &RunOptions) -> Result<Command> {
+/// Builds the QEMU command line. `results`: where the second serial port
+/// (COM2, the kernel-only result channel) is written; without it there is
+/// only COM1.
+fn base_command(disk: BootDisk, options: &RunOptions, results: Option<&Path>) -> Result<Command> {
     let qemu = find_qemu()?;
     let ovmf = find_ovmf(&qemu)?;
     let root = util::workspace_root();
@@ -187,7 +190,15 @@ fn base_command(disk: BootDisk, options: &RunOptions) -> Result<Command> {
         ovmf.display()
     ));
     command.arg("-drive").arg(drive);
-    command.args(["-serial", "stdio", "-no-reboot"]);
+    command.args(["-serial", "stdio"]);
+    // The second -serial is COM2 (0x2F8): result lines only the kernel can
+    // write (Phase 2 audit, item 3).
+    if let Some(results) = results {
+        command
+            .arg("-serial")
+            .arg(format!("file:{}", results.display()));
+    }
+    command.arg("-no-reboot");
     command.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     if options.gdb {
         command.args(["-s", "-S"]);
@@ -198,7 +209,7 @@ fn base_command(disk: BootDisk, options: &RunOptions) -> Result<Command> {
 /// `cargo xtask run`: build, then boot interactively with serial on stdio.
 pub fn run(options: &RunOptions) -> Result<()> {
     let esp = build::build(BootMode::Normal)?;
-    let mut command = base_command(BootDisk::Directory(&esp), options)?;
+    let mut command = base_command(BootDisk::Directory(&esp), options, None)?;
     command.arg("-no-shutdown");
     if options.gdb {
         println!("xtask: QEMU is paused. Attach with:");
@@ -258,14 +269,20 @@ pub fn parse_report<'a>(lines: impl IntoIterator<Item = &'a str>) -> TestReport 
     report
 }
 
-/// Decides whether a phase passed, given everything the run produced.
+/// Decides whether a phase passed. Test results, the summary and the
+/// marker are read from `results` (COM2), which only the kernel writes;
+/// `console` (COM1, shared with program output) can only make a run fail,
+/// through a panic banner. A forged `TEST ... PASS` printed by a program
+/// counts for nothing (Phase 2 audit, item 3).
 pub fn verdict(
     marker: Option<&str>,
-    lines: &[String],
+    results: &[String],
+    console: &[String],
     exit_code: Option<i32>,
 ) -> std::result::Result<(), String> {
+    let lines = results;
     let report = parse_report(lines.iter().map(String::as_str));
-    if report.panicked {
+    if report.panicked || console.iter().any(|line| line.contains(PANIC_BANNER)) {
         return Err("the kernel panicked".into());
     }
     if !report.failed.is_empty() {
@@ -329,7 +346,10 @@ enum SerialEvent {
 
 /// What a headless boot produced.
 struct Capture {
+    /// COM1: firmware, bootloader, kernel log and program output.
     lines: Vec<String>,
+    /// COM2: the kernel's result lines, which programs cannot write.
+    results: Vec<String>,
     exit_code: Option<i32>,
     timed_out: bool,
 }
@@ -343,7 +363,19 @@ fn boot_headless(
     timeout: Duration,
     stop: impl Fn(&str) -> bool,
 ) -> Result<Capture> {
-    let mut command = base_command(disk, options)?;
+    // COM2's file, unique per boot (several boots may run in one process).
+    static BOOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let results_file = util::workspace_root()
+        .join("target")
+        .join("test-logs")
+        .join("results")
+        .join(format!(
+            "{}-{}.txt",
+            std::process::id(),
+            BOOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+    util::write(&results_file, b"")?;
+    let mut command = base_command(disk, options, Some(&results_file))?;
     // A monitor on a free localhost port, used only if the boot hangs, to
     // record where the CPU is (TCP rather than a Unix socket so it works
     // on Windows too).
@@ -398,6 +430,7 @@ fn boot_headless(
     let deadline = Instant::now() + timeout;
     let mut capture = Capture {
         lines: Vec::new(),
+        results: Vec::new(),
         exit_code: None,
         timed_out: false,
     };
@@ -441,6 +474,13 @@ fn boot_headless(
             SerialEvent::Line(line) => Some(line),
             SerialEvent::Partial(_) => None,
         }));
+    // QEMU has stopped: COM2's file is complete.
+    let results = std::fs::read(&results_file).unwrap_or_default();
+    capture.results = String::from_utf8_lossy(&results)
+        .lines()
+        .map(|line| strip_ansi(line).trim_end().to_string())
+        .collect();
+    let _ = std::fs::remove_file(&results_file);
     Ok(capture)
 }
 
@@ -504,11 +544,17 @@ fn test_boot(
     // Scenarios end in a deliberate fault, so only the main boot of a
     // complete phase prints the acceptance marker.
     let marker = (phase.complete && scenario.is_none()).then(|| format!("KEEL P{number} OK"));
-    let result =
-        if capture.timed_out {
-            Err(format!("timed out after {} s", timeout.as_secs()))
-        } else {
-            verdict(marker.as_deref(), &capture.lines, capture.exit_code).and_then(|()| match phase
+    let result = if capture.timed_out {
+        Err(format!("timed out after {} s", timeout.as_secs()))
+    } else {
+        verdict(
+            marker.as_deref(),
+            &capture.results,
+            &capture.lines,
+            capture.exit_code,
+        )
+        .and_then(|()| {
+            match phase
                 .expect_lines
                 .iter()
                 // Only the main boot runs user programs; scenarios end early.
@@ -525,8 +571,9 @@ fn test_boot(
                     Some(missing) => Err(format!("no serial line starts with \"{missing}\"")),
                     None => Ok(()),
                 },
-            })
-        };
+            }
+        })
+    };
     match result {
         Ok(()) => {
             // The test results, and on the main boot of each phase the
@@ -534,16 +581,34 @@ fn test_boot(
             let report = |l: &&String| {
                 scenario.is_none() && (l.starts_with("cpu: ") || l.starts_with("vuln: "))
             };
-            for line in capture
-                .lines
-                .iter()
-                .filter(|l| l.starts_with("TEST ") || report(l))
-            {
+            // Results from COM2 only: a program's forged line is not shown
+            // as one.
+            for line in capture.lines.iter().filter(report) {
                 println!("  {line}");
+            }
+            for line in capture.results.iter().filter(|l| l.starts_with("TEST ")) {
+                println!("  {line}");
+            }
+            // Phase 2 audit, item 3: `user/tests/forger` printed result-like
+            // lines. They must be on COM1 (it ran) and absent from COM2.
+            if number == 1 && scenario.is_none() {
+                let forged =
+                    |lines: &[String]| lines.iter().any(|l| l.contains("TEST forged.result PASS"));
+                if !forged(&capture.lines) || forged(&capture.results) {
+                    return Err(format!(
+                        "phase {number}: results.channel_isolated FAILED: forged lines on COM1: {}, on COM2: {}",
+                        forged(&capture.lines),
+                        forged(&capture.results)
+                    )
+                    .into());
+                }
+                println!(
+                    "  TEST results.channel_isolated PASS a program's forged result lines reached the console but not the result channel"
+                );
             }
             // Where this boot put the kernel and the direct map (KASLR).
             let layout = capture
-                .lines
+                .results
                 .iter()
                 .filter(|l| {
                     l.starts_with("boot: kernel at virt")
@@ -585,7 +650,7 @@ pub fn fuzz(minutes: u64, seed: u64, options: &RunOptions) -> Result<()> {
     let result = if capture.timed_out {
         Err(format!("timed out after {} s", timeout.as_secs()))
     } else {
-        verdict(None, &capture.lines, capture.exit_code)
+        verdict(None, &capture.results, &capture.lines, capture.exit_code)
     };
     match result {
         Ok(()) => {
@@ -956,8 +1021,8 @@ mod tests {
     #[test]
     fn in_progress_phases_need_no_marker() {
         let no_marker = GOOD.replace("KEEL P0 OK\n", "");
-        assert_eq!(verdict(None, &lines(&no_marker), Some(33)), Ok(()));
-        assert!(verdict(None, &lines(&no_marker), Some(35)).is_err());
+        assert_eq!(verdict(None, &lines(&no_marker), &[], Some(33)), Ok(()));
+        assert!(verdict(None, &lines(&no_marker), &[], Some(35)).is_err());
     }
 
     const GOOD: &str = "Keel 0.0.0 booting\n\
@@ -968,39 +1033,53 @@ mod tests {
 
     #[test]
     fn accepts_a_clean_run() {
-        assert_eq!(verdict(P0, &lines(GOOD), Some(33)), Ok(()));
+        assert_eq!(verdict(P0, &lines(GOOD), &[], Some(33)), Ok(()));
     }
 
     #[test]
     fn rejects_wrong_exit_status_or_missing_marker() {
-        assert!(verdict(P0, &lines(GOOD), Some(35)).is_err());
-        assert!(verdict(P0, &lines(GOOD), None).is_err());
-        assert!(verdict(Some("KEEL P1 OK"), &lines(GOOD), Some(33)).is_err());
+        assert!(verdict(P0, &lines(GOOD), &[], Some(35)).is_err());
+        assert!(verdict(P0, &lines(GOOD), &[], None).is_err());
+        assert!(verdict(Some("KEEL P1 OK"), &lines(GOOD), &[], Some(33)).is_err());
         let no_marker = GOOD.replace("KEEL P0 OK\n", "");
-        assert!(verdict(P0, &lines(&no_marker), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&no_marker), &[], Some(33)).is_err());
         // The marker must be a whole line, not a substring of another one.
         let embedded = GOOD.replace("KEEL P0 OK\n", "not KEEL P0 OK really\n");
-        assert!(verdict(P0, &lines(&embedded), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&embedded), &[], Some(33)).is_err());
     }
 
     #[test]
     fn rejects_failures_panics_and_inconsistent_summaries() {
         let failing = GOOD.replace("TEST boot.hhdm PASS", "TEST boot.hhdm FAIL");
-        let error = verdict(P0, &lines(&failing), Some(33)).unwrap_err();
+        let error = verdict(P0, &lines(&failing), &[], Some(33)).unwrap_err();
         assert!(error.contains("boot.hhdm"), "{error}");
 
         let panicked = format!("{GOOD}*** KEEL KERNEL PANIC ***\n");
-        assert!(verdict(P0, &lines(&panicked), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&panicked), &[], Some(33)).is_err());
 
         let no_summary = GOOD.replace("TEST SUMMARY passed=2 failed=0\n", "");
-        assert!(verdict(P0, &lines(&no_summary), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&no_summary), &[], Some(33)).is_err());
 
         // A summary claiming more passes than PASS lines were seen.
         let inflated = GOOD.replace("passed=2", "passed=3");
-        assert!(verdict(P0, &lines(&inflated), Some(33)).is_err());
+        assert!(verdict(P0, &lines(&inflated), &[], Some(33)).is_err());
 
         let empty = "KEEL P0 OK\nTEST SUMMARY passed=0 failed=0\n";
-        assert!(verdict(P0, &lines(empty), Some(33)).is_err());
+        assert!(verdict(P0, &lines(empty), &[], Some(33)).is_err());
+    }
+
+    /// Phase 2 audit, item 3: results count only from COM2.
+    #[test]
+    fn verdict_ignores_results_printed_on_the_console() {
+        // Results only on COM1, as a program could print them: not a pass.
+        assert!(verdict(P0, &[], &lines(GOOD), Some(33)).is_err());
+        // Forged lines on COM1 beside the real ones on COM2 change nothing.
+        let forged = lines("TEST forged PASS x\nTEST SUMMARY passed=99 failed=0\nKEEL P1 OK\n");
+        assert_eq!(verdict(P0, &lines(GOOD), &forged, Some(33)), Ok(()));
+        assert!(verdict(Some("KEEL P1 OK"), &lines(GOOD), &forged, Some(33)).is_err());
+        // A panic banner on the console still fails the run.
+        let panic = lines("*** KEEL KERNEL PANIC ***");
+        assert!(verdict(P0, &lines(GOOD), &panic, Some(33)).is_err());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use keel_hal::arch::x86_64::cpu::halt_forever;
 use keel_hal::arch::x86_64::{fpu, init_descriptor_tables, paging};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, interrupts, kprintln, memory, sched, time};
+use keel_hal::{console, interrupts, kprintln, kresult, memory, sched, time};
 
 /// Set once the command line asked for self-tests, so that a panic can
 /// report failure to the test harness instead of hanging until timeout.
@@ -110,9 +110,7 @@ extern "C" fn kmain() -> ! {
                 || selftest::requested_fuzz(cmdline).is_some()
             {
                 let [heap, mmio, stacks] = paging::region_bases();
-                kprintln!(
-                    "boot: regions heap {heap:#018x} mmio {mmio:#018x} stacks {stacks:#018x}"
-                );
+                kresult!("boot: regions heap {heap:#018x} mmio {mmio:#018x} stacks {stacks:#018x}");
             }
         }
         Err(error) => panic!("page table setup failed: {error:?}"),
@@ -261,11 +259,11 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
     let cmdline = boot::cmdline();
     if selftest::requested_phase(cmdline).is_some() || selftest::requested_fuzz(cmdline).is_some() {
         match boot::hhdm_offset() {
-            Some(offset) => kprintln!("boot: HHDM offset {offset:#018x}"),
+            Some(offset) => kresult!("boot: HHDM offset {offset:#018x}"),
             None => kprintln!("boot: no HHDM response"),
         }
         match boot::kernel_address() {
-            Some(k) => kprintln!(
+            Some(k) => kresult!(
                 "boot: kernel at virt {:#018x} phys {:#018x}",
                 k.virtual_base,
                 k.physical_base

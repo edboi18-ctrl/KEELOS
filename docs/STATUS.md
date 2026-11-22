@@ -127,11 +127,9 @@ log; it is on the working branch for the owner to review and merge
 (SR-36).
 
 Hardening notes for later Phase 1 work:
-- User programs share the serial line with the kernel's `TEST` report lines,
-  so a hostile program could print a forged result. Harmless while only our
-  own programs run; before the escape suite (P3-S8) runs hostile code, test
-  results must travel on a channel user code cannot write (for example a
-  second serial port, or the debug-exit code).
+- Resolved at the start of Phase 3: test results now travel on COM2, which
+  only the kernel writes (see Phase 3 below). Programs still share COM1 and
+  the screen with the kernel log.
 
 ## Phase 2 (toy PE loader): complete (2026-11-22)
 
@@ -157,6 +155,25 @@ Keel's.
 | P2-T3 | `winetest/hello-console`: no-CRT Windows x64 `.exe` importing `GetStdHandle`, `WriteFile`, `ExitProcess` (`raw-dylib`), checked in as a pinned fixture with its build command | Done. Built with the pinned toolchain's `rust-lld` (lld-link mode), no Windows SDK. It writes its line through a static table of pointers, so it carries two DIR64 relocations and tests a loader's relocation code. 3072 bytes, SHA-256 `f603ceac...65e4`, reproducible (a clean rebuild gave the same hash). ADR 0013 records where `unsafe` may appear for Phase 2. The owner ran it on Windows: it printed the line and exited with status 0. |
 | P2-T4 | `cargo xtask test --phase 2`: `peldr /winetest/hello.exe` under Linux and on Keel; the exact line on serial and exit status 0 | Done. Under Linux: `host.peldr.hello.exe` and `.relocated` (exact stdout, exit 0). On Keel: `acceptance.peldr_hello`, `peldr.relocated` and `peldr.refuses_non_pe`; xtask requires the exact line on serial. The serial log shows no unimplemented system call and no user fault. `KEEL P2 OK` is printed when all pass; xtask requires it once the phase is marked complete. |
 | P2-S1 | Host fuzz target for the PE parser; 30 minutes with no crash | Done. `cargo xtask fuzz-pe --minutes N --seed S` (engine in `fuzz/pe-fuzz`, a host-only crate so `pe` never needs std; overflow checks on; a panic writes the input to `target/fuzz-pe-crash.exe`, checked by breaking the parser on purpose). Acceptance run: `cargo xtask fuzz-pe --minutes 30 --seed 20261122` passed, 187,340,000 inputs, 13,291,167 accepted as images, no panic. |
+
+## Phase 3 (Linux-ABI personality and compartments): in progress
+
+Started 2026-11-22, after the Phase 2 audit cleared it
+(`docs/PHASE2-AUDIT.md`; D1 fixed first). Plan, in the spec's order:
+
+1. Before any hostile code runs, the open assumptions the Phase 2 audit
+   lists. First done: the test-result channel (below).
+2. P3-T1, the trace: P4-T1's minimal Wine build in Alpine (Dockerfile
+   under `wine/build/`, run by a `wine-image.yml` workflow for the owner
+   to review), then `strace -f` of `wine cmd /c echo hello` on real Linux,
+   which also answers the risk-table question of whether Wine builds and
+   runs on musl at all before Phase 3 work depends on it.
+3. The kernel tasks in order of first appearance in the trace, with the
+   compartment tasks (P3-S1 to P3-S4) built before any Wine binary runs.
+
+| ID | Task | Status |
+| --- | --- | --- |
+| P3-pre | Test results on a channel programs cannot write (Phase 2 audit, item 3) | Done. The kernel writes `TEST`, summary, marker and layout lines to COM2 (0x2F8; `kresult!`), and also to the console. `cargo xtask test` attaches a second `-serial` to a file and reads every verdict only from it; COM1 can only fail a run (a panic banner). Test program `forger` prints a fake PASS line, summary and `KEEL P1 OK`; xtask checks they reach COM1 and not COM2 (`results.channel_isolated`). Reading verdicts from COM1 again makes phase 1 fail (100 PASS lines against a summary of 99). Unit test for the verdict rule. |
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 

@@ -14,7 +14,7 @@ use keel_hal::arch::x86_64::gdt::{self, IstSlot};
 use keel_hal::arch::x86_64::{cpu, idt, paging, selftest as hw};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, interrupts, kprintln, memory, sched, time};
+use keel_hal::{console, interrupts, kprintln, kresult, memory, sched, time};
 
 /// Lowest address of the canonical higher half with 4-level paging
 /// (Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing").
@@ -135,7 +135,7 @@ pub fn judge_expected_fault() {
         _ => return,
     };
     if passed {
-        console::emergency_print(format_args!(
+        console::emergency_result(format_args!(
             "TEST {name} PASS {detail}\nTEST SUMMARY passed=1 failed=0\n"
         ));
         exit_qemu(ExitCode::Success);
@@ -160,7 +160,7 @@ pub fn judge_nested_panic() {
         return;
     }
     if idt::last_fatal_exception().is_some_and(|f| f.vector == 14) {
-        console::emergency_serial(
+        console::emergency_result_serial(
             "TEST panic.nested_fault_halts PASS a fault inside the panic handler ends in one short message and a halt\nTEST SUMMARY passed=1 failed=0\n",
         );
         exit_qemu(ExitCode::Success);
@@ -176,10 +176,10 @@ impl Runner {
     fn check(&mut self, name: &str, ok: bool, detail: &str) {
         if ok {
             self.passed += 1;
-            kprintln!("TEST {name} PASS {detail}");
+            kresult!("TEST {name} PASS {detail}");
         } else {
             self.failed += 1;
-            kprintln!("TEST {name} FAIL {detail}");
+            kresult!("TEST {name} FAIL {detail}");
         }
     }
 }
@@ -252,7 +252,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
             "unknown phase or scenario requested",
         ),
     }
-    kprintln!(
+    kresult!(
         "TEST SUMMARY passed={} failed={}",
         runner.passed,
         runner.failed
@@ -336,7 +336,7 @@ fn phase0(t: &mut Runner) {
     // Phase 0 acceptance marker, on serial and on the framebuffer. The
     // framebuffer copy is then proven by reading its pixels back.
     const MARKER: &str = "KEEL P0 OK";
-    kprintln!("{MARKER}");
+    kresult!("{MARKER}");
     let shown = console::framebuffer_cursor()
         .and_then(|(_, row)| row.checked_sub(1))
         .is_some_and(|row| console::framebuffer_shows(0, row, MARKER));
@@ -396,7 +396,7 @@ fn phase1(t: &mut Runner) {
     // passed (the four acceptance items are among them). `cargo xtask
     // test` also checks the acceptance programs' own serial lines.
     if t.failed == 0 {
-        kprintln!("KEEL P1 OK");
+        kresult!("KEEL P1 OK");
     }
 }
 
@@ -1322,7 +1322,7 @@ pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
         report.hung.is_none() && report.runs > 0 && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
         "random system calls from user programs: no kernel panic, no hung run, and the kernel stays responsive, for the whole session",
     );
-    kprintln!(
+    kresult!(
         "TEST SUMMARY passed={} failed={}",
         runner.passed,
         runner.failed
@@ -1735,6 +1735,15 @@ pub fn phase1_audit_small_items(t: &mut Runner) {
         }
     }
 
+    // Phase 2 audit, item 3: a program prints forged result lines. They
+    // land on COM1 only; xtask checks they are absent from COM2.
+    let forged = run_test_program(b"/test/forger", &[b"/test/forger"]);
+    t.check(
+        "results.forger_ran",
+        forged == Some((0, None)),
+        "a program that prints forged test results ran (xtask checks they are not on the result channel)",
+    );
+
     // A7.5: no global translations: CR4.PGE is clear.
     t.check(
         "paging.no_global_pages",
@@ -1780,7 +1789,7 @@ fn phase2(t: &mut Runner) {
 
     // Phase 2 acceptance marker, only when every test above passed.
     if t.failed == 0 {
-        kprintln!("KEEL P2 OK");
+        kresult!("KEEL P2 OK");
     }
 }
 
