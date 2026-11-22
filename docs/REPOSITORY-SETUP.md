@@ -9,7 +9,7 @@ Repository: `edboi18-ctrl/KEELOS`
 
 ## 1. Visibility and license
 
-- [ ] **Settings → General → Danger Zone → Change visibility: Public.**
+- [x] **Settings → General → Danger Zone → Change visibility: Public.**
       Hosted runners are free and artifact attestations are available for
       public repositories (decision D13).
 - [x] License files are on `main`: `LICENSE-MIT`, `LICENSE-APACHE`.
@@ -19,15 +19,15 @@ Repository: `edboi18-ctrl/KEELOS`
 **Settings → Rules → Rulesets → New branch ruleset**, target the default
 branch (`main`), enforcement **Active**:
 
-- [ ] Restrict deletions.
-- [ ] Block force pushes.
-- [ ] Require a pull request before merging.
+- [x] Restrict deletions.
+- [x] Block force pushes.
+- [x] Require a pull request before merging.
       Also tick **Require review from Code Owners** so that changes under
       `.github/` need your approval (`.github/CODEOWNERS`).
-- [ ] Require status checks to pass, and add both CI jobs:
+- [x] Require status checks to pass, and add both CI jobs:
       `Audit and host tests` and `Build and boot tests (QEMU with KVM)`.
       They appear in the picker after CI has run once.
-- [ ] Leave this branch ruleset's bypass list empty: a bypass turns the
+- [x] Leave this branch ruleset's bypass list empty: a bypass turns the
       rule into a suggestion. (The tag ruleset in section 4 is different:
       there the bypass is how you, and only you, create release tags.)
 
@@ -35,26 +35,26 @@ branch (`main`), enforcement **Active**:
 
 **Settings → Actions → General**:
 
-- [ ] Actions permissions: **Allow edboi18-ctrl, and select non-edboi18-ctrl,
+- [x] Actions permissions: **Allow edboi18-ctrl, and select non-edboi18-ctrl,
       actions and reusable workflows**, with **Allow actions created by
       GitHub** ticked and nothing else. All four actions in use are
       GitHub's own (`docs/DEPENDENCIES.md`).
-- [ ] Tick **Require actions to be pinned to a full-length commit SHA**.
-- [ ] Workflow permissions: **Read repository contents and packages
+- [x] Tick **Require actions to be pinned to a full-length commit SHA**.
+- [x] Workflow permissions: **Read repository contents and packages
       permissions** (read-only default token).
-- [ ] Leave **Allow GitHub Actions to create and approve pull requests**
+- [x] Leave **Allow GitHub Actions to create and approve pull requests**
       unticked.
-- [ ] Approval for running fork pull request workflows: **Require approval
+- [x] Approval for running fork pull request workflows: **Require approval
       for all external contributors**.
-- [ ] Runners: do not add self-hosted runners to this repository.
+- [x] Runners: do not add self-hosted runners to this repository.
 
 ## 4. Tags and releases (SR-35)
 
 **Settings → Rules → Rulesets → New tag ruleset**, target `v*`:
 
-- [ ] Tick **Restrict creations**, **Restrict updates** and **Restrict
+- [x] Tick **Restrict creations**, **Restrict updates** and **Restrict
       deletions**.
-- [ ] Under **Bypass list**, click **Add bypass** and choose **Repository
+- [x] Under **Bypass list**, click **Add bypass** and choose **Repository
       admin** (mode "Always allow"). Without this the rule blocks you too,
       and `git push origin v0.1.0` fails with "GH013 ... Cannot create ref
       due to creations being restricted". With it, only you can create a
@@ -71,7 +71,7 @@ The `release` workflow refuses a tag whose commit is not on `main`.
 
 ## 5. Secrets (SR-34)
 
-- [ ] **Settings → Secrets and variables → Actions**: keep this empty.
+- [x] **Settings → Secrets and variables → Actions**: keep this empty.
       The build needs no secrets, and `cargo xtask audit` rejects any
       workflow that references one.
 
