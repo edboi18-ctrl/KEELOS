@@ -140,7 +140,7 @@ Hardening notes for later Phase 1 work:
   `sr27.tamper.initramfs` and `sr27.tamper.config` (Limine refuses a
   one-byte change to each; the config's hash is enrolled in
   `BOOTX64.EFI`).
-- `cargo xtask test --phase 1`: 91 in-kernel tests pass and `KEEL P1 OK`
+- `cargo xtask test --phase 1`: 92 in-kernel tests pass and `KEEL P1 OK`
   is on serial; the six fault scenarios (`double_fault`,
   `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`,
   `fault_in_panic`) pass; the

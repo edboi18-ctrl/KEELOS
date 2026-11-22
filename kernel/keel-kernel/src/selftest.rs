@@ -1567,6 +1567,36 @@ pub fn phase1_resource_limits(t: &mut Runner) {
         reserve == Some((0, None)) && refused > 0,
         "with only the kernel's reserve free, system calls are refused with ENOMEM instead of taking it (F-0011)",
     );
+
+    // A3: console writes on a UART as slow as a real one (115200 baud,
+    // 8N1: 11,520 bytes a second) must not keep interrupts off. A kernel
+    // thread counting 5 ms sleeps keeps running while a program writes
+    // 32 KiB to the console (about 2.8 s of transmission).
+    use keel_hal::drivers::serial::TEST_BYTE_DELAY_NS;
+    STOP.store(false, Ordering::Relaxed);
+    let ticker = sched::spawn("ticker", || {
+        while !STOP.load(Ordering::Relaxed) {
+            sched::sleep_ms(5);
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let ticks_before = TICKS.load(Ordering::Relaxed);
+    let begin = time::monotonic_nanos();
+    TEST_BYTE_DELAY_NS.store(1_000_000_000 / 11_520, Ordering::Relaxed);
+    let flood = run_test_program(b"/test/conflood", &[b"/test/conflood"]);
+    TEST_BYTE_DELAY_NS.store(0, Ordering::Relaxed);
+    let elapsed_ms = (time::monotonic_nanos() - begin) / 1_000_000;
+    let ticks = TICKS.load(Ordering::Relaxed) - ticks_before;
+    STOP.store(true, Ordering::Relaxed);
+    if let Ok(id) = ticker {
+        join(id);
+    }
+    t.check(
+        "console.slow_uart_preemptible",
+        flood == Some((0, None)) && elapsed_ms >= 2_000 && ticks >= elapsed_ms / 50,
+        "a program flooding a real-speed UART does not keep interrupts off: a kernel thread keeps running (A3)",
+    );
+    kprintln!("  conflood: {elapsed_ms} ms, ticker ran {ticks} times, exit {flood:?}");
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200

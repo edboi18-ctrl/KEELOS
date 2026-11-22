@@ -17,7 +17,7 @@ This file is a work list in the same form as `docs/PHASE1-AUDIT.md`.
 | --- | --- |
 | A1 | Fixed (F-0011, ADR 0011): 65530-mapping cap with merging, 65536-node tmpfs cap, fallible file growth, user page tables from the user pool (a third path found while fixing), and an admission check that refuses calls with ENOMEM once only the kernel's reserve is free. Regression tests `limits.map_count` (the proof of concept below, now ENOMEM after 65526 mappings), `limits.tmpfs_nodes` and `limits.reserve_admission`, each failing with its protection removed. |
 | A2 | Fixed (same change): `mmap(NULL)` searches below its last placement first. `limits.map_null_preemptible` maps to the cap with a kernel thread on schedule; without the search cache it does not finish in 15 s. |
-| A3 | Open |
+| A3 | Fixed. A device write no longer holds the file's lock, and user console text goes out in pieces of at most 64 bytes (ending after a newline, on UTF-8 character boundaries) with the console locks released between them, which also bounds framebuffer scrolling with interrupts off. Test `console.slow_uart_preemptible` slows the emulated UART to 115200 baud (a test knob in the serial driver) while a program writes 32 KiB: the ticker ran 524 times in 4.6 s; with unlimited pieces, 14 times. |
 | A4 | Open |
 | A5 | Open |
 | A6 | Open |

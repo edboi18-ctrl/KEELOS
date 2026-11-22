@@ -374,6 +374,18 @@ fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
                 Ok(done as u64)
             };
         }
+        // A device has no file position, so its write runs without the
+        // file's lock (an IrqMutex): a console write can take a long time on
+        // a real UART and must not keep interrupts off (audit 2, A3).
+        let kind = file.lock().kind;
+        if let Kind::Device(device) = kind {
+            let written = fs::device_write(device, &chunk[..want]);
+            done += written;
+            if written < want {
+                break;
+            }
+            continue;
+        }
         let written = {
             let mut f = file.lock();
             match f.kind {

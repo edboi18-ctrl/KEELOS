@@ -30,6 +30,11 @@ name = "reservecall"
 test = false
 bench = false
 
+[[bin]]
+name = "conflood"
+test = false
+bench = false
+
 [dependencies]
 keel-rt = { path = "../keel-rt" }
 

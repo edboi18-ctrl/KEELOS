@@ -101,7 +101,31 @@ impl fmt::Display for UserText<'_> {
 /// Writes bytes a user program sent to `/dev/console`, as [`UserText`],
 /// so a terminal reading the serial line sees only text.
 pub fn write_user_bytes(bytes: &[u8]) {
-    _print(format_args!("{}", UserText(bytes)));
+    // The console locks disable interrupts, and a UART at 115200 baud
+    // takes about 0.36 s for 4 KiB, while each newline can scroll the whole
+    // framebuffer. So user text goes out in pieces of at most `PIECE` bytes,
+    // ending after a newline, with the locks released (and interrupts
+    // allowed) between pieces (audit 2, A3). Pieces end on UTF-8 character
+    // boundaries, so the split never turns a valid character into U+FFFD.
+    const PIECE: usize = 64;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(PIECE);
+        if let Some(newline) = rest[..end].iter().position(|&b| b == b'\n') {
+            end = newline + 1;
+        } else if end < rest.len() {
+            // Back off over continuation bytes (10xxxxxx), at most three.
+            let mut cut = end;
+            while cut > end.saturating_sub(3) && rest[cut] & 0xC0 == 0x80 {
+                cut -= 1;
+            }
+            if rest[cut] & 0xC0 != 0x80 {
+                end = cut;
+            }
+        }
+        _print(format_args!("{}", UserText(&rest[..end])));
+        rest = &rest[end..];
+    }
 }
 
 /// Prints from the panic handler without waiting on any lock.
