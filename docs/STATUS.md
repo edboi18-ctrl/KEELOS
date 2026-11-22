@@ -65,7 +65,14 @@ plus the serial check in `cargo xtask test`, using `fixtures/musl-hello`
 (reference build by the owner with Docker Desktop, SHA-256 aa498cc9...,
 checked by xtask before use; also run natively under Linux as
 `host.musl-hello`). The fixture lives in `fixtures/`, not `initramfs/`, so
-it is not shipped in release images. Items 2-4 remain.
+it is not shipped in release images. Item 3 (a null dereference
+kills only that program, with a logged fault) is `acceptance.null_dereference`
+plus the serial check for the fault line. Item 4 (64 GB
+`mmap(PROT_NONE, MAP_NORESERVE)` with no measurable memory use) is
+`acceptance.reserve_64gib`, run by `user/tests/reserve`, which also passes
+under Linux: 64 GiB mapped, 16 KiB resident, 12 frames used during the run.
+Item 2 (a Rust x86_64-unknown-linux-musl program, 64 MB heap checksum,
+identical output on Linux and Keel) remains.
 
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel

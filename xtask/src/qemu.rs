@@ -26,6 +26,9 @@ pub struct Phase {
     /// Lines the main boot's serial log must contain (output of user
     /// programs, which the kernel cannot see itself).
     pub expect_lines: &'static [&'static str],
+    /// Text some line of the main boot's serial log must start with (the
+    /// kernel's own fault log lines end with variable text).
+    pub expect_prefixes: &'static [&'static str],
 }
 
 /// Every phase with tests. `cargo xtask test` runs them all, so work on an
@@ -36,6 +39,7 @@ pub const PHASES: &[Phase] = &[
         complete: true,
         scenarios: &[],
         expect_lines: &[],
+        expect_prefixes: &[],
     },
     Phase {
         number: 1,
@@ -50,6 +54,7 @@ pub const PHASES: &[Phase] = &[
         // Phase 1 acceptance item 1: the musl fixture's output reaches
         // serial (it runs as PID 1; the kernel checks PID and status).
         expect_lines: &["Hello from musl on Keel"],
+        expect_prefixes: &["user fault: #PF page fault at 0x400000 (error 0x4, address 0x0)"],
     },
 ];
 
@@ -498,7 +503,15 @@ fn test_boot(
                 .find(|want| !capture.lines.iter().any(|l| l.trim_end() == **want))
             {
                 Some(missing) => Err(format!("expected line \"{missing}\" not on serial")),
-                None => Ok(()),
+                None => match phase
+                    .expect_prefixes
+                    .iter()
+                    .filter(|_| scenario.is_none())
+                    .find(|want| !capture.lines.iter().any(|l| l.starts_with(**want)))
+                {
+                    Some(missing) => Err(format!("no serial line starts with \"{missing}\"")),
+                    None => Ok(()),
+                },
             })
         };
     match result {

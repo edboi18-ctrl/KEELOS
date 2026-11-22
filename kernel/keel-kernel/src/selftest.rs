@@ -1031,6 +1031,53 @@ pub fn phase1_musl(t: &mut Runner) {
     {
         kprintln!("  musl-hello: pid {pid}, exit {status:?}");
     }
+
+    // Acceptance item 3: a null-pointer read in a user program ends that
+    // program with a logged #PF at address 0 (cargo xtask test checks the
+    // log line), and the kernel carries on.
+    let null = run_user_program_with(keel_hal::arch::x86_64::userprog::Program::ReadAddress, 0);
+    t.check(
+        "acceptance.null_dereference",
+        null.is_some_and(|(status, fault, _)| {
+            status == 128 + 11 && fault.is_some_and(|f| f.vector == 14 && f.address == 0)
+        }),
+        "a user null dereference is a logged #PF at 0 that ends only that program (SIGSEGV status)",
+    );
+
+    // Acceptance item 4: a program reserves 64 GiB with
+    // mmap(PROT_NONE, MAP_NORESERVE); the reservation exists and costs no
+    // physical memory. The address space outlives the program because the
+    // loader's handle to it is kept here.
+    const RESERVE: &[u8] = b"/test/reserve";
+    let frames_before = memory::free_frames();
+    let reserve = keel_linux_abi::fs::read_file(RESERVE)
+        .ok()
+        .and_then(|file| {
+            let loaded = keel_linux_abi::exec::load(&file, RESERVE, &[RESERVE], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("reserve", &loaded).ok()?;
+            join(spawned.thread);
+            Some((sched::exit_status(spawned.thread)?, loaded.space))
+        });
+    let reserved = reserve.as_ref().is_some_and(|((status, fault), space)| {
+        *status == 0
+            && fault.is_none()
+            && space.mapped_bytes() >= 64 << 30
+            && space.resident_bytes() < 1 << 20
+    });
+    let used = frames_before.saturating_sub(memory::free_frames());
+    t.check(
+        "acceptance.reserve_64gib",
+        reserved && used < 256,
+        "mmap(PROT_NONE, MAP_NORESERVE) of 64 GiB succeeds and uses under 1 MiB of frames",
+    );
+    if let Some((_, space)) = &reserve {
+        kprintln!(
+            "  reserve: {} GiB mapped, {} KiB resident, {} frames used meanwhile",
+            space.mapped_bytes() >> 30,
+            space.resident_bytes() >> 10,
+            used
+        );
+    }
 }
 
 /// P1-T11: the initramfs, the ELF loader and the initial process state,

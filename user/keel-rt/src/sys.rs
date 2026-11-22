@@ -41,6 +41,7 @@ pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;
 pub const MAP_PRIVATE: u64 = 0x02;
 pub const MAP_ANONYMOUS: u64 = 0x20;
+pub const MAP_NORESERVE: u64 = 0x4000;
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 
@@ -240,9 +241,26 @@ pub struct Region {
 impl Region {
     /// mmap(NULL, length, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0).
     pub fn map(length: u64, prot: u64) -> Result<Region, i64> {
+        Self::map_with(length, prot, 0)
+    }
+
+    /// As [`Region::map`], with extra flags such as MAP_NORESERVE. MAP_FIXED
+    /// and MAP_FIXED_NOREPLACE are refused (-EINVAL): they could replace
+    /// this program's own memory.
+    pub fn map_with(length: u64, prot: u64, extra_flags: u64) -> Result<Region, i64> {
+        if extra_flags & (0x10 | 0x10_0000) != 0 {
+            return Err(-22);
+        }
         let result = call6(
             nr::MMAP,
-            [0, length, prot, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+            [
+                0,
+                length,
+                prot,
+                MAP_PRIVATE | MAP_ANONYMOUS | extra_flags,
+                u64::MAX,
+                0,
+            ],
         );
         if result < 0 {
             Err(result)

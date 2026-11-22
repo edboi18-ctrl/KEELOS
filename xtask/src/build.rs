@@ -111,6 +111,13 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
     },
     TestProgram {
+        path: "test/reserve",
+        binary: "reserve",
+        args: &[],
+        env: &[],
+        stdin: b"",
+    },
+    TestProgram {
         path: "test/readline",
         binary: "readline",
         args: &[],

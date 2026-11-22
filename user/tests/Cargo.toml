@@ -25,3 +25,8 @@ workspace = true
 name = "readline"
 test = false
 bench = false
+
+[[bin]]
+name = "reserve"
+test = false
+bench = false

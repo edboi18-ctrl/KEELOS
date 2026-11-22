@@ -334,6 +334,16 @@ impl AddressSpace {
         Ok(child)
     }
 
+    /// Bytes of user address space covered by mappings (reserved or not).
+    pub fn mapped_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .layout
+            .vmas()
+            .map(|v| v.end - v.start)
+            .sum()
+    }
+
     /// Bytes of user memory currently backed by frames.
     pub fn resident_bytes(&self) -> u64 {
         let inner = self.inner.lock();
