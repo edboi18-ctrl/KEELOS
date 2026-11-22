@@ -146,6 +146,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-peldr"
+version = "0.0.0"
+dependencies = [
+ "keel-rt",
+ "pe",
+]
+
+[[package]]
 name = "keel-rt"
 version = "0.0.0"
 
@@ -177,6 +185,13 @@ name = "pe"
 version = "0.0.0"
 
 [[package]]
+name = "pe-fuzz"
+version = "0.0.0"
+dependencies = [
+ "pe",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,6 +221,6 @@ dependencies = [
  "blake2",
  "fatfs",
  "keel-core",
- "pe",
+ "pe-fuzz",
  "sha2",
 ]

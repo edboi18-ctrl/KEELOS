@@ -12,7 +12,3 @@ bench = false
 [lints]
 workspace = true
 
-[features]
-# The mutation engine shared by the unit test and `cargo xtask fuzz-pe`
-# (P2-S1). Needs std; off for peldr.
-fuzz = []

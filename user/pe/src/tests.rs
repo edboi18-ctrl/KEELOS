@@ -9,8 +9,8 @@ fn the_fixture_parses_as_its_build_says() {
     let image = parse(HELLO).unwrap();
     assert_eq!(image.image_base, 0x1_4000_0000);
     assert_eq!(image.entry_rva, 0x1000);
-    assert_eq!(image.size_of_image, 0x4000);
-    assert_eq!(image.section_count(), 3);
+    assert_eq!(image.size_of_image, 0x5000);
+    assert_eq!(image.section_count(), 4);
     let text = image.section(0).unwrap();
     assert_eq!(&text.name[..5], b".text");
     assert!(text.execute && text.read && !text.write);
@@ -30,7 +30,16 @@ fn the_fixture_parses_as_its_build_says() {
         names,
         [b"ExitProcess".as_slice(), b"GetStdHandle", b"WriteFile"]
     );
-    assert_eq!(image.relocations().count(), 0);
+    // The table of two pointers in .rdata needs two DIR64 relocations.
+    let rdata = image.section(1).unwrap();
+    assert_eq!(&rdata.name[..6], b".rdata");
+    let relocs: Vec<u32> = image.relocations().map(Result::unwrap).collect();
+    assert_eq!(relocs.len(), 2);
+    assert!(
+        relocs
+            .iter()
+            .all(|&r| (rdata.rva..rdata.rva + rdata.memory_size).contains(&r))
+    );
 }
 
 /// (name, rva, virtual size, data, characteristics)
@@ -327,17 +336,6 @@ fn relocation_errors() {
         }),
         Some(PeError::BadRelocation)
     );
-}
-
-/// Random bytes and random mutations of valid files give an image or an
-/// error, never a panic; walking imports and relocations of any accepted
-/// image ends (the iterators are capped). The longer run is
-/// `cargo xtask fuzz-pe` (P2-S1).
-#[test]
-fn random_inputs_never_panic() {
-    let templates = [HELLO.to_vec(), with_imports_and_relocs().build()];
-    let accepted = crate::fuzz::run(0x5EED_0F5E, 20_000, &templates);
-    assert!(accepted > 0, "mutations should still reach valid images");
 }
 
 /// The first error parsing `data` or walking its imports and relocations

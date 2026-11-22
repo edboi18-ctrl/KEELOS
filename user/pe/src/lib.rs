@@ -29,7 +29,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-#[cfg(any(test, feature = "fuzz"))]
+#[cfg(test)]
 extern crate std;
 
 /// IMAGE_FILE_MACHINE_AMD64.
@@ -600,9 +600,6 @@ impl Iterator for Relocations<'_> {
         }
     }
 }
-
-#[cfg(any(test, feature = "fuzz"))]
-pub mod fuzz;
 
 #[cfg(test)]
 mod tests;

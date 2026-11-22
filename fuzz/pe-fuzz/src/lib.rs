@@ -1,11 +1,9 @@
-//! A mutation fuzzer for the parser (P2-S1), shared by the unit test and
-//! `cargo xtask fuzz-pe`. Deterministic from its seed, so a failure can be
+//! A mutation fuzzer for the `pe` parser (P2-S1), shared by this crate's
+//! test and `cargo xtask fuzz-pe`. Deterministic from its seed, so a failure can be
 //! replayed. Inputs are random bytes or valid files with some bytes
 //! changed: flipped bits, boundary values written over header fields, and
 //! truncation. Each accepted image is walked completely (sections, headers,
 //! imports, relocations), so every reader runs on the result.
-
-use std::vec::Vec;
 
 /// SplitMix64 (Sebastiano Vigna, public domain), as in keel-rt's fuzzer.
 pub struct Rng(pub u64);
@@ -85,7 +83,7 @@ pub fn input(rng: &mut Rng, templates: &[Vec<u8>]) -> Vec<u8> {
 /// Parses `data` and walks everything an accepted image offers. Returns
 /// whether it was accepted. Must never panic.
 pub fn exercise(data: &[u8]) -> bool {
-    let Ok(image) = crate::parse(data) else {
+    let Ok(image) = pe::parse(data) else {
         return false;
     };
     let _ = image.headers();
@@ -119,4 +117,24 @@ pub fn run(seed: u64, iterations: u64, templates: &[Vec<u8>]) -> u64 {
         }
     }
     accepted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// Random bytes and random mutations of valid and malformed files give
+    /// an image or an error, never a panic, and walking any accepted image
+    /// ends. The long run is `cargo xtask fuzz-pe`.
+    #[test]
+    fn random_inputs_never_panic() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut templates =
+            vec![std::fs::read(root.join("winetest/hello-console/hello.exe")).unwrap()];
+        for entry in std::fs::read_dir(root.join("fuzz/pe-corpus")).unwrap() {
+            templates.push(std::fs::read(entry.unwrap().path()).unwrap());
+        }
+        let accepted = super::run(0x5EED_0F5E, 20_000, &templates);
+        assert!(accepted > 0, "mutations should still reach valid images");
+    }
 }

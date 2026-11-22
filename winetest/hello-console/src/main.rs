@@ -15,7 +15,13 @@ use core::ptr;
 /// STD_OUTPUT_HANDLE, (DWORD)-11 (Microsoft: GetStdHandle).
 const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
 
-const MESSAGE: &[u8] = b"Hello from a Windows executable on Keel\r\n";
+/// The line, in two parts reached through a table of pointers. Pointers
+/// stored in data are absolute addresses, so the linker emits
+/// IMAGE_REL_BASED_DIR64 base relocations for them: loaded anywhere but
+/// its preferred base, the program prints the right line only if its
+/// loader applied them (`peldr --relocate` tests that).
+static PARTS: [&[u8]; 2] = [b"Hello from a Windows executable", b" on Keel\r\n"];
+const MESSAGE_LEN: usize = 41;
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 unsafe extern "system" {
@@ -34,26 +40,29 @@ unsafe extern "system" {
 /// `main`. Exit status 0 when the whole line was written, 1 otherwise.
 #[unsafe(no_mangle)]
 pub extern "system" fn mainCRTStartup() -> ! {
-    let mut written: u32 = 0;
-    // SAFETY: kernel32 functions with their documented signatures. The
+    let mut total = 0usize;
+    // SAFETY: kernel32 functions with their documented signatures. Each
     // buffer is a static byte string of the length passed; `written` is a
-    // valid u32 for the call; no OVERLAPPED is used (null), as for a
+    // valid u32 for each call; no OVERLAPPED is used (null), as for a
     // synchronous console or pipe handle.
     unsafe {
         let out = GetStdHandle(STD_OUTPUT_HANDLE);
-        let ok = WriteFile(
-            out,
-            MESSAGE.as_ptr(),
-            MESSAGE.len() as u32,
-            &mut written,
-            ptr::null_mut(),
-        );
-        let status = if ok != 0 && written as usize == MESSAGE.len() {
-            0
-        } else {
-            1
-        };
-        ExitProcess(status)
+        // black_box: keep the table in memory, so its pointers are read
+        // (and must have been relocated) at run time.
+        for part in core::hint::black_box(&PARTS) {
+            let mut written: u32 = 0;
+            let ok = WriteFile(
+                out,
+                part.as_ptr(),
+                part.len() as u32,
+                &mut written,
+                ptr::null_mut(),
+            );
+            if ok != 0 {
+                total += written as usize;
+            }
+        }
+        ExitProcess(if total == MESSAGE_LEN { 0 } else { 1 })
     }
 }
 

@@ -1,7 +1,9 @@
 # hello-console (Phase 2 test executable)
 
 A Windows x64 console program with no C runtime (`src/main.rs`). It
-imports only `GetStdHandle`, `WriteFile` and `ExitProcess` from
+writes its line in two parts reached through a static table of pointers,
+so it carries DIR64 base relocations and prints correctly away from its
+preferred base only if they were applied. It imports only `GetStdHandle`, `WriteFile` and `ExitProcess` from
 kernel32.dll, prints
 
     Hello from a Windows executable on Keel
@@ -34,14 +36,15 @@ Rust Reference, "External blocks"), so no Windows SDK is needed;
 
 ## Reference build
 
-`hello.exe` (2560 bytes) is the reference build, SHA-256 in
-`hello.sha256`. Built in the Linux CI-like container with Rust 1.100.0;
+`hello.exe` (3072 bytes) is the reference build, SHA-256 in
+`hello.sha256` (`f603ceac...65e4`). Built in the Linux CI-like container with Rust 1.100.0;
 a clean rebuild gave the same hash. `cargo xtask` checks the hash before
 putting the file in a test image.
 
 Layout (from `llvm-objdump -p`): PE32+, image base 0x140000000, entry
-RVA 0x1000, sections `.text`, `.rdata`, `.pdata`, an empty base
-relocation directory (all code is RIP-relative), subsystem Windows CUI.
+RVA 0x1000, SizeOfImage 0x5000, sections `.text`, `.rdata`, `.pdata`,
+`.reloc` (one block, two DIR64 entries for the pointer table), subsystem
+Windows CUI.
 
 ## Running on Windows
 

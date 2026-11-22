@@ -1,6 +1,6 @@
 //! `cargo xtask fuzz-pe --minutes N --seed S`: host fuzzing of the PE
 //! parser (Phase 2 security note, P2-S1; acceptance is 30 minutes with no
-//! crash). Uses the parser's own mutation engine (`pe::fuzz`) on the
+//! crash). Uses the parser's own mutation engine (`pe_fuzz`) on the
 //! fixture `hello.exe` and every file of the malformed corpus
 //! (`fuzz/pe-corpus/`), and walks every accepted image completely. Runs in
 //! xtask's dev profile, so integer overflow is a panic too.
@@ -50,16 +50,16 @@ pub fn fuzz_pe(minutes: u64, seed: u64) -> Result<()> {
         templates.len()
     );
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
-    let mut rng = pe::fuzz::Rng(seed);
+    let mut rng = pe_fuzz::Rng(seed);
     let (mut total, mut accepted) = (0u64, 0u64);
     let mut next_report = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         for _ in 0..BATCH {
-            let input = pe::fuzz::input(&mut rng, &templates);
+            let input = pe_fuzz::input(&mut rng, &templates);
             if let Ok(mut current) = CURRENT.lock() {
                 current.clone_from(&input);
             }
-            if pe::fuzz::exercise(&input) {
+            if pe_fuzz::exercise(&input) {
                 accepted += 1;
             }
             total += 1;

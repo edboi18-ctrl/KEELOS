@@ -261,6 +261,8 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
                 "--locked",
                 "--package",
                 "keel-user-tests",
+                "--package",
+                "keel-peldr",
             ])
             .args(["--target", KERNEL_TARGET])
             .arg("--target-dir")

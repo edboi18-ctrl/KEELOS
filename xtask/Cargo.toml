@@ -9,7 +9,7 @@ publish.workspace = true
 sha2 = "0.11.1"
 blake2 = "0.11.0"
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
-pe = { path = "../user/pe", features = ["fuzz"] }
+pe-fuzz = { path = "../fuzz/pe-fuzz" }
 
 [dev-dependencies]
 keel-core = { path = "../kernel/core" }
