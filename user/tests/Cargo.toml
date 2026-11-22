@@ -30,3 +30,8 @@ bench = false
 name = "reserve"
 test = false
 bench = false
+
+[[bin]]
+name = "rights"
+test = false
+bench = false

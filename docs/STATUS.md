@@ -91,7 +91,17 @@ and on Linux. Item 1 (page-table self-test) is
 covered for kernel tables by `paging.wx_walk` and for user views by
 `pti.user_view`. Item 3 is covered by the `write_kernel_text` and
 `execute_data` scenarios for the kernel and by `user.code_read_only` and
-`user.stack_no_execute` for user programs.
+`user.stack_no_execute` for user programs. Item 4 (a write through a
+read-only handle fails, and the test asserts it was the rights check) is
+`security.rights_refuse_write`: `user/tests/rights` (also passes under
+Linux) makes one write through a read-only handle and one read through a
+write-only one, and the kernel's count of rights refusals
+(`keel_core::handle::Refusal::MissingRights`, counted in
+`linux-abi::syscall::file`, the one place descriptors are resolved) must
+rise by exactly 2, while its write to a closed descriptor does not count;
+checked to fail with the rights check disabled. Item 5 (boot log lists each
+vulnerability and mitigation) is `vuln.report_complete` and
+`vuln.plan_applied`. Item 6 (one hour of random-syscall fuzzing) remains.
 
 Hardening notes for later Phase 1 work:
 - User programs share the serial line with the kernel's `TEST` report lines,

@@ -332,6 +332,7 @@ fn phase1(t: &mut Runner) {
     phase1_user(t);
     phase1_fs(t);
     phase1_musl(t);
+    phase1_rights(t);
     phase1_exec(t);
     phase1_mitigations(t);
 }
@@ -1097,6 +1098,31 @@ pub fn phase1_musl(t: &mut Runner) {
             space.resident_bytes() >> 10,
             used
         );
+    }
+}
+
+/// Security acceptance P1 item 4: a write through a read-only handle (and
+/// a read through a write-only one) fails, and it is the rights check
+/// that refuses it: the kernel's count of rights refusals rises by exactly
+/// the two calls `user/tests/rights` makes on purpose, and its write to a
+/// closed descriptor does not count.
+pub fn phase1_rights(t: &mut Runner) {
+    const PATH: &[u8] = b"/test/rights";
+    let before = keel_linux_abi::syscall::rights_refusals();
+    let status = keel_linux_abi::fs::read_file(PATH).ok().and_then(|file| {
+        let loaded = keel_linux_abi::exec::load(&file, PATH, &[PATH], &[]).ok()?;
+        let spawned = keel_linux_abi::process::spawn("rights", &loaded).ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    });
+    let refused = keel_linux_abi::syscall::rights_refusals() - before;
+    t.check(
+        "security.rights_refuse_write",
+        status == Some((0, None)) && refused == 2,
+        "writing through a read-only handle fails, refused by the rights check (not a bad descriptor)",
+    );
+    if status != Some((0, None)) || refused != 2 {
+        kprintln!("  rights: exit {status:?}, {refused} rights refusals (expected 2)");
     }
 }
 

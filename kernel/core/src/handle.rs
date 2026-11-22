@@ -22,6 +22,15 @@ pub fn index_nospec(index: usize, size: usize) -> usize {
     index & mask as usize
 }
 
+/// Why [`HandleTable::check`] refused a lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// No open handle at that index.
+    NoHandle,
+    /// The handle exists but lacks some of the rights asked for.
+    MissingRights { has: Rights, needs: Rights },
+}
+
 /// A set of rights (SR-1's list).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rights(u32);
@@ -122,9 +131,20 @@ impl<T: Clone> HandleTable<T> {
     /// which is what Linux returns for, e.g., write(2) on a read-only
     /// descriptor.
     pub fn get(&self, fd: i32, required: Rights) -> Result<&T, Errno> {
+        self.check(fd, required).map_err(|_| Errno::EBADF)
+    }
+
+    /// As [`HandleTable::get`], saying why a lookup was refused, so the
+    /// kernel can tell a rights refusal from a bad descriptor (security
+    /// acceptance P1 item 4).
+    pub fn check(&self, fd: i32, required: Rights) -> Result<&T, Refusal> {
         match self.slot(fd) {
             Some(h) if h.rights.contains(required) => Ok(&h.object),
-            _ => Err(Errno::EBADF),
+            Some(h) => Err(Refusal::MissingRights {
+                has: h.rights,
+                needs: required,
+            }),
+            None => Err(Refusal::NoHandle),
         }
     }
 
@@ -198,6 +218,15 @@ mod tests {
         assert_eq!(t.get(fd, Rights::READ | Rights::STAT), Ok(&7));
         assert_eq!(t.get(fd, Rights::NONE), Ok(&7));
         assert_eq!(t.get(fd, Rights::WRITE), Err(Errno::EBADF));
+        assert_eq!(
+            t.check(fd, Rights::WRITE),
+            Err(Refusal::MissingRights {
+                has: Rights::READ | Rights::STAT,
+                needs: Rights::WRITE
+            })
+        );
+        assert_eq!(t.check(5, Rights::NONE), Err(Refusal::NoHandle));
+        assert_eq!(t.check(-1, Rights::READ), Err(Refusal::NoHandle));
         assert_eq!(t.get(fd, Rights::READ | Rights::WRITE), Err(Errno::EBADF));
         for bad in [-1, 1, 1000, i32::MIN, i32::MAX] {
             assert_eq!(t.get(bad, Rights::NONE), Err(Errno::EBADF));

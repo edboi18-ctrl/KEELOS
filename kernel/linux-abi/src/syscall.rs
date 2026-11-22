@@ -12,8 +12,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use keel_core::errno::Errno;
-use keel_core::handle::{Handle, Rights};
+
+use keel_core::handle::{Handle, Refusal, Rights};
 use keel_core::vfs::{Device, Kind, PATH_MAX};
 use keel_core::vm::{PAGE, Placement, Prot, USER_END, VmError};
 use keel_hal::sched::{self, SegmentBase};
@@ -160,14 +162,29 @@ fn vm_error(error: AsError) -> Errno {
     }
 }
 
-/// The open file behind `fd`, if the handle has `required`.
+/// System calls refused because a handle lacked a right (not because the
+/// descriptor was bad). Security acceptance P1 item 4 checks it moves.
+static RIGHTS_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// How many calls the rights check has refused since boot.
+pub fn rights_refusals() -> u64 {
+    RIGHTS_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// The open file behind `fd`, if the handle has `required`. Every system
+/// call that acts on a descriptor's object comes through here.
 fn file(
     p: &Arc<IrqMutex<Process>>,
     fd: i32,
     required: Rights,
 ) -> Result<Arc<IrqMutex<OpenFile>>, Errno> {
-    match p.lock().handles.get(fd, required)? {
-        Object::File(file) => Ok(file.clone()),
+    match p.lock().handles.check(fd, required) {
+        Ok(Object::File(file)) => Ok(file.clone()),
+        Err(Refusal::MissingRights { .. }) => {
+            RIGHTS_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            Err(Errno::EBADF)
+        }
+        Err(Refusal::NoHandle) => Err(Errno::EBADF),
     }
 }
 
