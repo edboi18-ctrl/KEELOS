@@ -1597,6 +1597,31 @@ pub fn phase1_resource_limits(t: &mut Runner) {
         "a program flooding a real-speed UART does not keep interrupts off: a kernel thread keeps running (A3)",
     );
     kprintln!("  conflood: {elapsed_ms} ms, ticker ran {ticks} times, exit {flood:?}");
+
+    // A4: the branch-predictor barrier between processes is keyed on an id
+    // that a new address space never shares with a freed one, even when it
+    // gets the freed one's table frame. In this boot sequence it does get
+    // that frame (logged below), so keying on the table address, as before,
+    // fails this test; the allocator does not promise the reuse, so the
+    // check does not require it.
+    use keel_hal::vm::AddressSpace;
+    let barrier = AddressSpace::new().ok().and_then(|a| {
+        sched::note_user_space(&a);
+        let same_again = sched::note_user_space(&a);
+        let (a_id, a_root) = (a.id(), a.user_root());
+        drop(a);
+        let b = AddressSpace::new().ok()?;
+        let changed = sched::note_user_space(&b);
+        Some((same_again, changed, b.id() != a_id, b.user_root() == a_root))
+    });
+    t.check(
+        "mitigations.ibpb_keyed_by_space_id",
+        matches!(barrier, Some((false, true, true, _))),
+        "a dropped and recreated address space gets a new id and a barrier; the same space again does not (A4)",
+    );
+    if let Some((_, _, _, reused)) = barrier {
+        kprintln!("  new address space reused the old table frame: {reused}");
+    }
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200

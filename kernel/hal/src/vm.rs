@@ -81,8 +81,13 @@ struct Inner {
 pub struct AddressSpace {
     root: Frame,
     user_root: Frame,
+    /// Never reused, unlike the table frames (audit 2, A4).
+    id: u64,
     inner: IrqMutex<Inner>,
 }
+
+/// Source of `AddressSpace::id`. 64 bits never wrap in practice.
+static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Why an address-space operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,11 +119,19 @@ impl AddressSpace {
         Ok(Arc::new(AddressSpace {
             root,
             user_root,
+            id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             inner: IrqMutex::new(Inner {
                 layout: Layout::new(),
                 parked: BTreeMap::new(),
             }),
         }))
+    }
+
+    /// An identifier no other address space, past or future, has. The
+    /// table addresses are not one: a freed table frame can be handed to
+    /// the next address space.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The user view's top-level table (CR3 while user code runs).
