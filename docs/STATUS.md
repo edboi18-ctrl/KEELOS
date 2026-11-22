@@ -59,6 +59,14 @@ to `main` with PR #1.
 | P1-S6 | Kernel stack guard pages; zero-on-allocate for user frames; zeroed copy-out buffers; overflow checks in release | Done. Every kernel stack, now including the boot thread's (boot leaves Limine's unguarded stack for a 128 KiB kernel stack right after paging is up), has an unmapped guard page; an overflow becomes a double fault on IST1 and a clean panic (`stack_overflow` scenario). Stack probes: the pinned target (`x86_64-unknown-none`, Rust 1.100.0) sets `stack_probes: StackProbeType::Inline`, and the kernel binary contains the probe sequence. RELRO: `.data.rel.ro` and `.got` have their own segment, mapped read-only after Limine relocates them. Frames are zeroed on allocation (SR-18), structures copied to user space are built in zeroed buffers, and `overflow-checks = true` in release. Tests: `paging.boot_stack_guard`, `paging.relro`, `frames.zeroed`. |
 | P1-S7 | No identity checks; no forbidden device nodes; unknown syscalls and flags fail closed | Done (verification). SR-6: a sweep of `kernel/` and `user/` finds no check on user or group IDs or set-ID bits anywhere; uid and gid are reported as 0 and never consulted, and the loader ignores mode bits. SR-9: device nodes come from a fixed list (`fs.no_forbidden_devices`); user port I/O and CLI fault (`user.no_port_io`, `user.no_cli`). SR-10: unknown system calls return ENOSYS (`user.unknown_syscall`, conformance check on number 500); unknown flags or codes are EINVAL for openat, mmap, mprotect, getrandom, clock_gettime, arch_prctl, and ENOTTY for ioctl requests, all in `user/tests/syscalls`. |
 
+Phase 1 acceptance progress: item 1 (a static musl C "hello world" runs
+as PID 1 and prints to serial) is covered by `acceptance.musl_hello_pid1`
+plus the serial check in `cargo xtask test`, using `fixtures/musl-hello`
+(reference build by the owner with Docker Desktop, SHA-256 aa498cc9...,
+checked by xtask before use; also run natively under Linux as
+`host.musl-hello`). The fixture lives in `fixtures/`, not `initramfs/`, so
+it is not shipped in release images. Items 2-4 remain.
+
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel
 and on Linux. Item 1 (page-table self-test) is

@@ -281,11 +281,7 @@ mod tests {
         // A file that does not match is refused.
         let dir = root.join("target").join("fixture-test");
         util::write(&dir.join("bin"), b"not the binary").unwrap();
-        util::write(
-            &dir.join("bin.sha256"),
-            TEST_FIXTURES[0].hash_file.as_bytes(),
-        )
-        .unwrap();
+        // ...under the real fixture's recorded hash.
         let recorded = util::read(&root.join(TEST_FIXTURES[0].hash_file)).unwrap();
         util::write(&dir.join("bin.sha256"), &recorded).unwrap();
         let tampered = TestFixture {
