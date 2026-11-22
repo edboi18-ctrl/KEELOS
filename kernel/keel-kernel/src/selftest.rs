@@ -407,10 +407,16 @@ pub fn phase1_frames(t: &mut Runner) {
     use alloc::vec::Vec;
     use keel_hal::memory::OwnedFrame;
     const COUNT: usize = 64;
+    // Every vector is allocated at full size before the baseline: a heap
+    // allocation in between could take a frame for the heap and throw the
+    // count off by one (it did, once the heap had no spare room).
+    let mut frames: Vec<OwnedFrame> = Vec::with_capacity(COUNT);
+    let mut addresses: Vec<u64> = Vec::with_capacity(COUNT);
+    let mut again: Vec<OwnedFrame> = Vec::with_capacity(COUNT);
     let baseline = memory::free_frames();
-    let mut frames: Vec<OwnedFrame> = (0..COUNT).filter_map(|_| OwnedFrame::allocate()).collect();
+    frames.extend((0..COUNT).filter_map(|_| OwnedFrame::allocate()));
     let all = frames.len() == COUNT;
-    let addresses: Vec<u64> = frames.iter().map(OwnedFrame::address).collect();
+    addresses.extend(frames.iter().map(OwnedFrame::address));
 
     let mut distinct = all;
     for (i, a) in addresses.iter().enumerate() {
@@ -435,8 +441,8 @@ pub fn phase1_frames(t: &mut Runner) {
     for frame in frames.iter_mut() {
         frame.bytes_mut().fill(0xA5);
     }
-    drop(frames);
-    let again: Vec<OwnedFrame> = (0..COUNT).filter_map(|_| OwnedFrame::allocate()).collect();
+    frames.clear();
+    again.extend((0..COUNT).filter_map(|_| OwnedFrame::allocate()));
     let reused_zeroed =
         again.len() == COUNT && again.iter().all(|f| f.bytes().iter().all(|&b| b == 0));
     let reused = again
@@ -449,7 +455,7 @@ pub fn phase1_frames(t: &mut Runner) {
         "new frames read as zero, including frames a previous owner filled (SR-18)",
     );
 
-    drop(again);
+    again.clear();
     // A freed frame can be neither freed again nor read: outside keel-hal
     // that is the type system (an `OwnedFrame` is consumed when freed and
     // cannot be copied or made from an address; audit finding 1); inside,
