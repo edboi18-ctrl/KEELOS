@@ -111,10 +111,7 @@ impl SerialPort {
         let delay = TEST_BYTE_DELAY_NS.load(core::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "none")]
         if delay != 0 {
-            let start = crate::time::monotonic_nanos();
-            while crate::time::monotonic_nanos().wrapping_sub(start) < delay {
-                core::hint::spin_loop();
-            }
+            crate::time::spin_ns(delay);
         }
         for _ in 0..TX_SPIN_LIMIT {
             // SAFETY: reading the line-status register of our own UART has
