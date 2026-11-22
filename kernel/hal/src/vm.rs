@@ -28,6 +28,24 @@ use crate::arch::x86_64::paging::{DirectMapTables, kernel_root};
 use crate::memory;
 use crate::sync::IrqMutex;
 
+/// Page tables for the user half. Same as `DirectMapTables`, except that
+/// new tables come from the reserve-checked allocator
+/// (`memory::allocate_zeroed_user`): a program touching one page in each
+/// of many 2 MiB or 1 GiB regions makes the kernel allocate a table per
+/// page, and those frames must not come out of the kernel's reserve either
+/// (F-0011).
+struct UserTables(DirectMapTables);
+
+impl TableAccess for UserTables {
+    fn allocate_table(&mut self) -> Option<Frame> {
+        memory::allocate_zeroed_user()
+    }
+
+    fn table(&mut self, frame: Frame) -> &mut [u64; 512] {
+        self.0.table(frame)
+    }
+}
+
 const PAGE: u64 = vm::PAGE;
 
 /// Page-table rights for a user page with VMA protection `prot`.
@@ -63,8 +81,13 @@ struct Inner {
 pub struct AddressSpace {
     root: Frame,
     user_root: Frame,
+    /// Never reused, unlike the table frames (audit 2, A4).
+    id: u64,
     inner: IrqMutex<Inner>,
 }
+
+/// Source of `AddressSpace::id`. 64 bits never wrap in practice.
+static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Why an address-space operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,11 +119,19 @@ impl AddressSpace {
         Ok(Arc::new(AddressSpace {
             root,
             user_root,
+            id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             inner: IrqMutex::new(Inner {
                 layout: Layout::new(),
                 parked: BTreeMap::new(),
             }),
         }))
+    }
+
+    /// An identifier no other address space, past or future, has. The
+    /// table addresses are not one: a freed table frame can be handed to
+    /// the next address space.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The user view's top-level table (CR3 while user code runs).
@@ -209,7 +240,7 @@ impl AddressSpace {
                 };
                 let exclusive = memory::references(frame) == 1;
                 let mapped = paging::map(
-                    &mut DirectMapTables,
+                    &mut UserTables(DirectMapTables),
                     self.root,
                     page,
                     frame.address(),
@@ -270,7 +301,7 @@ impl AddressSpace {
                     return false;
                 };
                 let mapped = paging::map(
-                    &mut DirectMapTables,
+                    &mut UserTables(DirectMapTables),
                     self.root,
                     page,
                     frame.address(),
@@ -336,15 +367,20 @@ impl AddressSpace {
             let frame = Frame::containing(phys);
             memory::retain(frame).map_err(|_| AsError::OutOfMemory)?;
             let shared = user_flags(vma.prot, false);
-            paging::map(
-                &mut DirectMapTables,
+            if paging::map(
+                &mut UserTables(DirectMapTables),
                 child.root,
                 virt,
                 phys,
                 PageSize::Small,
                 shared,
             )
-            .map_err(|_| AsError::OutOfMemory)?;
+            .is_err()
+            {
+                // Give back the reference taken above (audit 2, A7.3).
+                let _ = memory::release(frame);
+                return Err(AsError::OutOfMemory);
+            }
             let _ = paging::replace_small(&mut DirectMapTables, self.root, virt, phys, shared);
             cpu::invalidate_page(virt);
         }

@@ -165,6 +165,8 @@ pub const CR0_WP: u64 = 1 << 16;
 pub const CR4_UMIP: u64 = 1 << 11;
 /// CR4.SMEP (bit 20): the kernel cannot execute user pages.
 pub const CR4_SMEP: u64 = 1 << 20;
+/// CR4.PGE, bit 7: global pages (SDM Vol. 3 section 2.5).
+pub const CR4_PGE: u64 = 1 << 7;
 /// CR4.SMAP (bit 21): the kernel cannot access user pages unless
 /// RFLAGS.AC is set.
 pub const CR4_SMAP: u64 = 1 << 21;
@@ -251,9 +253,10 @@ pub unsafe fn write_cr3(pml4: u64) {
     // Entry state: CPL 0; `{}` holds the PML4 physical address with the
     //   low 12 bits (PWT, PCD and reserved bits; CR4.PCIDE is 0) clear.
     // Instruction: `mov cr3, {}` switches the address space and flushes
-    //   all non-global TLB entries (SDM Vol. 3 section 5.10.4.1). CR4.PGE
-    //   is clear at entry under Limine base revision 5 and later, so no
-    //   global translations from the bootloader survive.
+    //   all non-global TLB entries (SDM Vol. 3 section 5.10.4.1). Global
+    //   entries would survive it; `paging::init` clears CR4.PGE first, which
+    //   flushes them (same section, "MOV to CR4"), and Keel never sets the
+    //   global bit, so none exist afterwards (audit 2, A7.5).
     // Exit state: every later access is translated by the new tables. The
     //   stack pointer's address must be mapped there (caller contract).
     // SAFETY: the caller guarantees the new tables map everything in use.

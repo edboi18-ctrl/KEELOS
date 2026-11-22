@@ -81,6 +81,21 @@ pub fn monotonic_nanos() -> u64 {
     }
 }
 
+/// Busy-waits about `nanos` nanoseconds by the TSC, at the frequency
+/// calibrated in `init` (0 before then: no wait). For short test delays:
+/// RDTSC does not leave a virtual machine, whereas reading the HPET (the
+/// monotonic clock when the TSC is not invariant) is an exit to the
+/// hypervisor each time, which made a per-byte delay loop many times slower
+/// than asked under KVM.
+pub fn spin_ns(nanos: u64) {
+    let hz = TSC_HZ.load(Ordering::Relaxed);
+    let cycles = (u128::from(nanos) * u128::from(hz) / 1_000_000_000) as u64;
+    let start = cpu::read_tsc();
+    while cpu::read_tsc().wrapping_sub(start) < cycles {
+        core::hint::spin_loop();
+    }
+}
+
 /// Timer interrupts since the timer started.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)

@@ -160,6 +160,29 @@ pub fn handle(call: &SyscallArgs) -> i64 {
     result
 }
 
+/// System calls refused with ENOMEM because only the kernel's reserve
+/// was free.
+static RESERVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// How many system calls have been refused to protect the kernel's
+/// reserve (for tests).
+pub fn reserve_refusals() -> u64 {
+    RESERVE_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Whether a call may run when only the kernel's frame reserve is free.
+/// Almost every call can make the kernel allocate on the caller's behalf
+/// (a mapping, a node, a buffer, a handle), and the kernel's own
+/// allocations cannot fail gracefully, so a call that could take the last
+/// frames is refused first with ENOMEM (F-0011; `memory::user_reserve`,
+/// which already does this for user page faults). Exempt: `close` and
+/// `munmap` free memory, so a program can recover; `brk` never returns an
+/// error (it reports the old break), and its mapping is checked by the
+/// same cap as any other.
+fn may_run_on_reserve(number: u64) -> bool {
+    matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK)
+}
+
 fn dispatch(call: &SyscallArgs) -> i64 {
     let a = call.args;
     let number = call.number;
@@ -176,6 +199,13 @@ fn dispatch(call: &SyscallArgs) -> i64 {
             // array_index_nospec in do_syscall_64).
             let index = keel_hal::arch::x86_64::cpu::index_nospec(number, TABLE_SIZE) as usize;
             match (TABLE[index], process::current()) {
+                (Some(_), Some(_))
+                    if !may_run_on_reserve(number)
+                        && keel_hal::memory::free_frames() <= keel_hal::memory::user_reserve() =>
+                {
+                    RESERVE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    Err(Errno::ENOMEM)
+                }
                 (Some(handler), Some(p)) => handler(&p, &a),
                 // Threads without a process (kernel self-test programs) get
                 // only exit; everything else is ENOSYS.
@@ -344,6 +374,18 @@ fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
                 Ok(done as u64)
             };
         }
+        // A device has no file position, so its write runs without the
+        // file's lock (an IrqMutex): a console write can take a long time on
+        // a real UART and must not keep interrupts off (audit 2, A3).
+        let kind = file.lock().kind;
+        if let Kind::Device(device) = kind {
+            let written = fs::device_write(device, &chunk[..want]);
+            done += written;
+            if written < want {
+                break;
+            }
+            continue;
+        }
         let written = {
             let mut f = file.lock();
             match f.kind {
@@ -449,16 +491,28 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         let process = p.lock();
         (process.root, process.cwd)
     };
-    let base = if dirfd == AT_FDCWD || path.first() == Some(&b'/') {
-        cwd
+    // Where the lookup starts and where `..` stops (ADR 0012). With
+    // AT_FDCWD or an absolute path: the process's working directory and
+    // root, its ambient authority until compartments exist. Relative to a
+    // directory handle: that directory, which is also the root, so `..`
+    // cannot climb above it (as Linux's openat2 RESOLVE_IN_ROOT; plain
+    // Linux openat would let it). A handle to /a/b then reaches only what
+    // is beneath /a/b (audit 2, A6).
+    let (root, base) = if dirfd == AT_FDCWD || path.first() == Some(&b'/') {
+        (root, cwd)
     } else {
-        // Lookup relative to a directory handle needs ENUMERATE on it.
-        let dir = file(p, dirfd, Rights::ENUMERATE)?;
+        // Lookup needs ENUMERATE on the directory; creating needs CREATE.
+        let needs = if flags & O_CREAT != 0 {
+            Rights::ENUMERATE | Rights::CREATE
+        } else {
+            Rights::ENUMERATE
+        };
+        let dir = file(p, dirfd, needs)?;
         let dir = dir.lock();
         if dir.kind != Kind::Directory {
             return Err(Errno::ENOTDIR);
         }
-        dir.node
+        (dir.node, dir.node)
     };
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);

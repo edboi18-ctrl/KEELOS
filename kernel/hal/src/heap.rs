@@ -12,9 +12,10 @@
 //! a dedicated non-executable region and leaves an unmapped page between
 //! large allocations, so running off the end of one faults (SR-17 spirit).
 //!
-//! Rules (docs/locking.md): never allocate from an interrupt handler, and
-//! never hold the heap lock while taking the page-table or frame lock in
-//! the other order.
+//! Rules (docs/locking.md): the heap lock is an `IrqMutex`, so allocating
+//! from an interrupt handler is safe (no interrupt arrives while it is
+//! held); never hold the heap lock while taking the page-table or frame
+//! lock in the other order.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
@@ -210,11 +211,25 @@ impl PageSource for KernelPages {
 #[global_allocator]
 static KERNEL_HEAP: LockedHeap<KernelPages> = LockedHeap::new(KernelPages {
     ranges: crate::va::VaRanges::new(
-        crate::arch::x86_64::paging::KERNEL_HEAP_BASE,
+        // Placed at a random offset by `paging::init` before first use.
+        0xffff_c000_0000_0000,
         crate::arch::x86_64::paging::KERNEL_HEAP_SIZE,
     ),
     mapped: 0,
 });
+
+/// Moves the heap's address range to `[base, base + size)`. Only before the
+/// first allocation (returns false afterwards): `paging::init` places the
+/// region at a random offset (audit 2, A5).
+#[cfg(target_os = "none")]
+pub(crate) fn rebase(base: u64, size: u64) -> bool {
+    let mut heap = KERNEL_HEAP.0.lock();
+    if heap.source.mapped != 0 {
+        return false;
+    }
+    heap.source.ranges = crate::va::VaRanges::new(base, size);
+    true
+}
 
 /// Pages the heap holds mapped (and so frames it uses), small-class pages
 /// included (those are kept once taken).

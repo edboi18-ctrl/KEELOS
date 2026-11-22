@@ -55,7 +55,7 @@ to `main` with PR #1.
 | P1-S3 | Page-table isolation with a trampoline entry path | Done. Each address space has a kernel view and a user view; the user view's kernel half is one top-level entry mapping only `.text.keel_entry` (RX), `.data.keel_entry` and `.bss.keel_entry` (RW+NX). Every entry switches to the kernel view; every exit to user mode switches back from the trampoline stack. Always on until P1-S4 reads RDCL_NO; no PCIDs yet. Tests: `pti.user_view` (walks the user view: only trampoline pages, no W+X), `pti.kernel_absent` (user reads of kernel text, rodata, data, direct map and heap find no page). Finding F-0001 fixed on the way (`user.ac_cleared_on_entry`). |
 | P1-S1 | Object table with a rights mask from its first version; every syscall handler names the right it requires | Done. `keel-core::handle`: rights from SR-1's list, checked on every lookup, lowest-free descriptor allocation, duplicate only removes rights, per-process limit 1024 (host tests). The process table is a `HandleTable`; there is no other descriptor table. Rights per call in `docs/syscalls.md`. |
 | P1-S4 | Boot-time vulnerability report and mitigation selection; one log line per item | Done (ADR 0007). `keel-core::cpuvuln` assesses 17 items from CPUID, IA32_ARCH_CAPABILITIES and IA32_MCU_OPT_CTRL (host tests for the target with and without current microcode, newer CPUs, hypervisors, unknown models); `hal::mitigations` applies the plan: legacy IBRS on entry/exit (or enhanced IBRS once), SSBD, BHI_DIS_S when needed, IBPB between address spaces, RSB fill on every context switch, VERW before every return to user mode, SRBDS/GDS microcode controls on. Spectre v1: branch-free index masking for syscall numbers and descriptors. L1TF: no not-present entry holds bits (checked in every page-table walk). The boot log has one `vuln:` line per item; `cargo xtask test` prints them. Found and fixed on the way: F-0002. Where the mitigations run: QEMU's emulator advertises none of the speculation-control features but accepts the MSR writes, so `vuln.ibrs_entry_path` forces the IBRS entry/exit and IBPB paths on there and runs the whole syscall conformance program through them; CI's KVM guest (an Ice Lake server CPU inside GitHub's own virtual machine) hides IBRS/IBPB/SSBD entirely but raises #GP for missing MSRs, which proves the fault path (`cpu.msr_safe`). The CPU's actual speculation behaviour under these mitigations can only be confirmed on the OptiPlex (P6-S6). Not implemented: software BHB clearing and ITS mitigations (neither applies to the target). |
-| P1-S5 | Kernel and user address-space randomization; entropy source | Done. (The intermittent timeout seen after these changes was F-0004, a console-lock deadlock older than P1-S5, now fixed.) Entropy: `keel-core::crypto` (ChaCha20, RFC 8439; BLAKE2s, RFC 7693; checked against the RFCs' vectors including the RFC 7693 self-test) and `keel-core::rng` (BLAKE2s pool, ChaCha20 fast key erasure, as Linux's random.c); `hal::random` seeds it at boot from RDSEED, RDRAND (after its self-test) and TSC jitter, adds timer and keyboard interrupt timing, reseeds every 60 s, never runs unseeded, and reports whether a hardware source contributed. AT_RANDOM, getrandom and /dev/urandom use it. KASLR: Limine `kaslr: yes` (the kernel is a PIE), which also randomises the HHDM base; `cargo xtask test` checks that the boots of a phase land at different addresses. User ASLR with Linux's ranges: stack top (22 bits of pages), mmap base and PIE load bias (28 bits), program break (1 GiB). Found on the way: F-0003. |
+| P1-S5 | Kernel and user address-space randomization; entropy source | Done. (The intermittent timeout seen after these changes was F-0004, a console-lock deadlock older than P1-S5, now fixed.) Entropy: `keel-core::crypto` (ChaCha20, RFC 8439; BLAKE2s, RFC 7693; checked against the RFCs' vectors including the RFC 7693 self-test) and `keel-core::rng` (BLAKE2s pool, ChaCha20 fast key erasure, as Linux's random.c); `hal::random` seeds it at boot from RDSEED, RDRAND (after its self-test) and TSC jitter, adds timer and keyboard interrupt timing, reseeds every 60 s, never runs unseeded, and reports whether a hardware source contributed. AT_RANDOM, getrandom and /dev/urandom use it. KASLR: Limine `kaslr: yes` (the kernel is a PIE), which also randomises the HHDM base; the kernel heap, device-register and kernel-stack regions are placed at random offsets too (audit 2, A5); `cargo xtask test` checks that the boots of a phase land at different addresses (`kaslr.layout_varies`, `kaslr.regions_vary`). User ASLR with Linux's ranges: stack top (22 bits of pages), mmap base and PIE load bias (28 bits), program break (1 GiB). Found on the way: F-0003. |
 | P1-S6 | Kernel stack guard pages; zero-on-allocate for user frames; zeroed copy-out buffers; overflow checks in release | Done. Every kernel stack, now including the boot thread's (boot leaves Limine's unguarded stack for a 128 KiB kernel stack right after paging is up), has an unmapped guard page; an overflow becomes a double fault on IST1 and a clean panic (`stack_overflow` scenario). Stack probes: the pinned target (`x86_64-unknown-none`, Rust 1.100.0) sets `stack_probes: StackProbeType::Inline`, and the kernel binary contains the probe sequence. RELRO: `.data.rel.ro` and `.got` have their own segment, mapped read-only after Limine relocates them. Frames are zeroed on allocation (SR-18), structures copied to user space are built in zeroed buffers, and `overflow-checks = true` in release. Tests: `paging.boot_stack_guard`, `paging.relro`, `frames.zeroed`. |
 | P1-S7 | No identity checks; no forbidden device nodes; unknown syscalls and flags fail closed | Done (verification). SR-6: a sweep of `kernel/` and `user/` finds no check on user or group IDs or set-ID bits anywhere; uid and gid are reported as 0 and never consulted, and the loader ignores mode bits. SR-9: device nodes come from a fixed list (`fs.no_forbidden_devices`); user port I/O and CLI fault (`user.no_port_io`, `user.no_cli`). SR-10: unknown system calls return ENOSYS (`user.unknown_syscall`, conformance check on number 500); unknown flags or codes are EINVAL for openat, mmap, mprotect, getrandom, clock_gettime, arch_prctl, and ENOTTY for ioctl requests, all in `user/tests/syscalls`. |
 
@@ -140,7 +140,7 @@ Hardening notes for later Phase 1 work:
   `sr27.tamper.initramfs` and `sr27.tamper.config` (Limine refuses a
   one-byte change to each; the config's hash is enrolled in
   `BOOTX64.EFI`).
-- `cargo xtask test --phase 1`: 87 in-kernel tests pass and `KEEL P1 OK`
+- `cargo xtask test --phase 1`: 96 in-kernel tests pass and `KEEL P1 OK`
   is on serial; the six fault scenarios (`double_fault`,
   `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`,
   `fault_in_panic`) pass; the
@@ -149,8 +149,8 @@ Hardening notes for later Phase 1 work:
   fail when the marker is not printed.
 - `cargo xtask fuzz --minutes 60 --seed 20261122`: passes (see security
   acceptance item 6 above).
-- `cargo test`: 160 host unit tests pass (96 `keel-core`, 29 `keel-hal`,
-  5 `keel-linux-abi`, 30 `xtask`).
+- `cargo test`: 181 host tests pass (106 `keel-core`, 29 `keel-hal`,
+  5 `keel-linux-abi`, 37 `xtask`, and 4 `keel-hal` doctests).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.
@@ -173,6 +173,43 @@ halting.`:
 - `serial COM1 ok`: a 16550 UART answered the loopback test at I/O port
   0x3F8. That shows the UART exists in the chipset or Super I/O; it does
   not show a serial connector is fitted on the back panel.
+
+## Second boot on the target machine (2026-11-22, release v0.1.0)
+
+The owner verified `keel-0.1.0-esp.zip` with `cargo xtask verify`
+(checksum, and an attestation from `release.yml` at `refs/tags/v0.1.0`),
+unzipped it onto a FAT32 USB stick, and booted the OptiPlex 3060 (Secure
+Boot off). Every line through `Keel: nothing more to run yet; halting.`
+appeared. Read from a photo of the screen:
+
+- Limine accepted the enrolled `limine.conf` (ADR 0010) and the hashed
+  kernel and initramfs. The kernel base and HHDM offset are hidden
+  (audit finding 8).
+- Memory: 39 regions, 7676 MiB usable; 1,964,018 frames free (7671 MiB).
+- Paging: NX, WP, SMEP and SMAP on; UMIP unsupported (CPUID does not
+  report it on this CPU).
+- CPU: Intel family 6, model 0x9E, stepping 0xA. `IA32_ARCH_CAPABILITIES`
+  is 0, and 6 CPUs are listed in the MADT (Keel uses one).
+- Time: HPET period 41,666,667 fs (24 MHz), APIC timer 1502 kHz, and TSC
+  3005 MHz, **invariant**. This is the first real-hardware run of the TSC
+  clock path (QEMU TCG has no invariant TSC).
+- Random: seeded from RDSEED, RDRAND and TSC jitter.
+- Keyboard: the i8042 controller answered its self-test. Whether the
+  firmware delivers USB keystrokes through it was not tested.
+- Mitigations in use: page-table isolation, legacy IBRS on every kernel
+  entry, IBPB between address spaces, RSB filling, SSBD, and L1TF-safe
+  page tables.
+- **Reported VULNERABLE: MDS, TAA, MMIO stale data, SRBDS and GDS.** In
+  every case the reason given is missing microcode support (no MD_CLEAR,
+  FB_CLEAR, SRBDS or GDS controls), not a missing Keel mitigation: Keel
+  already issues VERW. The firmware's microcode on this machine is older
+  than those fixes. The remedies are a newer firmware (BIOS) from the
+  vendor, or Keel loading microcode early (P6-S8), which the GDS line
+  names.
+- Known issue: the banner says `Keel 0.0.0 booting`. The kernel prints
+  its crate version (`CARGO_PKG_VERSION`), and `cargo xtask dist
+  --version` only names the files, so a release kernel does not know its
+  own version.
 
 ## `unsafe` budget
 

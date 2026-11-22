@@ -50,7 +50,11 @@ pub fn file_rights(read: bool, write: bool, kind: Kind) -> Rights {
         rights = rights | Rights::WRITE;
     }
     if kind == Kind::Directory {
-        rights = rights | Rights::ENUMERATE;
+        // CREATE is granted by default, as MAP_EXEC is on files, for Linux
+        // compatibility (creating through a directory descriptor needs no
+        // write access there); compartment manifests can withhold it from
+        // Phase 3 (ADR 0012).
+        rights = rights | Rights::ENUMERATE | Rights::CREATE;
     }
     rights
 }

@@ -13,7 +13,42 @@ None.
 F-0005 to F-0009 were found on 2026-11-22 by the system-call fuzzer
 (`cargo xtask fuzz`, security acceptance P1 item 6), each a denial of
 service reachable from an unprivileged user program. F-0010, of the same
-kind, was found the same day by CI.
+kind, was found the same day by CI. F-0011 was found by the second Phase 1
+audit (`docs/PHASE1-AUDIT-2.md`, A1), which reproduced it.
+
+### F-0011: user programs could exhaust kernel memory and panic the kernel
+
+Found 2026-11-22 by the second Phase 1 audit, confirmed by running it: a
+program mapping single `PROT_NONE` pages at spaced hints made the kernel
+panic (`memory allocation of 368 bytes failed`) after about 5.5 million
+calls on a 512 MB guest.
+
+Cause. Kernel allocations cannot fail gracefully, and three things let a
+program make the kernel allocate without limit:
+- VMAs: no cap per address space, and adjacent mappings were never
+  merged.
+- tmpfs nodes: file bytes were capped, but node count was not (read only,
+  not run by the auditor; confirmed here by `fileflood`, which made
+  127,643 files before its timeout with the cap removed).
+- Page tables for user mappings came from the kernel's frame pool,
+  outside the user reserve. This one was found while fixing the others.
+
+Fix (ADR 0011):
+- A 65530-VMA cap, Linux's `vm.max_map_count` default, checked before any
+  change. Adjacent VMAs with the same rights are merged.
+- A 65536-node tmpfs cap.
+- File growth through `try_reserve`.
+- User page tables taken from the user pool.
+- Admission: with only the kernel's reserve free, every call except
+  `close`, `munmap`, `brk` and `exit` returns ENOMEM.
+
+The same change fixes audit item A2: `mmap(NULL)` now searches below its
+last placement instead of walking every VMA with interrupts off.
+
+Regression tests: `limits.map_count` (the proof of concept),
+`limits.map_null_preemptible`, `limits.tmpfs_nodes` and
+`limits.reserve_admission`. Each fails with its protection removed. Host
+tests in `keel-core` cover the cap, merging and the search cache.
 
 ### F-0010: getrandom read a clock device for every 256 bytes
 

@@ -538,7 +538,9 @@ fn test_boot(
                 .lines
                 .iter()
                 .filter(|l| {
-                    l.starts_with("boot: kernel at virt") || l.starts_with("boot: HHDM offset")
+                    l.starts_with("boot: kernel at virt")
+                        || l.starts_with("boot: HHDM offset")
+                        || l.starts_with("boot: regions")
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -816,11 +818,40 @@ fn check_kaslr(layouts: &[Option<String>]) -> Result<()> {
             seen.len(),
             distinct.len()
         );
-        Ok(())
+        regions_vary(&seen)
     } else {
         Err(format!(
             "kaslr.layout_varies: {} boots gave {} distinct layouts: {distinct:?}",
             seen.len(),
+            distinct.len()
+        )
+        .into())
+    }
+}
+
+/// Audit 2, A5: the heap, device and stack region bases must be printed
+/// by every boot and differ between boots, independently of the kernel
+/// image and direct map.
+fn regions_vary(layouts: &[&String]) -> Result<()> {
+    let regions: Vec<&str> = layouts
+        .iter()
+        .filter_map(|l| l.split("; ").find(|part| part.starts_with("boot: regions")))
+        .collect();
+    let mut distinct = regions.clone();
+    distinct.sort();
+    distinct.dedup();
+    if regions.len() == layouts.len() && distinct.len() >= 2 {
+        println!(
+            "  TEST kaslr.regions_vary PASS {} boots, {} distinct heap/device/stack layouts",
+            regions.len(),
+            distinct.len()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "kaslr.regions_vary: {} of {} boots reported region bases, {} distinct: {distinct:?}",
+            regions.len(),
+            layouts.len(),
             distinct.len()
         )
         .into())

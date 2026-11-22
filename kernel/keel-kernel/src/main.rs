@@ -81,17 +81,40 @@ extern "C" fn kmain() -> ! {
     }
 
     match paging::init() {
-        Ok(report) => kprintln!(
-            "paging: own tables active; {} x 4 KiB + {} x 2 MiB pages; NX {}, WP on, SMEP {}, SMAP {}, UMIP {}",
-            report.summary.small_pages,
-            report.summary.large_pages,
-            on_off(report.features.nx),
-            on_off(report.features.smep),
-            on_off(report.features.smap),
-            on_off(report.features.umip),
-        ),
-        // Running on the bootloader's tables would mean no W^X and no
-        // guard pages; stop instead (SR-12).
+        Ok(report) => {
+            kprintln!(
+                "paging: own tables active; {} x 4 KiB + {} x 2 MiB pages; NX {}, WP on, SMEP {}, SMAP {}, UMIP {}",
+                report.summary.small_pages,
+                report.summary.large_pages,
+                on_off(report.features.nx),
+                on_off(report.features.smep),
+                on_off(report.features.smap),
+                on_off(report.features.umip),
+            );
+            kprintln!(
+                "paging: heap, device and stack regions {} ({})",
+                if report.regions_randomized {
+                    "at random offsets"
+                } else {
+                    "NOT randomized: already in use"
+                },
+                if report.regions_quality == keel_hal::random::Quality::Hardware {
+                    "hardware random source"
+                } else {
+                    "timing only: weak"
+                }
+            );
+            // As with the kernel base: test boots only (audit 2, A5).
+            let cmdline = boot::cmdline();
+            if selftest::requested_phase(cmdline).is_some()
+                || selftest::requested_fuzz(cmdline).is_some()
+            {
+                let [heap, mmio, stacks] = paging::region_bases();
+                kprintln!(
+                    "boot: regions heap {heap:#018x} mmio {mmio:#018x} stacks {stacks:#018x}"
+                );
+            }
+        }
         Err(error) => panic!("page table setup failed: {error:?}"),
     }
     // Leave the bootloader's stack, which has no guard page, for one of

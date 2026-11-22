@@ -15,6 +15,31 @@ name = "syscalls"
 test = false
 bench = false
 
+[[bin]]
+name = "maplimit"
+test = false
+bench = false
+
+[[bin]]
+name = "fileflood"
+test = false
+bench = false
+
+[[bin]]
+name = "reservecall"
+test = false
+bench = false
+
+[[bin]]
+name = "conflood"
+test = false
+bench = false
+
+[[bin]]
+name = "dirconfine"
+test = false
+bench = false
+
 [dependencies]
 keel-rt = { path = "../keel-rt" }
 

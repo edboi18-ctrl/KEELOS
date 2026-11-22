@@ -309,6 +309,33 @@ pub fn mmap_raw(length: u64, prot: u64, flags: u64, fd: i32) -> i64 {
     result
 }
 
+/// mmap(hint, length, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), kept
+/// until the program exits. `hint` is only a hint (never MAP_FIXED), so
+/// the kernel never places this over memory the program already has.
+/// Returns the raw result. For tests that fill the address space.
+pub fn mmap_keep(hint: u64, length: u64, prot: u64) -> i64 {
+    call6(
+        nr::MMAP,
+        [hint, length, prot, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+    )
+}
+
+/// Writes `prefix`, `value` in decimal and `suffix` as one line to fd 1.
+pub fn write_number(prefix: &[u8], value: u64, suffix: &[u8]) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    writev(1, &[prefix, &digits[at..], suffix]);
+}
+
 /// An anonymous private mapping this program owns. No Rust reference
 /// into it ever exists, so lending its address to the kernel is sound.
 pub struct Region {

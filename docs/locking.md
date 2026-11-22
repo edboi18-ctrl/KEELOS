@@ -19,18 +19,23 @@ Notes:
 
 - The console locks are independent of the memory locks: printing never
   allocates, and no memory code prints while holding a memory lock.
-- Never allocate from an interrupt or exception handler: the interrupted
-  code may hold the heap lock. The fatal-exception path does not allocate.
+- Interrupt handlers may allocate (the timer interrupt's scheduler pass
+  and the keyboard handler do): the heap lock is an `IrqMutex`, so an
+  interrupt can never arrive while the interrupted code holds it, and the
+  kernel's frame reserve keeps such small allocations from failing (ADR
+  0011). The fatal-exception path does not allocate. (Audit 2, A7.4: the
+  rule used to forbid this, which the code did not follow.)
 
 - `heap::KERNEL_HEAP`, `paging::TABLES`, `memory::FRAMES`, `sched::SCHED`
   and every `WaitQueue` are `sync::IrqMutex`es: interrupts are disabled
   while one is held, so the scheduler never preempts a thread inside
   them. Keep those critical sections short.
-- Interrupts are enabled from P1-T7 on. Interrupt handlers take no lock
-  at all (the timer handler only increments an atomic counter), so no
-  lock above can be re-entered by an interrupt. Any future handler that
-  needs a lock must use one that is only ever taken with interrupts
-  disabled.
+- Interrupts are enabled from P1-T7 on. Interrupt handlers take only
+  `IrqMutex`es (the timer's scheduler pass takes `SCHED`, the keyboard
+  handler `TERMINAL` and wait queues), and code holding an `IrqMutex` has
+  interrupts disabled, so no lock can be re-entered by an interrupt. Any
+  future handler that needs a lock must use one that is only ever taken
+  with interrupts disabled.
 - System calls run with interrupts enabled (F-0008): a thread can be
   preempted anywhere in a system call except inside an `IrqMutex`. So
   every lock a system call takes must be an `IrqMutex` (all of them are),

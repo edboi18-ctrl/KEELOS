@@ -77,6 +77,14 @@ pub struct UserFault {
 
 /// Exit status and last user fault of threads that have exited.
 static EXITED: IrqMutex<BTreeMap<u64, (i64, Option<UserFault>)>> = IrqMutex::new(BTreeMap::new());
+/// How many exit statuses `EXITED` keeps. Callers read a status right
+/// after the thread ends (`join`), long before 1024 more threads exit.
+const EXITED_LIMIT: usize = 1024;
+
+/// Number of exit statuses held (for tests).
+pub fn exited_count() -> usize {
+    EXITED.lock().len()
+}
 static FAULTS: IrqMutex<BTreeMap<u64, UserFault>> = IrqMutex::new(BTreeMap::new());
 
 struct Scheduler {
@@ -337,7 +345,29 @@ pub fn sleep_ms(ms: u64) {
 const IA32_PRED_CMD: u32 = 0x49;
 const PRED_CMD_IBPB: u64 = 1;
 static IBPB_ON_SWITCH: AtomicBool = AtomicBool::new(false);
-static LAST_USER_CR3: AtomicU64 = AtomicU64::new(0);
+/// `AddressSpace::id` of the last user address space that ran. An id, not
+/// the table address: a new process can get the freed table frame of the
+/// last one, and comparing addresses then skipped the barrier between two
+/// different processes (audit 2, A4).
+static LAST_USER_SPACE: AtomicU64 = AtomicU64::new(0);
+/// Switches to a different user address space so far (each one where an
+/// IBPB is issued when the CPU has it).
+static USER_SPACE_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Records that `space` is about to run. Returns whether it differs from
+/// the last user address space, that is, whether a barrier is due.
+pub fn note_user_space(space: &AddressSpace) -> bool {
+    let changed = LAST_USER_SPACE.swap(space.id(), Ordering::Relaxed) != space.id();
+    if changed {
+        USER_SPACE_CHANGES.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+/// How many times a different user address space has been switched to.
+pub fn user_space_changes() -> u64 {
+    USER_SPACE_CHANGES.load(Ordering::Relaxed)
+}
 
 /// Issues IBPB when switching between user address spaces (P1-S4). Only
 /// call with `true` if the CPU reports IBRS/IBPB (CPUID.(7,0):EDX[26]).
@@ -454,7 +484,16 @@ pub fn exit_with(status: i64) -> ! {
         hook(ThreadId(id));
     }
     let fault = FAULTS.lock().remove(&id);
-    EXITED.lock().insert(id, (status, fault));
+    {
+        // Keep the most recent statuses only (audit 2, A7.2): one entry per
+        // exited thread for ever would grow without bound. Thread ids only
+        // increase, so the first entry is the oldest.
+        let mut exited = EXITED.lock();
+        exited.insert(id, (status, fault));
+        while exited.len() > EXITED_LIMIT {
+            exited.pop_first();
+        }
+    }
     schedule(State::Exited);
     unreachable!("an exited thread was scheduled again");
 }
@@ -569,16 +608,17 @@ fn schedule(next_state: State) {
     let stack_top = next.stack.as_ref().map_or(0, |s| s.top);
     entry::set_current(kernel_cr3, user_cr3, stack_top);
     crate::vm::set_current(next.space.clone());
-    if next.space.is_some() && IBPB_ON_SWITCH.load(Ordering::Relaxed) {
-        // Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
-        // different user address space is about to run, so branch
-        // predictions trained by one process cannot steer another.
-        if LAST_USER_CR3.swap(user_cr3, Ordering::Relaxed) != user_cr3 {
-            // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
-            // enabled only after `set_ibpb_on_switch` checked CPUID for it.
-            // Writing it has no effect on memory.
-            unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
-        }
+    // Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
+    // different user address space is about to run, so branch predictions
+    // trained by one process cannot steer another.
+    if let Some(space) = next.space.as_ref()
+        && note_user_space(space)
+        && IBPB_ON_SWITCH.load(Ordering::Relaxed)
+    {
+        // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
+        // enabled only after `set_ibpb_on_switch` checked CPUID for it.
+        // Writing it has no effect on memory.
+        unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
     }
     if next.space.is_some() {
         // SAFETY: both values were checked to be user (hence canonical)

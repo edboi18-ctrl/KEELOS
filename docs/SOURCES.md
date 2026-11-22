@@ -135,3 +135,6 @@ against copies downloaded from the vendors:
 | Limine protocol `PROTOCOL.md` (codeberg.org/Limine/limine-protocol), "Memory Map Feature": entries sorted by base; usable entries 4096-byte aligned and not overlapping any other entry, read 2026-11-22 | `keel_core::frame::sound_usable_regions` (audit finding 8) |
 | Intel SDM Vol. 1, section 3.3.7.1, "Canonical Addressing" | `keel_core::frame::HIGHER_HALF` |
 | Intel SDM Vol. 2D, "XOR", Flags Affected; the Rust Reference, "Inline assembly", `asm.rules.preserved-registers` (status flags, x87 status word and MXCSR exception flags must be restored when `preserves_flags` is set), read 2026-11-22 | Audit finding 6: `gdt.rs`, `fpu.rs` |
+| Linux `arch/x86/mm/kaslr.c` at v6.12 (`kernel_randomize_memory`: `page_offset_base`, `vmalloc_base`, `vmemmap_base` placed at random, seeded with `kaslr_get_random_long("Memory")`), read 2026-11-22 | Region randomization in `hal::arch::x86_64::paging` and `random::early_words` (audit 2, A5) |
+| Intel SDM Vol. 3, section 2.5 (CR4.PGE, bit 7) and section 5.10.4.1 ("MOV to CR4" invalidates all TLB entries, global included, when CR4.PGE changes) | `paging::init` (audit 2, A7.5) |
+| Linux v6.12 `include/linux/mm.h` (`DEFAULT_MAX_MAP_COUNT`) and `Documentation/admin-guide/sysctl/vm.rst` ("The default value is 65530.") | `keel_core::vm::MAX_MAP_COUNT` (F-0011) |

@@ -41,6 +41,13 @@ pub struct SerialPort {
     present: bool,
 }
 
+/// Nanoseconds to wait before each byte; 0 (the default) means none. Set
+/// only by self-tests, to make the emulated UART as slow as a real one:
+/// 115200 baud with 8N1 framing carries 10 bits per byte, 11,520 bytes a
+/// second, about 86.8 µs each (audit 2, A3).
+pub static TEST_BYTE_DELAY_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 impl SerialPort {
     /// Creates a handle for the UART at `base` without touching hardware.
     ///
@@ -98,6 +105,13 @@ impl SerialPort {
     fn write_byte(&mut self, byte: u8) {
         if !self.present {
             return;
+        }
+        // Test knob: emulate a real UART's speed (QEMU's is instant).
+        #[cfg(target_os = "none")]
+        let delay = TEST_BYTE_DELAY_NS.load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "none")]
+        if delay != 0 {
+            crate::time::spin_ns(delay);
         }
         for _ in 0..TX_SPIN_LIMIT {
             // SAFETY: reading the line-status register of our own UART has

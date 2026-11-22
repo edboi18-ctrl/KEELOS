@@ -147,6 +147,11 @@ static TABLES: crate::sync::IrqMutex<()> = crate::sync::IrqMutex::new(());
 pub struct PagingReport {
     pub features: Features,
     pub summary: WalkSummary,
+    /// Whether the heap, device and stack regions were moved to random
+    /// offsets (false only if one was already in use), and whether a
+    /// hardware random source contributed.
+    pub regions_randomized: bool,
+    pub regions_quality: crate::random::Quality,
 }
 
 /// Why `init` failed.
@@ -187,6 +192,9 @@ pub fn init() -> Result<PagingReport, PagingError> {
     }
     let hhdm = boot::hhdm_offset().ok_or(PagingError::NoBootInformation)?;
     let kernel = boot::kernel_address().ok_or(PagingError::NoBootInformation)?;
+    // Before anything uses the heap, device or stack regions (A5).
+    let (words, regions_quality) = crate::random::early_words();
+    let regions_randomized = randomize_regions(words);
 
     let mut tables = DirectMapTables;
     let root = tables
@@ -297,6 +305,15 @@ pub fn init() -> Result<PagingReport, PagingError> {
         let efer = cpu::rdmsr(cpu::IA32_EFER);
         cpu::wrmsr(cpu::IA32_EFER, efer | cpu::EFER_NXE);
         cpu::write_cr0(cpu::read_cr0() | cpu::CR0_WP);
+        // Global translations survive a CR3 write. Limine leaves CR4.PGE
+        // clear, but that is checked rather than assumed: changing PGE
+        // invalidates every TLB entry, global ones included (SDM Vol. 3
+        // section 5.10.4.1, "MOV to CR4"), so none of the bootloader's can
+        // outlive the switch (audit 2, A7.5).
+        let cr4 = cpu::read_cr4();
+        if cr4 & cpu::CR4_PGE != 0 {
+            cpu::write_cr4(cr4 & !cpu::CR4_PGE);
+        }
         cpu::write_cr3(root.address());
         let mut cr4 = cpu::read_cr4();
         if features.smep {
@@ -312,7 +329,12 @@ pub fn init() -> Result<PagingReport, PagingError> {
     }
     ROOT.store(root.address(), Ordering::Release);
     crate::vm::set_smap_enabled(features.smap);
-    Ok(PagingReport { features, summary })
+    Ok(PagingReport {
+        features,
+        summary,
+        regions_randomized,
+        regions_quality,
+    })
 }
 
 /// The kernel's top-level table.
@@ -345,17 +367,66 @@ pub fn walk() -> Option<WalkSummary> {
     ))
 }
 
-/// Start of the kernel-heap virtual region. It lies outside both the
-/// direct map (which starts at Limine's HHDM offset and spans physical
-/// memory, at most 1 TiB here) and the kernel image (top 2 GiB).
-pub const KERNEL_HEAP_BASE: u64 = 0xffff_c000_0000_0000;
+/// Windows for the kernel heap, device registers and kernel stacks, 16 TiB
+/// each. They lie outside both the direct map (which starts at Limine's
+/// HHDM offset and spans physical memory, at most 1 TiB here) and the
+/// kernel image (top 2 GiB). Each region starts at a random 2 MiB-aligned
+/// offset in the lower 8 TiB of its window, chosen in `init` (audit 2,
+/// A5): 2^22 places each, so their addresses are not known in advance as
+/// the image's and the direct map's are not (KASLR, SR-16).
+const HEAP_WINDOW: u64 = 0xffff_c000_0000_0000;
+const MMIO_WINDOW: u64 = 0xffff_d000_0000_0000;
+const STACKS_WINDOW: u64 = 0xffff_e000_0000_0000;
+const OFFSET_STEP: u64 = 2 << 20;
+const OFFSET_STEPS: u64 = (8 << 40) / OFFSET_STEP;
+
 /// Size of the kernel-heap virtual region (64 GiB).
 pub const KERNEL_HEAP_SIZE: u64 = 64 << 30;
+static HEAP_BASE: AtomicU64 = AtomicU64::new(HEAP_WINDOW);
 
-/// Start of the region where device registers are mapped.
-pub const MMIO_BASE: u64 = 0xffff_d000_0000_0000;
+/// The kernel-heap virtual region.
+pub fn kernel_heap_region() -> core::ops::Range<u64> {
+    let base = HEAP_BASE.load(Ordering::Acquire);
+    base..base + KERNEL_HEAP_SIZE
+}
+
 const MMIO_SIZE: u64 = 1 << 30;
-static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
+static MMIO_BASE: AtomicU64 = AtomicU64::new(MMIO_WINDOW);
+static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_WINDOW);
+
+/// Bases of the kernel heap, device-register and kernel-stack regions
+/// (test boots print them; `cargo xtask test` checks they vary).
+pub fn region_bases() -> [u64; 3] {
+    [
+        HEAP_BASE.load(Ordering::Acquire),
+        MMIO_BASE.load(Ordering::Acquire),
+        STACKS_BASE.load(Ordering::Acquire),
+    ]
+}
+
+/// Moves the three regions to random offsets in their windows. Only
+/// before any of them is used; returns false (and moves nothing) after.
+fn randomize_regions(words: [u64; 3]) -> bool {
+    let unused = MMIO_NEXT.load(Ordering::Acquire) == MMIO_WINDOW
+        && STACK_HIGH.load(Ordering::Acquire) == STACKS_WINDOW;
+    if !unused {
+        return false;
+    }
+    let place = |window: u64, word: u64| window + (word % OFFSET_STEPS) * OFFSET_STEP;
+    let heap = place(HEAP_WINDOW, words[0]);
+    if !crate::heap::rebase(heap, KERNEL_HEAP_SIZE) {
+        return false;
+    }
+    HEAP_BASE.store(heap, Ordering::Release);
+    let mmio = place(MMIO_WINDOW, words[1]);
+    MMIO_BASE.store(mmio, Ordering::Release);
+    MMIO_NEXT.store(mmio, Ordering::Release);
+    let stacks = place(STACKS_WINDOW, words[2]);
+    *STACK_VA.lock() = crate::va::VaRanges::new(stacks + PAGE, KERNEL_STACKS_SIZE - PAGE);
+    STACK_HIGH.store(stacks, Ordering::Release);
+    STACKS_BASE.store(stacks, Ordering::Release);
+    true
+}
 
 /// Why `map_mmio` refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,7 +475,7 @@ pub fn map_mmio(phys: u64, length: u64) -> Result<u64, MmioError> {
     let size = pages * PAGE;
     // One unmapped page between mappings.
     let virt = MMIO_NEXT.fetch_add(size + PAGE, Ordering::AcqRel);
-    if virt + size > MMIO_BASE + MMIO_SIZE {
+    if virt + size > MMIO_BASE.load(Ordering::Acquire) + MMIO_SIZE {
         return Err(MmioError::BadRange);
     }
     let flags = Flags {
@@ -430,11 +501,7 @@ pub fn map_mmio(phys: u64, length: u64) -> Result<u64, MmioError> {
 /// pages `[virt, virt + pages * 4096)` inside the kernel-heap region.
 /// On failure nothing stays mapped.
 pub fn map_heap_pages(virt: u64, pages: u64) -> Result<(), paging::MapError> {
-    map_fresh_pages(
-        virt,
-        pages,
-        KERNEL_HEAP_BASE..KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE,
-    )
+    map_fresh_pages(virt, pages, kernel_heap_region())
 }
 
 /// Maps `pages` fresh zeroed frames RW+NX at `virt`, which must lie with
@@ -483,9 +550,9 @@ fn map_fresh_pages(
     Ok(())
 }
 
-/// Start of the kernel-stack region.
-pub const KERNEL_STACKS_BASE: u64 = 0xffff_e000_0000_0000;
+/// Size of the kernel-stack region; its base is `STACKS_BASE`.
 const KERNEL_STACKS_SIZE: u64 = 64 << 30;
+static STACKS_BASE: AtomicU64 = AtomicU64::new(STACKS_WINDOW);
 /// Address space for kernel stacks, reused when a stack is freed (F-0009;
 /// before, every thread used 68 KiB of the region for good). Ranges
 /// start one page above the region base, which is never mapped: every
@@ -493,11 +560,11 @@ const KERNEL_STACKS_SIZE: u64 = 64 << 30;
 /// the guard page that follows the range below), which is the stack's
 /// guard. Lock order: taken before `TABLES`.
 static STACK_VA: crate::sync::IrqMutex<crate::va::VaRanges> = crate::sync::IrqMutex::new(
-    crate::va::VaRanges::new(KERNEL_STACKS_BASE + PAGE, KERNEL_STACKS_SIZE - PAGE),
+    crate::va::VaRanges::new(STACKS_WINDOW + PAGE, KERNEL_STACKS_SIZE - PAGE),
 );
 /// Highest stack address handed out, for `is_kernel_stack_guard`, which
 /// runs on the fatal-fault path and so takes no lock.
-static STACK_HIGH: AtomicU64 = AtomicU64::new(KERNEL_STACKS_BASE);
+static STACK_HIGH: AtomicU64 = AtomicU64::new(STACKS_WINDOW);
 
 /// A kernel stack: mapped pages with an unmapped guard page directly
 /// below them (SR-17). Overflowing it faults on the guard page; the fault
@@ -524,11 +591,10 @@ pub fn map_kernel_stack(pages: u64) -> Option<KernelStack> {
     let mut va = STACK_VA.lock();
     let choice = va.choose(pages)?;
     let base = choice.start;
-    map_fresh_pages(
-        base,
-        pages,
-        KERNEL_STACKS_BASE..KERNEL_STACKS_BASE + KERNEL_STACKS_SIZE,
-    )
+    map_fresh_pages(base, pages, {
+        let base = STACKS_BASE.load(Ordering::Acquire);
+        base..base + KERNEL_STACKS_SIZE
+    })
     .ok()?;
     va.commit(choice);
     STACK_HIGH.fetch_max(base + (pages + 1) * PAGE, Ordering::AcqRel);
@@ -561,12 +627,12 @@ pub fn unmap_kernel_stack(stack: KernelStack) {
 /// Bytes of the kernel-stack region handed out so far (its high-water
 /// mark; F-0009's regression test).
 pub fn kernel_stack_space_used() -> u64 {
-    STACK_HIGH.load(Ordering::Acquire) - KERNEL_STACKS_BASE
+    STACK_HIGH.load(Ordering::Acquire) - STACKS_BASE.load(Ordering::Acquire)
 }
 
 /// Whether `address` is in the guard page of some kernel stack.
 pub fn is_kernel_stack_guard(address: u64) -> bool {
-    (KERNEL_STACKS_BASE..STACK_HIGH.load(Ordering::Acquire)).contains(&address)
+    (STACKS_BASE.load(Ordering::Acquire)..STACK_HIGH.load(Ordering::Acquire)).contains(&address)
         && translate(address).is_none()
 }
 
@@ -590,7 +656,7 @@ pub fn unmap_heap_pages(virt: u64, pages: u64) {
     let _guard = TABLES.lock();
     for i in 0..pages {
         let page = virt + i * PAGE;
-        if (KERNEL_HEAP_BASE..KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE).contains(&page) {
+        if kernel_heap_region().contains(&page) {
             unmap_locked(root, page);
         }
     }

@@ -387,6 +387,8 @@ fn phase1(t: &mut Runner) {
     phase1_exec(t);
     phase1_mitigations(t);
     phase1_robustness(t);
+    phase1_resource_limits(t);
+    phase1_audit_small_items(t);
     phase1_fuzz_smoke(t);
 
     // Phase 1 acceptance marker, printed only when every test above
@@ -608,8 +610,7 @@ pub fn phase1_heap(t: &mut Runner) {
         .is_some_and(|t| t.flags.writable && !t.flags.executable && !t.flags.user)
         && paging::translate(start + LARGE as u64 - 1).is_some()
         && paging::translate(start + LARGE as u64).is_none()
-        && (paging::KERNEL_HEAP_BASE..paging::KERNEL_HEAP_BASE + paging::KERNEL_HEAP_SIZE)
-            .contains(&start);
+        && paging::kernel_heap_region().contains(&start);
     let content_ok = block.iter().all(|&b| b == 0xAB);
     drop(block);
     let after_free = memory::free_frames();
@@ -1473,6 +1474,194 @@ pub fn phase1_robustness(t: &mut Runner) {
         "a 128 MiB getrandom takes the generator's lock once, not per chunk (F-0010)",
     );
     kprintln!("  generator draws while longcall ran: {draws}");
+}
+
+/// Runs `/test/<name>` with `args` and waits for it.
+fn run_test_program(path: &[u8], args: &[&[u8]]) -> Option<(i64, Option<sched::UserFault>)> {
+    let file = keel_linux_abi::fs::read_file(path).ok()?;
+    let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
+    let spawned = keel_linux_abi::process::spawn("limits", &loaded).ok()?;
+    join(spawned.thread);
+    sched::exit_status(spawned.thread)
+}
+
+/// F-0011 (audit 2, A1 and A2): a user program cannot make the kernel run
+/// out of memory. Mapping, creating files and calling into the kernel all
+/// end in ENOMEM or ENOSPC while the kernel keeps running.
+pub fn phase1_resource_limits(t: &mut Runner) {
+    // The audit's proof of concept: single PROT_NONE pages at spaced hints.
+    const MAPLIMIT: &[u8] = b"/test/maplimit";
+    let hint = run_test_program(MAPLIMIT, &[MAPLIMIT, b"hint"]);
+    t.check(
+        "limits.map_count",
+        hint == Some((0, None)),
+        "mapping single pages in a loop ends in ENOMEM at the 65530-mapping cap; the kernel keeps running (F-0011)",
+    );
+
+    // mmap(NULL) to the cap, with a kernel thread counting 5 ms sleeps
+    // meanwhile: placing each mapping must not stall the kernel (A2).
+    static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    STOP.store(false, Ordering::Relaxed);
+    let ticker = sched::spawn("ticker", || {
+        while !STOP.load(Ordering::Relaxed) {
+            sched::sleep_ms(5);
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let ticks_before = TICKS.load(Ordering::Relaxed);
+    let begin = time::monotonic_nanos();
+    let null = run_test_program(MAPLIMIT, &[MAPLIMIT, b"null"]);
+    let elapsed_ms = (time::monotonic_nanos() - begin) / 1_000_000;
+    let ticks = TICKS.load(Ordering::Relaxed) - ticks_before;
+    STOP.store(true, Ordering::Relaxed);
+    if let Ok(id) = ticker {
+        join(id);
+    }
+    t.check(
+        "limits.map_null_preemptible",
+        null == Some((0, None)) && ticks >= (elapsed_ms / 50).max(1),
+        "mmap(NULL) up to the cap ends in ENOMEM, and a kernel thread keeps running throughout (A2)",
+    );
+    kprintln!("  maplimit null: {elapsed_ms} ms, ticker ran {ticks} times, exit {null:?}");
+
+    // Creating files until the node cap. The cap is lowered to 200 more
+    // nodes than exist, so the run is short and later tests still have room.
+    let room = 200;
+    let old_limit = keel_linux_abi::fs::with(|fs| {
+        let nodes = fs.usage().1;
+        Ok(fs.set_node_limit(nodes + room))
+    });
+    let flood = run_test_program(b"/test/fileflood", &[b"/test/fileflood"]);
+    let nodes_after = keel_linux_abi::fs::usage().1;
+    if let Ok(old) = old_limit {
+        let _ = keel_linux_abi::fs::with(|fs| Ok(fs.set_node_limit(old)));
+    }
+    t.check(
+        "limits.tmpfs_nodes",
+        old_limit.is_ok() && flood == Some((0, None)),
+        "creating files in a loop ends in ENOSPC at the node cap; the kernel keeps running (F-0011)",
+    );
+    kprintln!("  fileflood: exit {flood:?}, {nodes_after} nodes");
+
+    // With only the kernel's reserve free, calls that would make the kernel
+    // allocate are refused with ENOMEM. The program is loaded first, then
+    // the reserve is raised while it loops.
+    const RESERVECALL: &[u8] = b"/test/reservecall";
+    let refused_before = keel_linux_abi::syscall::reserve_refusals();
+    let reserve = keel_linux_abi::fs::read_file(RESERVECALL)
+        .ok()
+        .and_then(|file| {
+            let loaded =
+                keel_linux_abi::exec::load(&file, RESERVECALL, &[RESERVECALL], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("reservecall", &loaded).ok()?;
+            sched::sleep_ms(20);
+            let old = memory::set_user_reserve(memory::free_frames() + 16);
+            join(spawned.thread);
+            memory::set_user_reserve(old);
+            sched::exit_status(spawned.thread)
+        });
+    let refused = keel_linux_abi::syscall::reserve_refusals() - refused_before;
+    t.check(
+        "limits.reserve_admission",
+        reserve == Some((0, None)) && refused > 0,
+        "with only the kernel's reserve free, system calls are refused with ENOMEM instead of taking it (F-0011)",
+    );
+
+    // A3: console writes on a UART at least as slow as a real one (115200 baud,
+    // 8N1: 11,520 bytes a second) must not keep interrupts off. A kernel
+    // thread counting 5 ms sleeps keeps running while a program writes
+    // 8 KiB to the console: about 0.7 s of transmission, each 4 KiB write
+    // 0.36 s with interrupts off if it went out in one piece. (Kept small:
+    // under nested KVM each UART port access is an exit to QEMU, about
+    // 0.5 ms a byte in CI, so 32 KiB overran the 15 s join.)
+    use keel_hal::drivers::serial::TEST_BYTE_DELAY_NS;
+    STOP.store(false, Ordering::Relaxed);
+    let ticker = sched::spawn("ticker", || {
+        while !STOP.load(Ordering::Relaxed) {
+            sched::sleep_ms(5);
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let ticks_before = TICKS.load(Ordering::Relaxed);
+    let begin = time::monotonic_nanos();
+    TEST_BYTE_DELAY_NS.store(1_000_000_000 / 11_520, Ordering::Relaxed);
+    let flood = run_test_program(b"/test/conflood", &[b"/test/conflood"]);
+    TEST_BYTE_DELAY_NS.store(0, Ordering::Relaxed);
+    let elapsed_ms = (time::monotonic_nanos() - begin) / 1_000_000;
+    let ticks = TICKS.load(Ordering::Relaxed) - ticks_before;
+    STOP.store(true, Ordering::Relaxed);
+    if let Ok(id) = ticker {
+        join(id);
+    }
+    t.check(
+        "console.slow_uart_preemptible",
+        flood == Some((0, None)) && elapsed_ms >= 500 && ticks >= elapsed_ms / 50,
+        "a program flooding a real-speed UART does not keep interrupts off: a kernel thread keeps running (A3)",
+    );
+    kprintln!("  conflood: {elapsed_ms} ms, ticker ran {ticks} times, exit {flood:?}");
+
+    // A4: the branch-predictor barrier between processes is keyed on an id
+    // that a new address space never shares with a freed one, even when it
+    // gets the freed one's table frame. In this boot sequence it does get
+    // that frame (logged below), so keying on the table address, as before,
+    // fails this test; the allocator does not promise the reuse, so the
+    // check does not require it.
+    use keel_hal::vm::AddressSpace;
+    let barrier = AddressSpace::new().ok().and_then(|a| {
+        sched::note_user_space(&a);
+        let same_again = sched::note_user_space(&a);
+        let (a_id, a_root) = (a.id(), a.user_root());
+        drop(a);
+        let b = AddressSpace::new().ok()?;
+        let changed = sched::note_user_space(&b);
+        Some((same_again, changed, b.id() != a_id, b.user_root() == a_root))
+    });
+    t.check(
+        "mitigations.ibpb_keyed_by_space_id",
+        matches!(barrier, Some((false, true, true, _))),
+        "a dropped and recreated address space gets a new id and a barrier; the same space again does not (A4)",
+    );
+    if let Some((_, _, _, reused)) = barrier {
+        kprintln!("  new address space reused the old table frame: {reused}");
+    }
+}
+
+/// Audit 2, A7: small robustness items that can be observed.
+pub fn phase1_audit_small_items(t: &mut Runner) {
+    // A7.2: exit statuses of finished threads are not kept for ever.
+    let mut last = None;
+    for _ in 0..1100 {
+        if let Ok(id) = sched::spawn("short", || {}) {
+            join(id);
+            last = Some(id);
+        }
+    }
+    let kept = sched::exited_count();
+    t.check(
+        "sched.exited_bounded",
+        last.is_some_and(|id| sched::exit_status(id).is_some()) && kept <= 1024,
+        "after 1100 threads exit, at most 1024 statuses are kept and the latest is still there (A7.2)",
+    );
+    kprintln!("  exit statuses kept: {kept}");
+
+    // A6: a directory handle confines lookups made through it.
+    let confined = run_test_program(b"/test/dirconfine", &[b"/test/dirconfine"]);
+    t.check(
+        "fs.dirfd_confines",
+        confined == Some((0, None)),
+        "`..` through a directory handle stops at that directory; creating through it lands beneath it (A6)",
+    );
+    if confined != Some((0, None)) {
+        kprintln!("  dirconfine: exit {confined:?}");
+    }
+
+    // A7.5: no global translations: CR4.PGE is clear.
+    t.check(
+        "paging.no_global_pages",
+        cpu::read_cr4() & cpu::CR4_PGE == 0,
+        "CR4.PGE is clear, so a CR3 write leaves no stale global translation (A7.5)",
+    );
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200

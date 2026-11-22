@@ -337,9 +337,12 @@ pub(crate) extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
         crate::syscall::dispatch(frame);
     } else if vector == 14 && crate::vm::handle_page_fault(frame, super::cpu::read_cr2()) {
         // Resolved (demand paging, copy-on-write, or a user-copy fixup).
-    } else if from_user && vector < 32 && !matches!(vector, 2 | 18) {
+    } else if from_user && vector < 32 && !matches!(vector, 2 | 8 | 18) {
         // A user program faulted. Until signals exist (Phase 3) that ends
-        // the thread; the kernel carries on.
+        // the thread; the kernel carries on. NMI (2), double fault (8) and
+        // machine check (18) are never a user program's fault, whatever the
+        // saved CS says, and run on IST stacks; they stay fatal (audit 2,
+        // A7.1).
         crate::syscall::user_fault(frame);
     } else {
         dispatch_kernel(frame);
