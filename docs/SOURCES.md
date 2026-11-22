@@ -128,3 +128,6 @@ against copies downloaded from the vendors:
 | GitHub changelog 2024-04-02, hardware acceleration on hosted Linux runners (KVM udev rule) | `.github/workflows/*.yml` |
 | The Rust Reference, "Comments" and "Tokens" | Lexer for the `unsafe` census in `xtask/src/audit.rs` |
 | Limine 12.9.6 `.github/workflows/release.yml` and `README.md` (binary release assets and their GPG signatures) | Limine pin procedure in `docs/DEPENDENCIES.md` |
+| Linux `drivers/char/random.c` at v6.12: `get_random_bytes_user` (one `crng_make_state` per call, then ChaCha20 blocks without the lock) and `crng_reseed` / `crng_reseed_interval` (reseeding scheduled by jiffies; no clock read on the output path), read 2026-11-22 | `Stream` in `kernel/core/src/rng.rs`, `stream` and the tick-based reseed in `kernel/hal/src/random.rs`, `getrandom` in `kernel/linux-abi/src/syscall.rs` (F-0010) |
+| QEMU 8.2.2 `target/i386/cpu.c`: CPUID 0x80000007 EDX `unmigratable_flags = CPUID_APM_INVTSC`, `DEFINE_PROP_BOOL("migratable", X86CPU, migratable, true)` (so `-cpu host` hides invariant TSC by default), read 2026-11-22 | Diagnosis of F-0010 (CI's KVM guest uses the HPET clock) |
+| Intel SDM Vol. 3 (325384-093US), section 28.1.2, "Instructions That Cause VM Exits Unconditionally" (CPUID, GETSEC, INVD, XSETBV) | `TSC_CLOCK` in `kernel/hal/src/time.rs` (F-0010) |

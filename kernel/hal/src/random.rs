@@ -17,7 +17,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use keel_core::rng::Rng;
+use keel_core::rng::{Rng, Stream};
 
 use crate::arch::x86_64::cpu;
 use crate::sync::IrqMutex;
@@ -164,16 +164,30 @@ pub fn add_interrupt_timing() {
     TIMING[slot % 64].fetch_xor(tsc.rotate_left((slot % 64) as u32), Ordering::Relaxed);
 }
 
-/// Reseed interval: 60 s, as Linux.
-const RESEED_INTERVAL_NS: u64 = 60_000_000_000;
+/// Reseed interval: 60 s, as Linux, counted in timer ticks. Linux
+/// schedules its reseed by jiffies (`crng_reseed_interval`,
+/// drivers/char/random.c v6.12) and reads no clock when producing output;
+/// here too a request never touches a clock device. Reading the clock per
+/// request cost an HPET access and two CPUIDs, which under KVM are exits
+/// to the hypervisor: a 128 MiB getrandom took over 15 s in CI (F-0010).
+const RESEED_INTERVAL_TICKS: u64 = 60 * crate::time::TICK_HZ;
 
 struct State {
     rng: Rng,
     quality: Quality,
-    last_reseed_ns: u64,
+    last_reseed_tick: u64,
 }
 
 static STATE: IrqMutex<Option<State>> = IrqMutex::new(None);
+
+/// Requests served (each takes the generator's lock once), for the F-0010
+/// regression test.
+static DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the generator has been asked for output since boot.
+pub fn draws() -> u64 {
+    DRAWS.load(Ordering::Relaxed)
+}
 
 /// Mixes everything available into `rng`; returns whether a hardware
 /// source contributed.
@@ -232,39 +246,52 @@ pub fn init() -> Quality {
     *guard = Some(State {
         rng,
         quality,
-        last_reseed_ns: crate::time::monotonic_nanos(),
+        last_reseed_tick: crate::time::ticks(),
     });
     quality
 }
 
-/// Fills `buf` with random bytes and says how the generator was seeded.
-pub fn fill(buf: &mut [u8]) -> Quality {
+/// Runs `f` on the seeded generator, reseeding first if the interval has
+/// passed.
+fn with_generator<R>(f: impl FnOnce(&mut State) -> R) -> R {
     if STATE.lock().is_none() {
         init();
     }
+    DRAWS.fetch_add(1, Ordering::Relaxed);
     let mut guard = STATE.lock();
     let state = guard.as_mut().expect("seeded by init");
-    let now = crate::time::monotonic_nanos();
-    if now.saturating_sub(state.last_reseed_ns) >= RESEED_INTERVAL_NS {
+    let now = crate::time::ticks();
+    if now.wrapping_sub(state.last_reseed_tick) >= RESEED_INTERVAL_TICKS {
         if collect(&mut state.rng) {
             state.quality = Quality::Hardware;
         }
         state.rng.reseed();
-        state.last_reseed_ns = now;
+        state.last_reseed_tick = now;
     }
-    let filled = state.rng.fill(buf);
-    debug_assert!(filled, "the generator is seeded before use");
-    state.quality
+    f(state)
+}
+
+/// Fills `buf` with random bytes and says how the generator was seeded.
+pub fn fill(buf: &mut [u8]) -> Quality {
+    with_generator(|state| {
+        let filled = state.rng.fill(buf);
+        debug_assert!(filled, "the generator is seeded before use");
+        state.quality
+    })
+}
+
+/// A keystream for one large request (getrandom, a read of
+/// `/dev/urandom`), keyed from the generator under one lock; the caller
+/// then fills any amount without the lock (Linux v6.12
+/// `get_random_bytes_user`).
+pub fn stream() -> (Stream, Quality) {
+    with_generator(|state| {
+        let stream = state.rng.stream().expect("seeded by init");
+        (stream, state.quality)
+    })
 }
 
 /// A uniformly distributed value below `bound`, for address randomization.
 pub fn below(bound: u64) -> u64 {
-    if STATE.lock().is_none() {
-        init();
-    }
-    STATE
-        .lock()
-        .as_mut()
-        .and_then(|s| s.rng.below(bound))
-        .unwrap_or(0)
+    with_generator(|state| state.rng.below(bound).unwrap_or(0))
 }

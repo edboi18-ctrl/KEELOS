@@ -1416,6 +1416,7 @@ pub fn phase1_robustness(t: &mut Runner) {
     });
     const PATH: &[u8] = b"/test/longcall";
     let ticks_before = TICKS.load(Ordering::Relaxed);
+    let draws_before = keel_hal::random::draws();
     let begin = time::monotonic_nanos();
     let status = keel_linux_abi::fs::read_file(PATH).ok().and_then(|file| {
         let loaded = keel_linux_abi::exec::load(&file, PATH, &[PATH], &[]).ok()?;
@@ -1425,6 +1426,7 @@ pub fn phase1_robustness(t: &mut Runner) {
     });
     let elapsed_ms = (time::monotonic_nanos() - begin) / 1_000_000;
     let ticks = TICKS.load(Ordering::Relaxed) - ticks_before;
+    let draws = keel_hal::random::draws() - draws_before;
     STOP.store(true, Ordering::Relaxed);
     if let Ok(id) = ticker {
         join(id);
@@ -1437,6 +1439,16 @@ pub fn phase1_robustness(t: &mut Runner) {
         "a kernel thread keeps running while a user program is inside one long system call (F-0008)",
     );
     kprintln!("  longcall: {elapsed_ms} ms, ticker ran {ticks} times, exit {status:?}");
+    // F-0010: the 128 MiB getrandom draws from the generator once, not
+    // once per 256 bytes (524,288 draws, each reading a clock device,
+    // which under KVM took over 15 s). Loading the program draws a few
+    // more for address randomization and AT_RANDOM.
+    t.check(
+        "random.one_draw_per_getrandom",
+        status == Some((0, None)) && draws <= 16,
+        "a 128 MiB getrandom takes the generator's lock once, not per chunk (F-0010)",
+    );
+    kprintln!("  generator draws while longcall ran: {draws}");
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200

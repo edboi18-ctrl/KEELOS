@@ -100,6 +100,16 @@ impl Rng {
         true
     }
 
+    /// A keystream for one large request, keyed with fresh output of this
+    /// generator, so the caller can produce many bytes without holding the
+    /// generator (Linux v6.12 `get_random_bytes_user`: `crng_make_state`
+    /// once per call, then ChaCha20 blocks in a loop). `None` if the
+    /// generator was never seeded.
+    pub fn stream(&mut self) -> Option<Stream> {
+        let mut key = [0u8; 32];
+        self.fill(&mut key).then_some(Stream { key, block: 0 })
+    }
+
     /// A uniformly distributed value below `bound` (> 0), by rejection.
     pub fn below(&mut self, bound: u64) -> Option<u64> {
         if bound == 0 {
@@ -117,6 +127,39 @@ impl Rng {
                 return Some(value % bound);
             }
         }
+    }
+}
+
+/// ChaCha20 keystream for one request (see [`Rng::stream`]). Every call
+/// to [`Stream::fill`] starts at a fresh block, so no keystream byte is
+/// ever given out twice; the key is overwritten when the stream is
+/// dropped (best effort, as in [`Rng::fill`]).
+pub struct Stream {
+    key: [u8; 32],
+    /// Next block number: the low 32 bits are ChaCha20's block counter,
+    /// the high 32 bits go in the nonce (RFC 8439 section 2.3), so the
+    /// counter never wraps onto an earlier block.
+    block: u64,
+}
+
+impl Stream {
+    pub fn fill(&mut self, out: &mut [u8]) {
+        for chunk in out.chunks_mut(64) {
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&((self.block >> 32) as u32).to_le_bytes());
+            let mut block = chacha20_block(&self.key, self.block as u32, &nonce);
+            self.block = self.block.wrapping_add(1);
+            chunk.copy_from_slice(&block[..chunk.len()]);
+            block.fill(0);
+            core::hint::black_box(&block);
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.key.fill(0);
+        core::hint::black_box(&self.key);
     }
 }
 
@@ -181,6 +224,43 @@ mod tests {
         two.fill(&mut b);
         assert_ne!(a, b);
         assert_eq!(two.pending(), 0);
+    }
+
+    #[test]
+    fn stream_needs_a_seed_and_never_repeats() {
+        let mut rng = Rng::new();
+        assert!(rng.stream().is_none());
+        rng.mix(b"stream");
+        rng.reseed();
+        let mut one = rng.stream().unwrap();
+        let mut two = rng.stream().unwrap();
+        assert_ne!(one.key, two.key, "each stream has its own key");
+        // Partial blocks still advance: no byte is given out twice.
+        let mut a = [0u8; 10];
+        let mut b = [0u8; 64];
+        one.fill(&mut a);
+        one.fill(&mut b);
+        assert_ne!(a[..], b[..10]);
+        assert_eq!(one.block, 2);
+        let mut c = [0u8; 64];
+        two.fill(&mut c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn stream_is_chacha20_with_the_block_number_split_over_counter_and_nonce() {
+        let key = [7u8; 32];
+        let mut stream = Stream {
+            key,
+            block: (5 << 32) | 0xffff_ffff,
+        };
+        let mut out = [0u8; 128];
+        stream.fill(&mut out);
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(out[..64], chacha20_block(&key, u32::MAX, &nonce));
+        nonce[..4].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(out[64..], chacha20_block(&key, 0, &nonce));
     }
 
     #[test]

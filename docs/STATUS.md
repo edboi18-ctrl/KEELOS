@@ -112,7 +112,8 @@ run that does not end within 10 minutes, or a harness wake-up more than
 5 s late (kernel not preempting). Every phase 1 boot also runs a short
 smoke (`fuzz.smoke`). The first sessions found F-0005 to F-0008, all
 fixed with regression tests, and a check of frame use after the first
-one-hour session found F-0009 (also fixed). **Passed on the final code:**
+one-hour session found F-0009, and CI under KVM found F-0010 (both
+fixed). **Passed on the final code:**
 `cargo xtask fuzz --minutes 60 --seed 20261122` (no KVM): 62 runs,
 124,434 system calls, 3,781 s, no panic, no hung run, worst harness
 wake-up delay 702 ms. Free frames went 1,034,119 → 1,034,108. All 11
@@ -137,7 +138,7 @@ Hardening notes for later Phase 1 work:
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
-- `cargo xtask test --phase 1`: 86 in-kernel tests pass and `KEEL P1 OK`
+- `cargo xtask test --phase 1`: 87 in-kernel tests pass and `KEEL P1 OK`
   is on serial; the five fault scenarios (`double_fault`,
   `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`) pass; the
   boots land at different kernel addresses (KASLR); and the user test
@@ -145,7 +146,7 @@ Hardening notes for later Phase 1 work:
   fail when the marker is not printed.
 - `cargo xtask fuzz --minutes 60 --seed 20261122`: passes (see security
   acceptance item 6 above).
-- `cargo test`: 158 host unit tests pass (94 `keel-core`, 29 `keel-hal`,
+- `cargo test`: 160 host unit tests pass (96 `keel-core`, 29 `keel-hal`,
   5 `keel-linux-abi`, 30 `xtask`).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image

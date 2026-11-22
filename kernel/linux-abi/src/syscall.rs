@@ -687,11 +687,14 @@ fn getrandom(buf: u64, count: u64, flags: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let count = count.min(MAX_RW_COUNT) as usize;
+    // One draw from the generator per call, as Linux (F-0010): the
+    // stream then produces every chunk without the generator's lock.
+    let (mut stream, _) = random::stream();
     let mut chunk = [0u8; 256];
     let mut done = 0usize;
     while done < count {
         let n = (count - done).min(chunk.len());
-        random::fill(&mut chunk[..n]);
+        stream.fill(&mut chunk[..n]);
         if copy_to_user(buf + done as u64, &chunk[..n]).is_err() {
             return if done == 0 {
                 Err(Errno::EFAULT)

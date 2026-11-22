@@ -9,7 +9,7 @@
 //! one-shot and periodic modes, divide configuration) and section 20.17.1
 //! (invariant TSC).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::x86_64::{apic, cpu, paging};
 use crate::interrupts;
@@ -28,6 +28,13 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static TSC_START: AtomicU64 = AtomicU64::new(0);
 static HPET_START: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Whether the monotonic clock reads the TSC: set once by `init`, from
+/// CPUID (invariant TSC, a fixed property of the CPU) and a calibrated
+/// frequency. Decided once because CPUID always exits to the hypervisor
+/// under hardware virtualization (Intel SDM Vol. 3, 325384-093US, section
+/// 28.1.2, "Instructions That Cause VM Exits Unconditionally"), which made
+/// every clock read two VM exits (F-0010).
+static TSC_CLOCK: AtomicBool = AtomicBool::new(false);
 
 fn hpet_read(offset: u64) -> u64 {
     let base = HPET_BASE.load(Ordering::Acquire);
@@ -65,8 +72,8 @@ pub fn hpet_nanos() -> u64 {
 /// Monotonic nanoseconds since `init`: from the TSC when it is invariant
 /// (cheap, no device access), otherwise from the HPET.
 pub fn monotonic_nanos() -> u64 {
-    let hz = TSC_HZ.load(Ordering::Relaxed);
-    if hz != 0 && cpu::invariant_tsc() {
+    if TSC_CLOCK.load(Ordering::Relaxed) {
+        let hz = TSC_HZ.load(Ordering::Relaxed);
         let cycles = cpu::read_tsc().wrapping_sub(TSC_START.load(Ordering::Relaxed));
         (u128::from(cycles) * 1_000_000_000 / u128::from(hz)) as u64
     } else {
@@ -144,6 +151,8 @@ pub fn init() -> Result<TimeReport, TimeError> {
     TSC_HZ.store(tsc_hz, Ordering::Relaxed);
     TSC_START.store(cpu::read_tsc(), Ordering::Relaxed);
     HPET_START.store(hpet_counter(), Ordering::Relaxed);
+    let invariant_tsc = cpu::invariant_tsc();
+    TSC_CLOCK.store(tsc_hz != 0 && invariant_tsc, Ordering::Relaxed);
 
     // Periodic 1 kHz tick.
     if !interrupts::set_handler(TIMER_VECTOR, on_tick) {
@@ -163,6 +172,6 @@ pub fn init() -> Result<TimeReport, TimeError> {
         hpet_period_fs: period,
         lapic_timer_hz: lapic_hz,
         tsc_hz,
-        invariant_tsc: cpu::invariant_tsc(),
+        invariant_tsc,
     })
 }

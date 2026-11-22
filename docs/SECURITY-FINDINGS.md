@@ -12,7 +12,51 @@ None.
 
 F-0005 to F-0009 were found on 2026-11-22 by the system-call fuzzer
 (`cargo xtask fuzz`, security acceptance P1 item 6), each a denial of
-service reachable from an unprivileged user program.
+service reachable from an unprivileged user program. F-0010, of the same
+kind, was found the same day by CI.
+
+### F-0010: getrandom read a clock device for every 256 bytes
+
+Found 2026-11-22 by CI, not by the fuzzer: `sched.syscall_preemptible`
+failed on 5 of 6 pushes to the working branch under KVM (GitHub-hosted
+runner, Intel model 0xAD), always the same way: `longcall` (one 128 MiB
+getrandom) did not finish within 15 s, while the ticker thread kept
+running normally (about 2,490 ticks), so preemption (F-0008) was not
+the problem. Under QEMU TCG locally the same call took 4.3 s. These CI
+failures went unnoticed for several pushes because CI was not checked
+after each one.
+
+Cause. `getrandom` drew from the generator once per 256-byte chunk
+(524,288 draws for 128 MiB), and every draw read the monotonic clock to
+decide whether 60 s had passed since the last reseed. Each clock read
+ran CPUID twice (to ask whether the TSC is invariant), and CPUID always
+causes a VM exit (Intel SDM Vol. 3, section 28.1.2). QEMU's `-cpu host`
+also hides invariant TSC by default (QEMU 8.2.2 `target/i386/cpu.c`:
+`unmigratable_flags = CPUID_APM_INVTSC`, `migratable` defaults to true),
+so the clock fell back to the HPET, an emulated device whose every read
+is a further exit to QEMU. On a nested-virtualization runner that is
+about 1.5 million expensive exits for one system call. A Windows program
+asking for random bytes in a loop would have been just as slow on any
+virtual machine.
+
+Fix, following Linux v6.12 `drivers/char/random.c`:
+- `hal::random` checks the reseed interval in timer ticks
+  (`time::ticks()`, an in-memory counter), as Linux uses jiffies; no
+  random-number request touches a clock device.
+- `getrandom` takes one `keel_core::rng::Stream` per call (keyed with
+  fresh generator output under the lock once, as `get_random_bytes_user`
+  does with `crng_make_state`) and fills every chunk from it without the
+  lock.
+- `time::monotonic_nanos` decides once at boot whether to use the TSC
+  instead of running CPUID on every read.
+
+Regression test: `random.one_draw_per_getrandom` counts generator draws
+while `longcall` runs: 5 with the fix (loading the program draws a few
+for address randomization), 524,293 with the per-chunk draw restored,
+which makes the test fail. Host tests cover `Stream` (needs a seed, no
+keystream byte given out twice, block number split over counter and
+nonce). Under TCG `longcall` went from 4.3 s to 3.5 s; the KVM result is
+whatever the next CI run shows.
 
 ### F-0009: kernel address space for heap pages and stacks was never reused
 
