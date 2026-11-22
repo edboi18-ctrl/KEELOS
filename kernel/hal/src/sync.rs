@@ -6,6 +6,11 @@
 //! it would spin forever on a uniprocessor. Holding these locks with
 //! interrupts disabled means no thread is ever switched out while holding
 //! one. Critical sections must therefore be short.
+//!
+//! Rule: any lock that code with interrupts disabled may take (interrupt
+//! handlers, system calls, the scheduler) must be an `IrqMutex`. A plain
+//! spinlock held by a preempted thread makes such code spin forever on
+//! one CPU. That happened with the console locks (F-0004).
 
 use core::ops::{Deref, DerefMut};
 
@@ -33,6 +38,26 @@ impl<T> IrqMutex<T> {
         IrqGuard {
             guard: Some(self.inner.lock()),
             interrupts_were_enabled,
+        }
+    }
+}
+
+impl<T> IrqMutex<T> {
+    /// Like `lock`, but gives up at once if the lock is taken (for the
+    /// panic path, which must not wait on a lock its own CPU may hold).
+    pub fn try_lock(&self) -> Option<IrqGuard<'_, T>> {
+        let interrupts_were_enabled = disable();
+        match self.inner.try_lock() {
+            Some(guard) => Some(IrqGuard {
+                guard: Some(guard),
+                interrupts_were_enabled,
+            }),
+            None => {
+                if interrupts_were_enabled {
+                    enable();
+                }
+                None
+            }
         }
     }
 }

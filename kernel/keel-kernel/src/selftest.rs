@@ -739,6 +739,28 @@ pub fn phase1_sched(t: &mut Runner) {
         "two threads kept their own XMM0 across 200 switches each",
     );
 
+    // F-0004 regression: while the console lock is held (here: while a
+    // kprintln! argument is being formatted), interrupts must be off, so
+    // the holder cannot be preempted and leave a system call spinning.
+    struct InterruptProbe;
+    static INTERRUPTS_DURING_PRINT: AtomicU8 = AtomicU8::new(2);
+    impl core::fmt::Display for InterruptProbe {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let on = cpu::interrupts_enabled();
+            INTERRUPTS_DURING_PRINT.store(u8::from(on), Ordering::Relaxed);
+            f.write_str("console lock probe")
+        }
+    }
+    let enabled_before = cpu::interrupts_enabled();
+    kprintln!("selftest: {InterruptProbe}");
+    t.check(
+        "console.lock_disables_interrupts",
+        enabled_before
+            && INTERRUPTS_DURING_PRINT.load(Ordering::Relaxed) == 0
+            && cpu::interrupts_enabled(),
+        "printing holds the console lock with interrupts off, and restores them after (F-0004)",
+    );
+
     // The bounded wait the self-tests use: it gives up on a thread that
     // is still running, and succeeds once it has finished.
     let sleeper = sched::spawn("sleeper", || sched::sleep_ms(100));

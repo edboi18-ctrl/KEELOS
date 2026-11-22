@@ -10,6 +10,29 @@ None.
 
 ## Closed
 
+### F-0004: a user write to the console could freeze the kernel
+
+- Found: 2026-11-22, the intermittent phase-1 test timeout (2 in about
+  60 full runs). Located with the QEMU register snapshot added for it:
+  RIP in `console::_print`, spinning on the framebuffer console's lock,
+  RFLAGS 0x2 (interrupts off), not halted.
+- Problem: the console locks (SERIAL, FRAMEBUFFER) were plain spinlocks.
+  A kernel thread printing with interrupts on (the echo thread, or the
+  boot thread) could be preempted while holding one; a system call,
+  which runs with interrupts off, then writing to /dev/console spun on it
+  forever, and with interrupts off the timer could never switch back to
+  the holder. Any program writing to the console while the kernel was
+  printing could freeze the whole machine: a denial of service reachable
+  from user mode. Present since the console became writable from user
+  mode (P1-T13); timing made it rare.
+- Fix: both console locks, and the interrupt-routing lock, are
+  `IrqMutex`es, which keep interrupts off while held, so a holder is
+  never preempted. `sync.rs` states the rule: any lock that code with
+  interrupts off may take must be an `IrqMutex`.
+- Regression test: `console.lock_disables_interrupts` (records the
+  interrupt flag from inside a print); checked to fail with the old
+  console code.
+
 ### F-0003: a context switch undid `with_address_space`
 
 - Found: 2026-11-22, from an intermittent failure of the `smap` scenario

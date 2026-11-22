@@ -13,8 +13,8 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::sync::IrqMutex;
 use keel_core::acpi::{IntiFlags, MadtEntry};
-use spin::Mutex;
 
 use crate::acpi::{self, TableError};
 use crate::arch::x86_64::apic::{self, IoApic, SPURIOUS_VECTOR};
@@ -33,7 +33,7 @@ struct Routing {
     bsp_apic_id: u32,
 }
 
-static ROUTING: Mutex<Option<Routing>> = Mutex::new(None);
+static ROUTING: IrqMutex<Option<Routing>> = IrqMutex::new(None);
 
 /// Called by the IDT stub for vectors 32-255, with interrupts disabled.
 pub(crate) fn dispatch(vector: u8) {

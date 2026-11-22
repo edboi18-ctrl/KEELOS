@@ -6,7 +6,7 @@
 
 use core::fmt::{self, Write};
 
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 use crate::boot;
 use crate::drivers::framebuffer::TextConsole;
@@ -15,9 +15,9 @@ use crate::drivers::serial::{COM1_BASE, SerialPort};
 // SAFETY: 0x3F8 is the standard COM1 base (or undecoded when the port is
 // not fitted). This static is the only long-lived handle; the panic path
 // creates a second one only after normal printing has stopped for good.
-static SERIAL: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(COM1_BASE) });
+static SERIAL: IrqMutex<SerialPort> = IrqMutex::new(unsafe { SerialPort::new(COM1_BASE) });
 
-static FRAMEBUFFER: Mutex<Option<TextConsole<'static>>> = Mutex::new(None);
+static FRAMEBUFFER: IrqMutex<Option<TextConsole<'static>>> = IrqMutex::new(None);
 
 /// Initialises COM1. Returns whether a UART answered the loopback test.
 pub fn init_serial() -> bool {
