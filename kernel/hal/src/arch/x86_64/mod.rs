@@ -1,11 +1,23 @@
 //! x86-64 primitives.
 
+#[cfg(target_os = "none")]
+pub mod apic;
 pub mod cpu;
+#[cfg(target_os = "none")]
+pub mod entry;
+#[cfg(target_os = "none")]
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
+#[cfg(target_os = "none")]
+pub mod paging;
 pub mod port;
 #[cfg(target_os = "none")]
 pub mod selftest;
+#[cfg(target_os = "none")]
+pub mod switch;
+#[cfg(target_os = "none")]
+pub mod userprog;
 
 #[cfg(target_os = "none")]
 use core::sync::atomic::{AtomicBool, Ordering};

@@ -8,6 +8,12 @@ compartment that starts with no authority.
 **Status:** early development. Keel is hardened by design but unaudited; do
 not describe it or rely on it as secure.
 
+**Boot chain:** the bootloader checks the kernel, the initramfs and its own
+config against hashes, so a corrupted or edited file is refused. This is
+not a verified boot: the bootloader is unsigned and Secure Boot is not
+used yet, so someone who can write the boot disk can replace everything
+together (`docs/adr/0010-enrolled-limine-config.md`).
+
 ## License
 
 The kernel and native user-space code are licensed under either of

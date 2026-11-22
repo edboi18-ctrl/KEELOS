@@ -1,0 +1,18 @@
+[package]
+name = "keel-std-tests"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Programs that use Rust's standard library, built for
+# x86_64-unknown-linux-musl (static), run on Linux and on Keel.
+[[bin]]
+name = "heap64"
+test = false
+bench = false
+
+[dependencies]
+
+[lints]
+workspace = true

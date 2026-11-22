@@ -14,8 +14,8 @@
 //!    wrong would misread the whole frame, so they are handled as
 //!    error-code vectors.
 //!
-//! Every vector 0-31 has a gate. Vectors 32-255 are left not present until
-//! the interrupt controllers are brought up (P1-T6).
+//! Every vector has a gate. Vectors 0-31 are exceptions; vectors 32-255
+//! are interrupts, dispatched to `crate::interrupts` (P1-T6).
 
 #[cfg(target_os = "none")]
 use core::arch::{asm, global_asm};
@@ -29,13 +29,15 @@ use super::gdt::{self, IstSlot, KERNEL_CS};
 
 /// Register state saved by the exception entry stub, in memory order.
 ///
-/// The stub pushes the general registers in the order rax, rbx, ..., r15,
-/// so r15 ends up at the lowest address. Above them sit the vector and
+/// Built by the entry code in entry.rs: a pad word, the general
+/// registers (r15 lowest), the CR3 at entry, rax, then the vector and
 /// error code pushed by the per-vector stub, then the five words the
 /// processor pushed (Figure 7-9).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrapFrame {
+    /// Alignment padding (keeps the frame a multiple of 16 bytes).
+    pub pad: u64,
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -50,8 +52,10 @@ pub struct TrapFrame {
     pub rdx: u64,
     pub rcx: u64,
     pub rbx: u64,
+    /// CR3 at entry; restored on exit (entry.rs).
+    pub saved_cr3: u64,
     pub rax: u64,
-    /// Vector number pushed by the stub.
+    /// Vector number pushed by the stub (0x100 for a system call).
     pub vector: u64,
     /// Error code from the processor, or 0 pushed by the stub.
     pub error_code: u64,
@@ -62,11 +66,15 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 22 * 8);
-// The common stub reads the saved CS at [rsp + 24] before the general
-// registers are pushed: vector at +0, error code at +8, RIP at +16.
-const _: () =
-    assert!(core::mem::offset_of!(TrapFrame, cs) - core::mem::offset_of!(TrapFrame, vector) == 24);
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 24 * 8);
+// entry.rs reads CS at [rsp + 40] counting from saved_cr3, and the vector
+// at [rsp + 16].
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, cs) - core::mem::offset_of!(TrapFrame, saved_cr3) == 40
+);
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, vector) - core::mem::offset_of!(TrapFrame, saved_cr3) == 16
+);
 
 // Assembly reasoning (spec section 1, rule 4) for the entry stubs.
 //
@@ -141,70 +149,30 @@ global_asm!(
     .irp vector, 8,10,11,12,13,14,17,21,29,30
         KEEL_VECTOR_ERROR_CODE \vector
     .endr
+    // Vectors 32-255 are interrupts (external or INT n); none pushes an
+    // error code (SDM Table 7-1, "User Defined (Non-reserved) Interrupts").
+    .irp vector, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+        KEEL_VECTOR_NO_ERROR_CODE \vector
+    .endr
 
-    keel_exception_common:
-        test qword ptr [rsp + 24], 3
-        jz 2f
-        swapgs
-    2:
-        push rax
-        push rbx
-        push rcx
-        push rdx
-        push rsi
-        push rdi
-        push rbp
-        push r8
-        push r9
-        push r10
-        push r11
-        push r12
-        push r13
-        push r14
-        push r15
-        cld
-        mov rdi, rsp
-        call {dispatch}
-        pop r15
-        pop r14
-        pop r13
-        pop r12
-        pop r11
-        pop r10
-        pop r9
-        pop r8
-        pop rbp
-        pop rdi
-        pop rsi
-        pop rdx
-        pop rcx
-        pop rbx
-        pop rax
-        test qword ptr [rsp + 24], 3
-        jz 3f
-        swapgs
-    3:
-        add rsp, 16
-        iretq
 
     .popsection
 
     .pushsection .data.keel_entry, "aw", @progbits
     .balign 8
     keel_exception_stubs:
-    .irp vector, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    .irp vector, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
         .quad keel_vector_\vector
     .endr
     .popsection
     "#,
-    dispatch = sym exception_dispatch,
 );
 
 #[cfg(target_os = "none")]
 unsafe extern "C" {
-    /// Entry addresses of the 32 exception stubs, in vector order. The
-    /// bootloader relocates the `.quad` values with the kernel image.
-    static keel_exception_stubs: [u64; 32];
+    /// Entry addresses of the 256 stubs, in vector order. The bootloader
+    /// relocates the `.quad` values with the kernel image.
+    static keel_exception_stubs: [u64; 256];
 }
 
 /// An IDT gate (Figure 7-8) as two 8-byte words.
@@ -245,7 +213,7 @@ unsafe impl Sync for Idt {}
 #[unsafe(link_section = ".data.keel_entry")]
 static IDT: Idt = Idt(UnsafeCell::new([[0; 2]; 256]));
 
-/// Loads the IDT with gates for the 32 exception vectors.
+/// Loads the IDT with gates for all 256 vectors.
 #[cfg(target_os = "none")]
 ///
 /// # Safety
@@ -254,7 +222,7 @@ static IDT: Idt = Idt(UnsafeCell::new([[0; 2]; 256]));
 pub unsafe fn init() {
     // SAFETY: the stub table is defined in the global_asm above, holds 32
     // relocated addresses and is never written after relocation.
-    let stubs: &[u64; 32] = unsafe { &keel_exception_stubs };
+    let stubs: &[u64; 256] = unsafe { &keel_exception_stubs };
     // SAFETY: by the contract, nothing else accesses the IDT now.
     let idt = unsafe { &mut *IDT.0.get() };
     for (vector, &stub) in stubs.iter().enumerate() {
@@ -325,6 +293,10 @@ pub fn breakpoint_count() -> u64 {
 pub struct FatalException {
     /// Vector number.
     pub vector: u64,
+    /// Error code pushed by the processor (0 for vectors without one).
+    pub error_code: u64,
+    /// CR2 for a page fault: the linear address that faulted.
+    pub fault_address: u64,
     /// Address of the saved TrapFrame, which tells which stack the handler
     /// ran on.
     pub frame_address: u64,
@@ -332,42 +304,88 @@ pub struct FatalException {
 
 static FATAL_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
 static FATAL_FRAME: AtomicU64 = AtomicU64::new(0);
+static FATAL_ERROR_CODE: AtomicU64 = AtomicU64::new(0);
+static FATAL_CR2: AtomicU64 = AtomicU64::new(0);
+/// Set on the first entry to `fatal`. A fault while the dump is being
+/// printed (or later, in the panic handler) re-enters `fatal`; without
+/// this it would print again, fault again, and never halt (audit
+/// finding 7).
+#[cfg(target_os = "none")]
+static FATAL_ENTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The fatal exception that caused the current panic, if any.
 pub fn last_fatal_exception() -> Option<FatalException> {
     let vector = FATAL_VECTOR.load(Ordering::Acquire);
     (vector != u64::MAX).then(|| FatalException {
         vector,
+        error_code: FATAL_ERROR_CODE.load(Ordering::Relaxed),
+        fault_address: FATAL_CR2.load(Ordering::Relaxed),
         frame_address: FATAL_FRAME.load(Ordering::Relaxed),
     })
 }
 
-/// Called by the common stub with interrupts disabled.
+/// Called by the common entry code (entry.rs) with interrupts disabled.
 #[cfg(target_os = "none")]
-extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
+pub(crate) extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
     // SAFETY: the stub passes the address of the TrapFrame it just built on
     // the current stack. It is valid, aligned, and exclusively ours until
     // this function returns.
     let frame = unsafe { &mut *frame };
-    match frame.vector {
+    let vector = frame.vector;
+    let from_user = frame.cs & 3 == 3;
+    if vector == super::entry::SYSCALL_VECTOR {
+        crate::syscall::dispatch(frame);
+    } else if vector == 14 && crate::vm::handle_page_fault(frame, super::cpu::read_cr2()) {
+        // Resolved (demand paging, copy-on-write, or a user-copy fixup).
+    } else if from_user && vector < 32 && !matches!(vector, 2 | 18) {
+        // A user program faulted. Until signals exist (Phase 3) that ends
+        // the thread; the kernel carries on.
+        crate::syscall::user_fault(frame);
+    } else {
+        dispatch_kernel(frame);
+    }
+    if frame.cs & 3 == 3 && !super::entry::prepare_user_return(frame) {
+        panic!("returning to user mode without a user address space");
+    }
+}
+
+#[cfg(target_os = "none")]
+fn dispatch_kernel(frame: &mut TrapFrame) {
+    let vector = frame.vector;
+    match vector {
+        32..=255 => crate::interrupts::dispatch(vector as u8),
         3 => {
             // #BP is a trap: the saved RIP already points after INT3, so
             // returning resumes execution (SDM section 7.15, Interrupt 3).
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
         }
+        // #GP from rdmsr_safe/wrmsr_safe: resume at their error return.
+        13 => match super::cpu::msr_fixup(frame.rip) {
+            Some(resume) => frame.rip = resume,
+            None => fatal(frame),
+        },
         _ => fatal(frame),
     }
 }
 
 #[cfg(target_os = "none")]
 fn fatal(frame: &TrapFrame) -> ! {
-    FATAL_FRAME.store(frame as *const TrapFrame as u64, Ordering::Relaxed);
-    FATAL_VECTOR.store(frame.vector, Ordering::Release);
-    let cr2 = if frame.vector == 14 {
+    if FATAL_ENTERED.swap(true, Ordering::AcqRel) {
+        // Nested: keep the first fault's record and print nothing that
+        // could fault again; the panic handler's own guard halts.
+        panic!("fault inside the fatal path");
+    }
+    // CR2 matters for #PF and for a #DF caused by a page fault (such as a
+    // stack running into its guard page).
+    let cr2 = if matches!(frame.vector, 8 | 14) {
         super::cpu::read_cr2()
     } else {
         0
     };
+    FATAL_FRAME.store(frame as *const TrapFrame as u64, Ordering::Relaxed);
+    FATAL_ERROR_CODE.store(frame.error_code, Ordering::Relaxed);
+    FATAL_CR2.store(cr2, Ordering::Relaxed);
+    FATAL_VECTOR.store(frame.vector, Ordering::Release);
     crate::console::emergency_print(format_args!("{}", Dump { frame, cr2 }));
     panic!(
         "unhandled exception {} at {:#018x}",
@@ -466,4 +484,19 @@ mod tests {
         assert_eq!(ist_for(18), 3);
         assert_eq!(ist_for(14), 0);
     }
+}
+
+/// Page-fault error code bits (SDM Vol. 3 section 7.15, Figure 7-11
+/// "Page-Fault Error Code").
+pub mod page_fault {
+    /// 1: protection violation; 0: page not present.
+    pub const PRESENT: u64 = 1 << 0;
+    /// 1: the access was a write.
+    pub const WRITE: u64 = 1 << 1;
+    /// 1: the access came from user mode.
+    pub const USER: u64 = 1 << 2;
+    /// 1: a reserved bit was set in a paging-structure entry.
+    pub const RESERVED: u64 = 1 << 3;
+    /// 1: the access was an instruction fetch.
+    pub const INSTRUCTION_FETCH: u64 = 1 << 4;
 }

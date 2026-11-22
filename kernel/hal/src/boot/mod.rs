@@ -262,6 +262,12 @@ pub fn rsdp() -> Option<&'static [u8; RSDP_V1_LEN]> {
     unsafe { address.cast::<[u8; RSDP_V1_LEN]>().as_ref() }
 }
 
+/// Physical address of the ACPI RSDP, when `rsdp` would return it.
+pub fn rsdp_physical() -> Option<u64> {
+    let virt = rsdp()? as *const [u8; RSDP_V1_LEN] as u64;
+    virt.checked_sub(hhdm_offset()?)
+}
+
 /// The boot framebuffer: its pixel memory and its layout.
 pub struct BootFramebuffer {
     /// Pixel memory, exactly as long as the layout requires.

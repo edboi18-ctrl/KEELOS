@@ -27,8 +27,9 @@ branch (`main`), enforcement **Active**:
 - [ ] Require status checks to pass, and add both CI jobs:
       `Audit and host tests` and `Build and boot tests (QEMU with KVM)`.
       They appear in the picker after CI has run once.
-- [ ] Do not add yourself to a bypass list unless you need it; a bypass
-      turns the rule into a suggestion.
+- [ ] Leave this branch ruleset's bypass list empty: a bypass turns the
+      rule into a suggestion. (The tag ruleset in section 4 is different:
+      there the bypass is how you, and only you, create release tags.)
 
 ## 3. Actions permissions (SR-32, SR-33)
 
@@ -51,8 +52,13 @@ branch (`main`), enforcement **Active**:
 
 **Settings → Rules → Rulesets → New tag ruleset**, target `v*`:
 
-- [ ] Restrict creations, updates, and deletions to yourself, so only you
-      can cause a release.
+- [ ] Tick **Restrict creations**, **Restrict updates** and **Restrict
+      deletions**.
+- [ ] Under **Bypass list**, click **Add bypass** and choose **Repository
+      admin** (mode "Always allow"). Without this the rule blocks you too,
+      and `git push origin v0.1.0` fails with "GH013 ... Cannot create ref
+      due to creations being restricted". With it, only you can create a
+      release tag.
 
 A release is made by tagging a commit that is already on `main`:
 

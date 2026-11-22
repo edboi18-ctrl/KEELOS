@@ -134,6 +134,30 @@ version = "0.0.0"
 dependencies = [
  "keel-core",
  "keel-hal",
+ "keel-linux-abi",
+]
+
+[[package]]
+name = "keel-linux-abi"
+version = "0.0.0"
+dependencies = [
+ "keel-core",
+ "keel-hal",
+]
+
+[[package]]
+name = "keel-rt"
+version = "0.0.0"
+
+[[package]]
+name = "keel-std-tests"
+version = "0.0.0"
+
+[[package]]
+name = "keel-user-tests"
+version = "0.0.0"
+dependencies = [
+ "keel-rt",
 ]
 
 [[package]]
@@ -177,5 +201,6 @@ version = "0.0.0"
 dependencies = [
  "blake2",
  "fatfs",
+ "keel-core",
  "sha2",
 ]

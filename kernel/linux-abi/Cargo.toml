@@ -1,0 +1,16 @@
+[package]
+name = "keel-linux-abi"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keel-core = { path = "../core" }
+
+# The kernel half of keel-hal exists only on the kernel target.
+[target.'cfg(target_os = "none")'.dependencies]
+keel-hal = { path = "../hal" }
+
+[lints]
+workspace = true

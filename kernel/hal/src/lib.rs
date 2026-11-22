@@ -7,11 +7,32 @@
 //! block required by spec section 1, rule 4.
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("Keel supports x86-64 only (spec section 2, non-goals).");
 
+#[cfg(target_os = "none")]
+pub mod acpi;
 pub mod arch;
 pub mod boot;
 pub mod console;
 pub mod drivers;
+pub mod heap;
+#[cfg(target_os = "none")]
+pub mod interrupts;
 pub mod memory;
+#[cfg(target_os = "none")]
+pub mod mitigations;
+#[cfg(target_os = "none")]
+pub mod random;
+#[cfg(target_os = "none")]
+pub mod sched;
+pub mod sync;
+#[cfg(target_os = "none")]
+pub mod syscall;
+#[cfg(target_os = "none")]
+pub mod time;
+pub mod va;
+#[cfg(target_os = "none")]
+pub mod vm;

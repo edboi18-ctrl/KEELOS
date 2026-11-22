@@ -3,20 +3,24 @@
 #![no_main]
 #![deny(unsafe_code)]
 
+extern crate alloc;
+
 mod selftest;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use keel_hal::arch::x86_64::cpu::halt_forever;
-use keel_hal::arch::x86_64::init_descriptor_tables;
+use keel_hal::arch::x86_64::{fpu, init_descriptor_tables, paging};
 use keel_hal::boot::{self, RegionKind};
 use keel_hal::drivers::debug_exit::{ExitCode, exit_qemu};
-use keel_hal::{console, kprintln, memory};
+use keel_hal::{console, interrupts, kprintln, memory, sched, time};
 
 /// Set once the command line asked for self-tests, so that a panic can
 /// report failure to the test harness instead of hanging until timeout.
 static TEST_MODE: AtomicBool = AtomicBool::new(false);
+/// Set on the first entry to the panic handler (audit finding 7).
+static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// Kernel entry point, named by `ENTRY(kmain)` in `linker.ld`.
 ///
@@ -56,18 +60,140 @@ extern "C" fn kmain() -> ! {
     report_boot_info(serial_ok, fb_size);
 
     match memory::init() {
-        Ok(stats) => kprintln!(
-            "mem: {} frames managed, {} free ({} MiB); bookkeeping at {:#x}..{:#x}",
-            stats.frames_managed,
-            stats.frames_free,
-            stats.frames_free * 4096 / (1024 * 1024),
-            stats.bookkeeping.start,
-            stats.bookkeeping.end
-        ),
+        Ok(stats) => {
+            kprintln!(
+                "mem: {} frames managed, {} free ({} MiB); bookkeeping at {:#x}..{:#x}",
+                stats.frames_managed,
+                stats.frames_free,
+                stats.frames_free * 4096 / (1024 * 1024),
+                stats.bookkeeping.start,
+                stats.bookkeeping.end
+            );
+            if stats.regions_skipped != 0 {
+                kprintln!(
+                    "mem: {} usable memory-map entries skipped (misaligned or overlapping)",
+                    stats.regions_skipped
+                );
+            }
+        }
         // Nothing past this point can work without physical memory.
         Err(error) => panic!("frame allocator setup failed: {error:?}"),
     }
 
+    match paging::init() {
+        Ok(report) => kprintln!(
+            "paging: own tables active; {} x 4 KiB + {} x 2 MiB pages; NX {}, WP on, SMEP {}, SMAP {}, UMIP {}",
+            report.summary.small_pages,
+            report.summary.large_pages,
+            on_off(report.features.nx),
+            on_off(report.features.smep),
+            on_off(report.features.smap),
+            on_off(report.features.umip),
+        ),
+        // Running on the bootloader's tables would mean no W^X and no
+        // guard pages; stop instead (SR-12).
+        Err(error) => panic!("page table setup failed: {error:?}"),
+    }
+    // Leave the bootloader's stack, which has no guard page, for one of
+    // the kernel's own (P1-S6, SR-17).
+    keel_hal::sched::continue_on_boot_stack(kmain_on_boot_stack)
+}
+
+/// The rest of boot, on the kernel's own guarded boot stack.
+extern "C" fn kmain_on_boot_stack() -> ! {
+    // System calls and user-mode entry, with page-table isolation.
+    keel_hal::arch::x86_64::entry::init(paging::kernel_root().map_or(0, |r| r.address()));
+    report_mitigations(&keel_hal::mitigations::init());
+
+    let fpu = fpu::init();
+    match fpu.xcr0 {
+        Some(xcr0) => kprintln!(
+            "fpu: XSAVE, XCR0 {xcr0:#x}, {} bytes per thread",
+            fpu.area_size
+        ),
+        None => kprintln!("fpu: FXSAVE, {} bytes per thread", fpu.area_size),
+    }
+
+    match interrupts::init() {
+        Ok(r) => kprintln!(
+            "apic: {} mode, boot CPU APIC ID {}, {} CPU(s) in MADT, {} I/O APIC(s) with {} inputs; legacy PIC masked",
+            if r.x2apic { "x2APIC" } else { "xAPIC" },
+            r.bsp_apic_id,
+            r.enabled_cpus,
+            r.io_apics,
+            r.gsis
+        ),
+        Err(error) => panic!("interrupt controller setup failed: {error:?}"),
+    }
+    match time::init() {
+        Ok(r) => kprintln!(
+            "time: HPET period {} fs; APIC timer {} kHz, ticking at {} Hz; TSC {} MHz ({})",
+            r.hpet_period_fs,
+            r.lapic_timer_hz / 1000,
+            time::TICK_HZ,
+            r.tsc_hz / 1_000_000,
+            if r.invariant_tsc {
+                "invariant"
+            } else {
+                "not invariant: clock uses the HPET"
+            }
+        ),
+        Err(error) => panic!("timer setup failed: {error:?}"),
+    }
+    // Random numbers (P1-S5, SR-16): BLAKE2s pool, ChaCha20 output.
+    match keel_hal::random::init() {
+        keel_hal::random::Quality::Hardware => kprintln!(
+            "random: seeded from {}{}TSC jitter; ChaCha20 generator, reseeded every 60 s",
+            if keel_hal::random::has_rdseed() {
+                "RDSEED, "
+            } else {
+                ""
+            },
+            if keel_hal::random::rdrand_usable() {
+                "RDRAND, "
+            } else {
+                ""
+            },
+        ),
+        keel_hal::random::Quality::Weak => kprintln!(
+            "random: WARNING: no usable RDSEED/RDRAND; seeded from timing only (weak until interrupts add more)"
+        ),
+    }
+    if let Err(error) = sched::init() {
+        panic!("scheduler setup failed: {error:?}");
+    }
+    interrupts::enable();
+
+    // The Linux system calls and process teardown (P1-T13).
+    keel_linux_abi::syscall::init();
+    match keel_linux_abi::fs::init() {
+        Ok(r) => kprintln!(
+            "fs: initramfs {} bytes, {} members unpacked into tmpfs ({} unsupported skipped); /dev has console, null, zero, urandom",
+            r.archive_bytes,
+            r.members - r.skipped,
+            r.skipped
+        ),
+        // Without a root filesystem no program can start; the kernel keeps
+        // running so the console shows why.
+        Err(error) => kprintln!("fs: root filesystem not available: {error}"),
+    }
+    match keel_linux_abi::tty::init() {
+        Ok(()) => {
+            kprintln!("keyboard: i8042 ready (IRQ 1, scancode set 1, US layout) on /dev/console")
+        }
+        // No keyboard is not fatal: output still works.
+        Err(error) => kprintln!("keyboard: not available ({error:?}); /dev/console is output only"),
+    }
+
+    if let Some((minutes, seed)) = selftest::requested_fuzz(boot::cmdline()) {
+        TEST_MODE.store(true, Ordering::Relaxed);
+        let passed = selftest::run_fuzz(minutes, seed);
+        exit_qemu(if passed {
+            ExitCode::Success
+        } else {
+            ExitCode::Failure
+        });
+    }
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {
         TEST_MODE.store(true, Ordering::Relaxed);
@@ -81,6 +207,10 @@ extern "C" fn kmain() -> ! {
 
     kprintln!("Keel: nothing more to run yet; halting.");
     halt_forever();
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "unsupported" }
 }
 
 fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
@@ -99,17 +229,28 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
         Some((cols, rows)) => kprintln!("boot: framebuffer console {cols}x{rows} characters"),
         None => kprintln!("boot: no usable framebuffer"),
     }
-    match boot::hhdm_offset() {
-        Some(offset) => kprintln!("boot: HHDM offset {offset:#018x}"),
-        None => kprintln!("boot: no HHDM response"),
-    }
-    match boot::kernel_address() {
-        Some(k) => kprintln!(
-            "boot: kernel at virt {:#018x} phys {:#018x}",
-            k.virtual_base,
-            k.physical_base
-        ),
-        None => kprintln!("boot: no kernel address response"),
+    // Where the kernel and the direct map are would undo KASLR (P1-S5),
+    // so a normal boot does not print them (audit finding 8). Test boots
+    // do: `cargo xtask test` compares them across boots
+    // (`kaslr.layout_varies`). The command line comes from `limine.conf`,
+    // which is trusted only as far as the boot chain is (audit finding 2);
+    // whoever can edit it can also replace the kernel.
+    let cmdline = boot::cmdline();
+    if selftest::requested_phase(cmdline).is_some() || selftest::requested_fuzz(cmdline).is_some() {
+        match boot::hhdm_offset() {
+            Some(offset) => kprintln!("boot: HHDM offset {offset:#018x}"),
+            None => kprintln!("boot: no HHDM response"),
+        }
+        match boot::kernel_address() {
+            Some(k) => kprintln!(
+                "boot: kernel at virt {:#018x} phys {:#018x}",
+                k.virtual_base,
+                k.physical_base
+            ),
+            None => kprintln!("boot: no kernel address response"),
+        }
+    } else {
+        kprintln!("boot: kernel and direct-map addresses not shown (KASLR)");
     }
     let mut regions = 0u64;
     let mut usable = 0u64;
@@ -141,14 +282,65 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
 /// stops. In self-test mode the failure is reported to QEMU first.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    if PANICKING.swap(true, Ordering::AcqRel) {
+        // A fault or panic while panicking. Formatting or the framebuffer
+        // may be what failed, so write one fixed line and stop.
+        if TEST_MODE.load(Ordering::Relaxed) {
+            selftest::judge_nested_panic();
+        }
+        console::emergency_serial("\n*** KEEL KERNEL PANIC while panicking; halted ***\n");
+        if TEST_MODE.load(Ordering::Relaxed) {
+            exit_qemu(ExitCode::Failure);
+        }
+        halt_forever();
+    }
     if TEST_MODE.load(Ordering::Relaxed) {
         // A scenario that ends in a deliberate fatal exception judges the
         // outcome here and exits QEMU itself.
         selftest::judge_expected_fault();
+        selftest::fault_in_panic_if_requested();
     }
     console::emergency_print(format_args!("\n*** KEEL KERNEL PANIC ***\n{info}\n"));
     if TEST_MODE.load(Ordering::Relaxed) {
         exit_qemu(ExitCode::Failure);
     }
     halt_forever();
+}
+
+/// The boot-time vulnerability report (P1-S4, SR-15): one line per item.
+fn report_mitigations(report: &keel_hal::mitigations::Report) {
+    use keel_core::cpuvuln::Status;
+    let c = &report.cpu;
+    kprintln!(
+        "cpu: {} family {:#x} model {:#x} stepping {:#x}{}; IA32_ARCH_CAPABILITIES {:#x}",
+        if c.intel { "Intel" } else { "non-Intel" },
+        c.family,
+        c.model,
+        c.stepping,
+        if c.hypervisor { " (virtualized)" } else { "" },
+        c.arch_capabilities
+    );
+    for item in &report.items {
+        let (kind, detail) = match item.status {
+            Status::NotAffected(d) => ("Not affected", d),
+            Status::Mitigated(d) => ("Mitigation", d),
+            Status::Vulnerable(d) => ("VULNERABLE", d),
+        };
+        kprintln!("vuln: {}: {kind}: {detail}", item.name);
+    }
+    if !report.spec_ctrl_written || !report.mcu_opt_written {
+        kprintln!(
+            "vuln: WARNING: the CPU rejected a mitigation MSR write (SPEC_CTRL {}, MCU_OPT_CTRL {}); IBRS and IBPB are off",
+            if report.spec_ctrl_written {
+                "ok"
+            } else {
+                "rejected"
+            },
+            if report.mcu_opt_written {
+                "ok"
+            } else {
+                "rejected"
+            }
+        );
+    }
 }

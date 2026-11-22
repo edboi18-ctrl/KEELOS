@@ -4,4 +4,23 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+pub mod acpi;
+pub mod cpio;
+pub mod cpuvuln;
+pub mod crypto;
+pub mod elf;
+pub mod errno;
+pub mod exec;
+
 pub mod frame;
+pub mod handle;
+pub mod keyboard;
+pub mod paging;
+pub mod poll;
+pub mod rng;
+pub mod signal;
+pub mod tty;
+pub mod vfs;
+pub mod vm;

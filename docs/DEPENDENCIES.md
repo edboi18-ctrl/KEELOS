@@ -21,7 +21,13 @@ Pin record for Limine 12.9.6, made 2026-11-17:
 - Archive SHA-256:
   `b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee`
 - `BOOTX64.EFI` SHA-256:
-  `e486ae7abd7d5b88f98f43cfd6e8f9057ff975ecd667dfb33f1581de36e00982`
+  `e486ae7abd7d5b88f98f43cfd6e8f9057ff975ecd667dfb33f1581de36e00982`.
+  This is the file as downloaded. The copy shipped in an image differs
+  in 128 bytes only: `xtask` enrols the BLAKE2B of that image's
+  `limine.conf` after the `++CONFIG_B2SUM_SIGNATURE++` marker (ADR 0010).
+  When moving to a new Limine release, check that its `BOOTX64.EFI` still
+  has exactly one marker followed by 128 `0` digits; `enroll_config`
+  refuses it otherwise.
 - The upstream detached signature `limine-binary.tar.gz.sig` verified as a
   good signature from the Limine release key
   `05D2 9860 D0A0 668A AEFB 9D69 1F3C 021B ECA2 3821` (Mintsuki), fetched

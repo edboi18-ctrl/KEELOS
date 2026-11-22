@@ -8,6 +8,23 @@ matters, what to change, and how to tell the change is done. Findings are
 ordered by priority. Line numbers refer to commit `1502eb9`; re-locate the
 code by the quoted text if the file has moved on.
 
+## Status on the working branch
+
+The audit read `1502eb9`; the working branch was about 40 commits ahead
+when the fixes started (P1-T4 to P1-T14 and P1-S1 to P1-S7 done). Each
+finding was re-checked there before it was fixed.
+
+| # | Status |
+| --- | --- |
+| 1 | Fixed (ADR 0009). Raw frame operations in `keel_hal::memory` are `pub(crate)`; `with_frame_bytes` is gone. Outside `keel-hal`, frames are `OwnedFrame` values: created only by the allocator, not `Copy`/`Clone`, freed on drop, contents through `&self`/`&mut self` with no lock held. `compile_fail` doctests show safe code cannot free a frame made from an address, use a handle after freeing it, or build one; the error codes were confirmed by hand. `frames.*` self-tests use the new API; `stale_frame_refused` covers the raw side. Also: `selftest::read_user_directly` now refuses non-user addresses. |
+| 2 | Agent part done (ADR 0010). `xtask` enrols the BLAKE2B of `limine.conf` into the shipped `BOOTX64.EFI` itself, in Limine's own format (no extra host tool; refuses an executable without exactly one marker and 128-digit slot). Limine v12.9.6 then checks the config and disables the editor whether or not Secure Boot is on (`common/lib/config.c`), so QEMU can test it: `sr27.tamper.config` requires the config-mismatch panic, and fails with enrolment disabled. README, STATUS and DEPENDENCIES say the boot chain detects corruption but is not a verified boot. Owner part open: signing `BOOTX64.EFI` and turning Secure Boot on (SR-34). |
+| 3 | Fixed. `cargo xtask verify` derives `refs/tags/v<version>` from the artifact name (`verify::release_ref`: only `keel-<version>.img`, `-esp.zip`, `-notices.zip`, with `N.N.N` or `N.N.N-suffix` versions, as `release.yml`'s tag filters) and passes it as `--source-ref`; other names are refused before anything else. Unit tests for accepted and rejected names. Checked against `gh attestation verify --help` (gh 2.89.0). Still depends on the tag ruleset (finding 4). |
+| 4 | Agent part done: `.github/CODEOWNERS` covers `/xtask/` (on the working branch for the owner to merge, SR-36). Owner part open: sections 2 to 4 of `docs/REPOSITORY-SETUP.md` (branch and tag rulesets). CODEOWNERS has no effect until the branch ruleset requires code-owner review. |
+| 5 | Fixed. `workflow_problems` reads the block-YAML subset the workflows use, with each key's path, and checks allow-lists: triggers `push`, `pull_request`, `schedule`, `workflow_dispatch` (the last two for `security.yml`); `permissions` at any level only as a block of `read`/`none`, with `write` only for `contents`, `id-token`, `attestations` in `release.yml`'s `publish` job; runner exactly `ubuntu-24.04`; step `uses:` pinned to a SHA with a version comment, no `./`, `docker://` or job-level reusable workflows; the word `secrets` nowhere, scripts included. YAML it does not interpret (anchors, aliases, merge keys, flow mappings, tags, tabs, extra documents) is refused. One test case per table row plus those forms, each checked to fail for its intended reason; a test runs the three real workflows. |
+| 6 | Fixed. The same check over all 20 `asm!` blocks on the working branch that claim `preserves_flags` found two more: `xrstor64` and `fxrstor64` in `fpu.rs` load the x87 status word and MXCSR, which that option also covers (the Rust Reference, asm.rules.preserved-registers). All three no longer claim it. |
+| 7 | Fixed. Guard pages were done in P1-T4. Recursion: `idt::fatal` and the panic handler each set a flag on first entry; a nested entry prints one fixed line to COM1 (no formatting, no framebuffer) and halts, or exits QEMU in test mode. Scenario `fault_in_panic` panics, then faults inside the panic handler; it hangs (180 s timeout) with the panic handler's guard disabled. |
+| 8 | Fixed. `memory::init` refuses an HHDM offset that is not page-aligned and in the higher half (`MemoryInitError::BadHhdm`) and uses only usable entries that are page-aligned, non-empty, non-wrapping and overlap no other entry of any kind (`keel_core::frame::sound_usable_regions`, host tests); skipped entries are counted in the boot log. A normal boot no longer prints the kernel base or HHDM offset (checked: a release-image boot's serial log has no `0xffff` address); test boots still do, for `kaslr.layout_varies`. Fatal dumps still print addresses, which is expected for a crash report. |
+
 ## Scope and limits
 
 - Read in full: everything outside `vendor/` (kernel crates, `xtask`,

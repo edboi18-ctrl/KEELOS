@@ -23,6 +23,12 @@ pub struct Phase {
     pub complete: bool,
     /// Extra boots, each testing one behaviour that ends the kernel.
     pub scenarios: &'static [&'static str],
+    /// Lines the main boot's serial log must contain (output of user
+    /// programs, which the kernel cannot see itself).
+    pub expect_lines: &'static [&'static str],
+    /// Text some line of the main boot's serial log must start with (the
+    /// kernel's own fault log lines end with variable text).
+    pub expect_prefixes: &'static [&'static str],
 }
 
 /// Every phase with tests. `cargo xtask test` runs them all, so work on an
@@ -32,11 +38,28 @@ pub const PHASES: &[Phase] = &[
         number: 0,
         complete: true,
         scenarios: &[],
+        expect_lines: &[],
+        expect_prefixes: &[],
     },
     Phase {
         number: 1,
-        complete: false,
-        scenarios: &["double_fault"],
+        complete: true,
+        scenarios: &[
+            "double_fault",
+            "write_kernel_text",
+            "execute_data",
+            "stack_overflow",
+            "smap",
+            "fault_in_panic",
+        ],
+        // Phase 1 acceptance item 1: the musl fixture's output reaches
+        // serial (it runs as PID 1; the kernel checks PID and status).
+        // Item 2: the Rust std program's line, identical to its Linux run.
+        expect_lines: &[
+            "Hello from musl on Keel",
+            "heap64: 67108864 bytes in 16384 pages, checksum 0x7f282b735ac8d3f2",
+        ],
+        expect_prefixes: &["user fault: #PF page fault at 0x400000 (error 0x4, address 0x0)"],
     },
 ];
 
@@ -313,7 +336,18 @@ fn boot_headless(
     stop: impl Fn(&str) -> bool,
 ) -> Result<Capture> {
     let mut command = base_command(disk, options)?;
-    command.args(["-display", "none", "-monitor", "none"]);
+    // A monitor on a free localhost port, used only if the boot hangs, to
+    // record where the CPU is (TCP rather than a Unix socket so it works
+    // on Windows too).
+    let monitor_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .ok();
+    command.args(["-display", "none", "-monitor"]);
+    match monitor_port {
+        Some(port) => command.arg(format!("tcp:127.0.0.1:{port},server,nowait")),
+        None => command.arg("none"),
+    };
     command.stdin(Stdio::null()).stdout(Stdio::piped());
 
     let mut child = command.spawn()?;
@@ -379,6 +413,9 @@ fn boot_headless(
         }
         if Instant::now() >= deadline {
             capture.timed_out = true;
+            if let Some(port) = monitor_port {
+                capture.lines.extend(monitor_snapshot(port));
+            }
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -399,6 +436,33 @@ fn boot_headless(
     Ok(capture)
 }
 
+/// Asks a hung QEMU's monitor for the CPU registers (RIP locates the
+/// hang; subtract the kernel base from the boot log, since KASLR moves
+/// it). Lines come back prefixed with `qemu-monitor: `.
+fn monitor_snapshot(port: u16) -> Vec<String> {
+    use std::io::Write;
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return vec!["qemu-monitor: could not connect".to_string()];
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut text = Vec::new();
+    for command in ["info registers\n"] {
+        let _ = stream.write_all(command.as_bytes());
+        std::thread::sleep(Duration::from_millis(300));
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            text.extend_from_slice(&chunk[..n]);
+        }
+    }
+    strip_ansi(&String::from_utf8_lossy(&text))
+        .lines()
+        .map(|l| format!("qemu-monitor: {}", l.trim_end()))
+        .collect()
+}
+
 fn print_tail(lines: &[String]) {
     let start = lines.len().saturating_sub(TAIL_LINES);
     println!("xtask: last {} serial lines:", lines.len() - start);
@@ -414,7 +478,7 @@ fn test_boot(
     scenario: Option<&'static str>,
     options: &RunOptions,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let number = phase.number;
     match scenario {
         None => println!("xtask: ---- phase {number} ----"),
@@ -422,20 +486,64 @@ fn test_boot(
     }
     let esp = build::build(BootMode::Test(number, scenario))?;
     let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
+    // Keep every boot's full serial log, so a failure can be examined
+    // afterwards however the console output was filtered.
+    let log_dir = util::workspace_root().join("target").join("test-logs");
+    let log_name = format!("phase{number}-{}.log", scenario.unwrap_or("main"));
+    let mut text = capture.lines.join("\n");
+    text.push('\n');
+    util::write(&log_dir.join(&log_name), text.as_bytes())?;
     // Scenarios end in a deliberate fault, so only the main boot of a
     // complete phase prints the acceptance marker.
     let marker = (phase.complete && scenario.is_none()).then(|| format!("KEEL P{number} OK"));
-    let result = if capture.timed_out {
-        Err(format!("timed out after {} s", timeout.as_secs()))
-    } else {
-        verdict(marker.as_deref(), &capture.lines, capture.exit_code)
-    };
+    let result =
+        if capture.timed_out {
+            Err(format!("timed out after {} s", timeout.as_secs()))
+        } else {
+            verdict(marker.as_deref(), &capture.lines, capture.exit_code).and_then(|()| match phase
+                .expect_lines
+                .iter()
+                // Only the main boot runs user programs; scenarios end early.
+                .filter(|_| scenario.is_none())
+                .find(|want| !capture.lines.iter().any(|l| l.trim_end() == **want))
+            {
+                Some(missing) => Err(format!("expected line \"{missing}\" not on serial")),
+                None => match phase
+                    .expect_prefixes
+                    .iter()
+                    .filter(|_| scenario.is_none())
+                    .find(|want| !capture.lines.iter().any(|l| l.starts_with(**want)))
+                {
+                    Some(missing) => Err(format!("no serial line starts with \"{missing}\"")),
+                    None => Ok(()),
+                },
+            })
+        };
     match result {
         Ok(()) => {
-            for line in capture.lines.iter().filter(|l| l.starts_with("TEST ")) {
+            // The test results, and on the main boot of each phase the
+            // CPU vulnerability report (P1-S4), so CI logs show it.
+            let report = |l: &&String| {
+                scenario.is_none() && (l.starts_with("cpu: ") || l.starts_with("vuln: "))
+            };
+            for line in capture
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("TEST ") || report(l))
+            {
                 println!("  {line}");
             }
-            Ok(())
+            // Where this boot put the kernel and the direct map (KASLR).
+            let layout = capture
+                .lines
+                .iter()
+                .filter(|l| {
+                    l.starts_with("boot: kernel at virt") || l.starts_with("boot: HHDM offset")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            Ok(Some(layout))
         }
         Err(reason) => {
             print_tail(&capture.lines);
@@ -444,57 +552,125 @@ fn test_boot(
     }
 }
 
+/// `cargo xtask fuzz`: boots the system-call fuzzer (Phase 1 security
+/// acceptance item 6) for `minutes`, from `seed`. Passes when the kernel
+/// reports the session passed: no panic, no hung fuzz process, and QEMU
+/// exited cleanly. The full serial log goes to `target/test-logs/fuzz.log`;
+/// each run's seed is in it, so a failure can be replayed.
+pub fn fuzz(minutes: u64, seed: u64, options: &RunOptions) -> Result<()> {
+    println!("xtask: ---- system-call fuzzing: {minutes} min, seed {seed} ----");
+    let esp = build::build(BootMode::Fuzz { minutes, seed })?;
+    // The last run may end up to 10 minutes after the deadline (the
+    // kernel's FUZZ_RUN_LIMIT_MS), and boot and setup take well under five
+    // minutes even without hardware acceleration.
+    let timeout = Duration::from_secs(minutes * 60 + 600 + 300);
+    let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
+    let mut text = capture.lines.join("\n");
+    text.push('\n');
+    let log = util::workspace_root()
+        .join("target")
+        .join("test-logs")
+        .join("fuzz.log");
+    util::write(&log, text.as_bytes())?;
+    let result = if capture.timed_out {
+        Err(format!("timed out after {} s", timeout.as_secs()))
+    } else {
+        verdict(None, &capture.lines, capture.exit_code)
+    };
+    match result {
+        Ok(()) => {
+            for line in capture
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("TEST ") || l.starts_with("fuzz: "))
+            {
+                println!("  {line}");
+            }
+            println!("xtask: fuzzing PASSED (log: {})", log.display());
+            Ok(())
+        }
+        Err(reason) => {
+            print_tail(&capture.lines);
+            Err(format!("fuzzing FAILED: {reason} (log: {})", log.display()).into())
+        }
+    }
+}
+
 /// Text Limine prints when a file does not match its pinned hash
 /// (Limine 12.9.6, `common/lib/uri.c`, `uri_hash_mismatch`).
 const LIMINE_HASH_PANIC: &str = "does not match";
+/// Limine v12.9.6 `common/lib/config.c`, `init_config`.
+const LIMINE_CONFIG_PANIC: &str = "CHECKSUM MISMATCH FOR CONFIG FILE";
 
 /// Judges a boot of a tampered image: it passes only if Limine reported
-/// the hash mismatch and the kernel never produced a line of output.
-pub fn tamper_verdict(lines: &[String]) -> std::result::Result<(), String> {
+/// `expected` in a panic and the kernel never produced a line of output.
+pub fn tamper_verdict(lines: &[String], expected: &str) -> std::result::Result<(), String> {
     if lines.iter().any(|line| line.starts_with("Keel ")) {
         return Err("the kernel booted from a tampered image".into());
     }
     if !lines
         .iter()
-        .any(|line| line.contains("PANIC") && line.contains(LIMINE_HASH_PANIC))
+        .any(|line| line.contains("PANIC") && line.contains(expected))
     {
-        return Err("Limine did not report a hash mismatch".into());
+        return Err(format!("Limine did not report \"{expected}\""));
     }
     Ok(())
 }
 
-/// SR-27 negative test: flip one byte of the kernel, then of the
-/// initramfs, and check that the bootloader refuses each image.
+/// SR-27 negative test: flip one byte of the kernel, the initramfs, then
+/// the config (whose hash is enrolled in the EFI executable, audit
+/// finding 2), and check that the bootloader refuses each image.
 fn test_tampered_boot(options: &RunOptions, timeout: Duration) -> Result<()> {
     let tree = build::build_tree(BootMode::Test(0, None))?;
-    for (name, target) in [
-        ("sr27.tamper.kernel", build::KERNEL_PATH),
-        ("sr27.tamper.initramfs", build::INITRAMFS_PATH),
+    // Make Limine report its panics on the serial port, which is the only
+    // output this headless test can read, and enrol that config: this is
+    // a legitimate edit, made before any tampering. (A config mismatch is
+    // reported before the config is read, through the firmware console,
+    // which OVMF also sends to serial.)
+    let file = |name: &str| {
+        tree.files
+            .iter()
+            .find(|(path, _)| *path == name)
+            .map(|(_, d)| d.clone())
+    };
+    let conf = String::from_utf8(file(build::CONFIG_PATH).ok_or("no config in the tree")?)?
+        .replacen("timeout: 0\n", "timeout: 0\nserial: yes\n", 1)
+        .into_bytes();
+    let mut efi = file(build::EFI_PATH).ok_or("no EFI executable in the tree")?;
+    build::enroll_config(&mut efi, &conf)?;
+    for (name, target, expected) in [
+        ("sr27.tamper.kernel", build::KERNEL_PATH, LIMINE_HASH_PANIC),
+        (
+            "sr27.tamper.initramfs",
+            build::INITRAMFS_PATH,
+            LIMINE_HASH_PANIC,
+        ),
+        (
+            "sr27.tamper.config",
+            build::CONFIG_PATH,
+            LIMINE_CONFIG_PANIC,
+        ),
     ] {
         let esp = util::workspace_root().join("target").join("esp-tampered");
         if esp.exists() {
             std::fs::remove_dir_all(&esp)?;
         }
         for (path, data) in &tree.files {
-            let mut data = data.clone();
+            let mut data = match *path {
+                build::CONFIG_PATH => conf.clone(),
+                build::EFI_PATH => efi.clone(),
+                _ => data.clone(),
+            };
             if *path == target {
                 let middle = data.len() / 2;
                 data[middle] ^= 0x01;
             }
-            if *path == build::CONFIG_PATH {
-                // Make Limine report its panic on the serial port, which
-                // is the only output this headless test can read.
-                let conf = String::from_utf8(data)?;
-                data = conf
-                    .replacen("timeout: 0\n", "timeout: 0\nserial: yes\n", 1)
-                    .into_bytes();
-            }
             util::write(&esp.join(path), &data)?;
         }
         let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |line| {
-            line.contains(LIMINE_HASH_PANIC) || line.starts_with("Keel ")
+            line.contains(expected) || line.starts_with("Keel ")
         })?;
-        match tamper_verdict(&capture.lines) {
+        match tamper_verdict(&capture.lines, expected) {
             Ok(()) => println!("  TEST {name} PASS bootloader refused the altered file"),
             Err(reason) => {
                 print_tail(&capture.lines);
@@ -532,6 +708,125 @@ pub fn boot_image_until(image: &Path, options: &RunOptions, marker: &str) -> Res
 }
 
 /// `cargo xtask test [--phase N]`.
+/// Runs the `user/tests` programs natively when the host is x86-64 Linux,
+/// so each one is checked against the real Linux ABI as well as against
+/// Keel (spec section 4, `user/tests`). Elsewhere (Windows) the step is
+/// skipped and says so; CI runs it on Linux.
+fn test_user_programs_on_host() -> Result<()> {
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        println!("xtask: user programs on the host: SKIPPED (needs x86-64 Linux; CI runs it)");
+        return Ok(());
+    }
+    println!("xtask: ---- user programs on the host (Linux) ----");
+    let binaries = build::build_user_tests(&util::workspace_root())?;
+    for (program, binary) in build::TEST_PROGRAMS
+        .iter()
+        .zip(binaries)
+        .filter(|(program, _)| program.host)
+    {
+        let mut child = Command::new(&binary)
+            .args(program.args)
+            .env_clear()
+            .envs(program.env.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            std::io::Write::write_all(&mut stdin, program.stdin)?;
+            // Dropping stdin closes the pipe: the program sees end of file.
+        }
+        let output = child.wait_with_output()?;
+        let name = format!("host.{}", program.binary);
+        if output.status.success() {
+            println!("  TEST {name} PASS runs to exit 0 under Linux");
+        } else {
+            return Err(format!(
+                "{name} failed under Linux ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+    }
+    let root = util::workspace_root();
+    for fixture in build::TEST_FIXTURES {
+        // Run a copy: the committed file may lack the executable bit (it
+        // was committed from Windows).
+        let data = build::load_fixture(&root, fixture)?;
+        let path = root.join("target").join("fixtures").join(fixture.path);
+        util::write(&path, &data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let output = Command::new(&path)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()?;
+        let name = format!(
+            "host.{}",
+            fixture.path.rsplit('/').next().unwrap_or(fixture.path)
+        );
+        if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+            println!("  TEST {name} PASS prints the expected line under Linux");
+        } else {
+            return Err(format!(
+                "{name} under Linux: {} printing {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            )
+            .into());
+        }
+    }
+    for (program, binary) in build::STD_PROGRAMS
+        .iter()
+        .zip(build::build_std_tests(&root)?)
+    {
+        let output = Command::new(&binary)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()?;
+        let name = format!("host.{}", program.binary);
+        if output.status.success() && output.stdout == program.stdout.as_bytes() {
+            println!("  TEST {name} PASS prints the expected line under Linux");
+        } else {
+            return Err(format!(
+                "{name} under Linux: {} printing {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// SR-16 (P1-S5): across the boots of one phase, the kernel and the
+/// direct map must not sit at the same addresses every time.
+fn check_kaslr(layouts: &[Option<String>]) -> Result<()> {
+    let seen: Vec<&String> = layouts.iter().flatten().filter(|l| !l.is_empty()).collect();
+    let mut distinct = seen.clone();
+    distinct.sort();
+    distinct.dedup();
+    if seen.len() >= 3 && distinct.len() >= 2 {
+        println!(
+            "  TEST kaslr.layout_varies PASS {} boots, {} distinct kernel/HHDM layouts",
+            seen.len(),
+            distinct.len()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "kaslr.layout_varies: {} boots gave {} distinct layouts: {distinct:?}",
+            seen.len(),
+            distinct.len()
+        )
+        .into())
+    }
+}
+
 pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Result<()> {
     let selected: Vec<&Phase> = match phase {
         None => PHASES.iter().collect(),
@@ -545,10 +840,17 @@ pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Resu
             }
         },
     };
+    if selected.iter().any(|p| p.number >= 1) {
+        test_user_programs_on_host()?;
+    }
     for phase in selected {
-        test_boot(phase, None, options, timeout)?;
+        let mut layouts = Vec::new();
+        layouts.push(test_boot(phase, None, options, timeout)?);
         for &scenario in phase.scenarios {
-            test_boot(phase, Some(scenario), options, timeout)?;
+            layouts.push(test_boot(phase, Some(scenario), options, timeout)?);
+        }
+        if phase.number >= 1 {
+            check_kaslr(&layouts)?;
         }
         if phase.number == 0 {
             test_tampered_boot(options, timeout)?;
@@ -628,11 +930,15 @@ mod tests {
     #[test]
     fn tamper_verdict_needs_a_refusal_and_a_silent_kernel() {
         let refused = lines("limine: Loading...PANIC: Blake2b hash for URI `x` does not match!");
-        assert_eq!(tamper_verdict(&refused), Ok(()));
-        assert!(tamper_verdict(&lines("limine: Loading executable")).is_err());
-        assert!(tamper_verdict(&[]).is_err());
+        assert_eq!(tamper_verdict(&refused, LIMINE_HASH_PANIC), Ok(()));
+        assert!(tamper_verdict(&lines("limine: Loading executable"), LIMINE_HASH_PANIC).is_err());
+        assert!(tamper_verdict(&[], LIMINE_HASH_PANIC).is_err());
         let booted = lines("PANIC: hash does not match\nKeel 0.0.0 booting");
-        assert!(tamper_verdict(&booted).is_err());
+        assert!(tamper_verdict(&booted, LIMINE_HASH_PANIC).is_err());
+        // The config case needs its own message, not just any panic.
+        let config = lines("PANIC: !!! CHECKSUM MISMATCH FOR CONFIG FILE !!!");
+        assert_eq!(tamper_verdict(&config, LIMINE_CONFIG_PANIC), Ok(()));
+        assert!(tamper_verdict(&refused, LIMINE_CONFIG_PANIC).is_err());
     }
 
     #[test]

@@ -10,6 +10,13 @@
 //!
 //! The checksum alone proves nothing about origin, since `SHA256SUMS`
 //! comes from the same download. The attestation is the trust anchor.
+//!
+//! The attestation must also come from the release tag the file is named
+//! after (`--source-ref refs/tags/v<version>`, audit finding 3). Without
+//! that, a modified `release.yml` run from any branch would still be
+//! "this repository's release workflow". What stops someone pushing a
+//! `v*` tag that carries a modified workflow is the tag ruleset
+//! (`docs/REPOSITORY-SETUP.md`, audit finding 4).
 
 use std::path::Path;
 use std::process::Command;
@@ -32,11 +39,52 @@ pub fn expected_digest<'a>(sums: &'a str, file_name: &str) -> Option<&'a str> {
     })
 }
 
+/// The artifact names `cargo xtask dist` produces, as (prefix, suffix)
+/// around the version.
+const ARTIFACT_FORMS: [(&str, &str); 3] = [
+    ("keel-", "-esp.zip"),
+    ("keel-", "-notices.zip"),
+    ("keel-", ".img"),
+];
+
+/// The git ref the release workflow must have run from for `file_name`:
+/// `refs/tags/v<version>`. The version is taken from the name and must
+/// be one `release.yml` builds: `N.N.N` or `N.N.N-<suffix>` (its tag
+/// filters), within `dist::validate_version`'s characters.
+pub fn release_ref(file_name: &str) -> Result<String> {
+    let version = ARTIFACT_FORMS
+        .iter()
+        .find_map(|(prefix, suffix)| file_name.strip_prefix(prefix)?.strip_suffix(suffix))
+        .ok_or_else(|| {
+            format!(
+                "{file_name:?} is not a release artifact name \
+                 (keel-<version>.img, keel-<version>-esp.zip or keel-<version>-notices.zip)"
+            )
+        })?;
+    crate::dist::validate_version(version)?;
+    let (core, _) = version.split_once('-').unwrap_or((version, ""));
+    let parts: Vec<&str> = core.split('.').collect();
+    let numeric = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if !numeric || version.ends_with('-') {
+        return Err(format!(
+            "version {version:?} in {file_name:?} is not one the release workflow builds (N.N.N or N.N.N-suffix)"
+        )
+        .into());
+    }
+    Ok(format!("refs/tags/v{version}"))
+}
+
 pub fn verify(file: &Path) -> Result<()> {
     let file_name = file
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("the artifact path has no UTF-8 file name")?;
+    // Before anything else: a name that maps to no release tag cannot be
+    // verified, whatever its checksum.
+    let source_ref = release_ref(file_name)?;
     let data = util::read(file)?;
 
     let sums_path = file.with_file_name("SHA256SUMS");
@@ -60,6 +108,7 @@ pub fn verify(file: &Path) -> Result<()> {
         .arg(file)
         .args(["--repo", REPOSITORY])
         .args(["--signer-workflow", RELEASE_WORKFLOW])
+        .args(["--source-ref", &source_ref])
         .arg("--deny-self-hosted-runners")
         .status()
         .map_err(|e| {
@@ -76,7 +125,7 @@ pub fn verify(file: &Path) -> Result<()> {
         )
         .into());
     }
-    println!("xtask: attestation ok: built by {RELEASE_WORKFLOW}");
+    println!("xtask: attestation ok: built by {RELEASE_WORKFLOW} from {source_ref}");
     println!("xtask: {file_name} is verified.");
     Ok(())
 }
@@ -93,6 +142,41 @@ mod tests {
         assert_eq!(expected_digest(&sums, "keel-0.1.0.img"), Some(DIGEST));
         assert_eq!(expected_digest(&sums, "keel-0.1.0"), None);
         assert_eq!(expected_digest(&sums, "other.img"), None);
+    }
+
+    #[test]
+    fn release_ref_comes_from_the_artifact_name() {
+        for (name, tag) in [
+            ("keel-0.1.0.img", "refs/tags/v0.1.0"),
+            ("keel-0.1.0-esp.zip", "refs/tags/v0.1.0"),
+            ("keel-0.1.0-notices.zip", "refs/tags/v0.1.0"),
+            ("keel-12.0.3-rc.1.img", "refs/tags/v12.0.3-rc.1"),
+            ("keel-1.2.3-rc1-esp.zip", "refs/tags/v1.2.3-rc1"),
+        ] {
+            assert_eq!(release_ref(name).unwrap(), tag, "{name}");
+        }
+    }
+
+    #[test]
+    fn release_ref_rejects_other_names() {
+        for name in [
+            "keel.img",
+            "keel-.img",
+            "keel-0.1.img",
+            "keel-0.1.0.0.img",
+            "keel-v0.1.0.img",
+            "keel-0.1.0-.img",
+            "keel-0.1.x.img",
+            "keel-0..1.img",
+            "keel-0.1.0.zip",
+            "keel-0.1.0-esp.zip.img.bak",
+            "other-0.1.0.img",
+            "keel-0.1.0/../x.img",
+            "keel-0.1.0 .img",
+            "SHA256SUMS",
+        ] {
+            assert!(release_ref(name).is_err(), "{name} must be rejected");
+        }
     }
 
     #[test]

@@ -69,24 +69,38 @@ pub enum IstSlot {
 }
 
 const IST_STACK_SIZE: usize = 16 * 1024;
+const PAGE: usize = 4096;
 
-/// One interrupt stack. 16-byte alignment keeps the top of the stack
-/// 16-byte aligned, as SDM section 7.14.4 expects of TSS stack pointers.
-#[repr(C, align(16))]
-struct Stack([u8; IST_STACK_SIZE]);
+/// One interrupt stack preceded by a guard page (SR-17). Stacks grow
+/// down, so an overflow runs into the guard page, which the kernel page
+/// tables leave unmapped (`paging::init`): the overflow faults instead of
+/// silently overwriting the neighbouring stack. Page alignment puts the
+/// guard on its own page; the stack top is then 16-byte aligned, as SDM
+/// section 7.14.4 expects of TSS stack pointers.
+#[repr(C, align(4096))]
+struct GuardedStack {
+    guard: [u8; PAGE],
+    stack: [u8; IST_STACK_SIZE],
+}
 
-/// IST stacks. They live in `.bss` for now; SR-17 guard pages around them
-/// arrive with the kernel's own page tables (P1-T4, P1-S6), until then an
-/// overflow of one of these stacks is not detected.
+/// IST stacks with their guard pages.
 #[unsafe(link_section = ".bss.keel_entry")]
-static IST_STACKS: IstStacks =
-    IstStacks(UnsafeCell::new([const { Stack([0; IST_STACK_SIZE]) }; 3]));
+static IST_STACKS: IstStacks = IstStacks(UnsafeCell::new(
+    [const {
+        GuardedStack {
+            guard: [0; PAGE],
+            stack: [0; IST_STACK_SIZE],
+        }
+    }; 3],
+));
 
-struct IstStacks(UnsafeCell<[Stack; 3]>);
+struct IstStacks(UnsafeCell<[GuardedStack; 3]>);
 // SAFETY: the stacks are only ever written by the processor while it runs
 // an interrupt handler on them; Rust code never forms references to their
 // contents, only computes addresses.
 unsafe impl Sync for IstStacks {}
+
+const GUARDED_STACK_SIZE: u64 = core::mem::size_of::<GuardedStack>() as u64;
 
 /// The 64-bit TSS, Figure 10-11. The 64-bit fields sit at 4-byte offsets
 /// (RSP0 at offset 4), so the structure is packed to 4-byte alignment.
@@ -198,13 +212,21 @@ pub(crate) struct DescriptorTablePointer {
 /// Address one past the end of IST stack `slot`.
 pub fn ist_stack_top(slot: IstSlot) -> u64 {
     let base = IST_STACKS.0.get() as u64;
-    base + (slot as u64) * IST_STACK_SIZE as u64
+    // Slot n (1-based) ends where block n ends.
+    base + (slot as u64) * GUARDED_STACK_SIZE
 }
 
 /// The address range `[low, high)` of IST stack `slot`.
 pub fn ist_stack_range(slot: IstSlot) -> core::ops::Range<u64> {
     let top = ist_stack_top(slot);
     top - IST_STACK_SIZE as u64..top
+}
+
+/// The guard page directly below each IST stack. These pages must stay
+/// unmapped.
+pub fn ist_guard_pages() -> [u64; 3] {
+    [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck]
+        .map(|slot| ist_stack_range(slot).start - PAGE as u64)
 }
 
 /// Loads Keel's GDT and TSS on the boot CPU and reloads every segment
@@ -261,9 +283,13 @@ pub unsafe fn init() {
     //    descriptor busy (type 11). The TSS is used from now on for RSP0
     //    and the IST pointers.
     // Exit state: all segment registers refer to our GDT; RSP is
-    //   unchanged; RAX is clobbered (declared); flags are unchanged by
-    //   these instructions except as noted by none (LGDT, MOV Sreg, LTR
-    //   and RETF from CPL 0 to CPL 0 do not modify RFLAGS).
+    //   unchanged; RAX is clobbered (declared). The status flags are NOT
+    //   preserved: `xor eax, eax` clears OF and CF, sets SF, ZF and PF from
+    //   the result and leaves AF undefined (SDM Vol. 2D "XOR", Flags
+    //   Affected), so `preserves_flags` is not claimed (the Rust Reference,
+    //   "Inline assembly", asm.rules.preserved-registers: the status flags
+    //   must be restored on exit if it is). LGDT, MOV Sreg, LTR and a far
+    //   return from CPL 0 to CPL 0 do not modify RFLAGS.
     // References: Intel SDM Vol. 2A "LGDT/LIDT", Vol. 2B "RET" and "LTR",
     //   Vol. 2B "MOV" (segment register loads), Vol. 3A section 3.4.3.
     //
@@ -291,7 +317,6 @@ pub unsafe fn init() {
             ds = in(reg) u64::from(KERNEL_DS),
             tss = in(reg) u64::from(TSS_SELECTOR),
             out("rax") _,
-            options(preserves_flags),
         );
     }
 }
@@ -352,6 +377,20 @@ mod tests {
         assert_eq!(gdt[0], 0);
         assert_eq!(gdt[usize::from(USER_CS >> 3)] >> 45 & 3, 3);
         assert_eq!(gdt[usize::from(KERNEL_CS >> 3)] >> 45 & 3, 0);
+    }
+
+    #[test]
+    fn guard_pages_sit_directly_below_page_aligned_stacks() {
+        assert_eq!(GUARDED_STACK_SIZE, (PAGE + IST_STACK_SIZE) as u64);
+        for (slot, guard) in [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck]
+            .into_iter()
+            .zip(ist_guard_pages())
+        {
+            let range = ist_stack_range(slot);
+            assert_eq!(guard % PAGE as u64, 0);
+            assert_eq!(guard + PAGE as u64, range.start);
+            assert_eq!(range.end % 16, 0);
+        }
     }
 
     #[test]
