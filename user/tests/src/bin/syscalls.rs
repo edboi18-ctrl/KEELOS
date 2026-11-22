@@ -246,7 +246,20 @@ fn main(startup: &Startup) -> i32 {
             "Keel only: unknown open flag is EINVAL (SR-10)",
             sys::openat(sys::AT_FDCWD, c"/dev/null", 0o10, 0) == EINVAL,
         );
+        // PROT_SEM (0x8) means nothing on x86 and is not accepted.
+        if let Ok(region) = Region::map(4096, sys::PROT_READ) {
+            c.check(
+                "Keel only: unknown mprotect bit is EINVAL (SR-10)",
+                region.protect(sys::PROT_READ | 0x8) == EINVAL,
+            );
+            let _ = region.unmap();
+        }
     }
+    // Unknown arch_prctl codes fail on both (Linux checks the code first).
+    c.check(
+        "unknown arch_prctl code is EINVAL",
+        Hostile::new(0).is_some_and(|h| sys::arch_prctl_get_into(0x9999, h) == EINVAL),
+    );
 
     // brk.
     let start = sys::brk(0);

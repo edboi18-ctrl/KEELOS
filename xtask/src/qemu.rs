@@ -319,7 +319,18 @@ fn boot_headless(
     stop: impl Fn(&str) -> bool,
 ) -> Result<Capture> {
     let mut command = base_command(disk, options)?;
-    command.args(["-display", "none", "-monitor", "none"]);
+    // A monitor on a free localhost port, used only if the boot hangs, to
+    // record where the CPU is (TCP rather than a Unix socket so it works
+    // on Windows too).
+    let monitor_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .ok();
+    command.args(["-display", "none", "-monitor"]);
+    match monitor_port {
+        Some(port) => command.arg(format!("tcp:127.0.0.1:{port},server,nowait")),
+        None => command.arg("none"),
+    };
     command.stdin(Stdio::null()).stdout(Stdio::piped());
 
     let mut child = command.spawn()?;
@@ -385,6 +396,9 @@ fn boot_headless(
         }
         if Instant::now() >= deadline {
             capture.timed_out = true;
+            if let Some(port) = monitor_port {
+                capture.lines.extend(monitor_snapshot(port));
+            }
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -403,6 +417,33 @@ fn boot_headless(
             SerialEvent::Partial(_) => None,
         }));
     Ok(capture)
+}
+
+/// Asks a hung QEMU's monitor for the CPU registers (RIP locates the
+/// hang; subtract the kernel base from the boot log, since KASLR moves
+/// it). Lines come back prefixed with `qemu-monitor: `.
+fn monitor_snapshot(port: u16) -> Vec<String> {
+    use std::io::Write;
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return vec!["qemu-monitor: could not connect".to_string()];
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut text = Vec::new();
+    for command in ["info registers\n"] {
+        let _ = stream.write_all(command.as_bytes());
+        std::thread::sleep(Duration::from_millis(300));
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            text.extend_from_slice(&chunk[..n]);
+        }
+    }
+    strip_ansi(&String::from_utf8_lossy(&text))
+        .lines()
+        .map(|l| format!("qemu-monitor: {}", l.trim_end()))
+        .collect()
 }
 
 fn print_tail(lines: &[String]) {
