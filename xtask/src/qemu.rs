@@ -61,6 +61,14 @@ pub const PHASES: &[Phase] = &[
         ],
         expect_prefixes: &["user fault: #PF page fault at 0x400000 (error 0x4, address 0x0)"],
     },
+    Phase {
+        number: 2,
+        complete: false,
+        scenarios: &[],
+        // Acceptance P2: the exact line hello.exe writes, through peldr.
+        expect_lines: &["Hello from a Windows executable on Keel"],
+        expect_prefixes: &[],
+    },
 ];
 
 /// First line of the kernel's panic output (`keel-kernel/src/main.rs`).
@@ -721,6 +729,12 @@ fn test_user_programs_on_host() -> Result<()> {
     }
     println!("xtask: ---- user programs on the host (Linux) ----");
     let binaries = build::build_user_tests(&util::workspace_root())?;
+    let peldr = build::TEST_PROGRAMS
+        .iter()
+        .zip(&binaries)
+        .find(|(program, _)| program.binary == "peldr")
+        .map(|(_, binary)| binary.clone())
+        .ok_or("peldr is not among the test programs")?;
     for (program, binary) in build::TEST_PROGRAMS
         .iter()
         .zip(binaries)
@@ -752,6 +766,36 @@ fn test_user_programs_on_host() -> Result<()> {
         }
     }
     let root = util::workspace_root();
+    // Phase 2: each Windows executable through peldr, at its preferred base
+    // and relocated, must print exactly its line and exit 0.
+    for fixture in build::PE_FIXTURES {
+        let data = build::load_fixture(&root, fixture)?;
+        let path = root.join("target").join("fixtures").join(fixture.path);
+        util::write(&path, &data)?;
+        for (mode, extra) in [("", None), (".relocated", Some("--relocate"))] {
+            let output = Command::new(&peldr)
+                .args(extra)
+                .arg(&path)
+                .env_clear()
+                .stdin(Stdio::null())
+                .output()?;
+            let name = format!(
+                "host.peldr.{}{mode}",
+                fixture.path.rsplit('/').next().unwrap_or(fixture.path)
+            );
+            if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+                println!("  TEST {name} PASS peldr runs it under Linux: exact line, exit 0");
+            } else {
+                return Err(format!(
+                    "{name} failed under Linux ({}): stdout {:?}, stderr {:?}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+                .into());
+            }
+        }
+    }
     for fixture in build::TEST_FIXTURES {
         // Run a copy: the committed file may lack the executable bit (it
         // was committed from Windows).
@@ -880,7 +924,8 @@ pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Resu
         for &scenario in phase.scenarios {
             layouts.push(test_boot(phase, Some(scenario), options, timeout)?);
         }
-        if phase.number >= 1 {
+        // Phase 1 has the boots (main and six scenarios) to compare.
+        if phase.number == 1 {
             check_kaslr(&layouts)?;
         }
         if phase.number == 0 {

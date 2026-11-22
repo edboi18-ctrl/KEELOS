@@ -194,6 +194,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
     match (phase, scenario) {
         (0, Scenario::None) => phase0(&mut runner),
         (1, Scenario::None) => phase1(&mut runner),
+        (2, Scenario::None) => phase2(&mut runner),
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -1480,7 +1481,7 @@ pub fn phase1_robustness(t: &mut Runner) {
 fn run_test_program(path: &[u8], args: &[&[u8]]) -> Option<(i64, Option<sched::UserFault>)> {
     let file = keel_linux_abi::fs::read_file(path).ok()?;
     let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
-    let spawned = keel_linux_abi::process::spawn("limits", &loaded).ok()?;
+    let spawned = keel_linux_abi::process::spawn("test", &loaded).ok()?;
     join(spawned.thread);
     sched::exit_status(spawned.thread)
 }
@@ -1662,6 +1663,47 @@ pub fn phase1_audit_small_items(t: &mut Runner) {
         cpu::read_cr4() & cpu::CR4_PGE == 0,
         "CR4.PGE is clear, so a CR3 write leaves no stale global translation (A7.5)",
     );
+}
+
+/// Phase 2: the toy PE loader runs a Windows executable (spec section 9).
+/// Acceptance P2: `peldr /winetest/hello.exe` writes the exact line, which
+/// `cargo xtask test --phase 2` finds on serial, and exits 0.
+fn phase2(t: &mut Runner) {
+    const PELDR: &[u8] = b"/test/peldr";
+    const HELLO: &[u8] = b"/winetest/hello.exe";
+    let status = run_test_program(PELDR, &[PELDR, HELLO]);
+    t.check(
+        "acceptance.peldr_hello",
+        status == Some((0, None)),
+        "peldr runs hello.exe, a Windows x64 executable, to exit status 0 (its line is checked on serial)",
+    );
+    if status != Some((0, None)) {
+        kprintln!("  peldr: exit {status:?}");
+    }
+    // Loaded away from its preferred base: the DIR64 relocations of its
+    // pointer table must have been applied for the same line to come out.
+    let relocated = run_test_program(PELDR, &[PELDR, b"--relocate", HELLO]);
+    t.check(
+        "peldr.relocated",
+        relocated == Some((0, None)),
+        "peldr runs hello.exe away from its preferred base (base relocations applied) to exit status 0",
+    );
+    if relocated != Some((0, None)) {
+        kprintln!("  peldr --relocate: exit {relocated:?}");
+    }
+    // A malformed file is refused with an error, and the kernel carries on.
+    const BAD: &[u8] = b"/test/startup";
+    let refused = run_test_program(PELDR, &[PELDR, BAD]);
+    t.check(
+        "peldr.refuses_non_pe",
+        refused == Some((1, None)),
+        "peldr refuses a file that is not a PE executable with exit status 1",
+    );
+
+    // Phase 2 acceptance marker, only when every test above passed.
+    if t.failed == 0 {
+        kprintln!("KEEL P2 OK");
+    }
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200
