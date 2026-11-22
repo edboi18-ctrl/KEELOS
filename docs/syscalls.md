@@ -13,6 +13,19 @@ occurrence of each number is logged to serial.
 | 231 | `exit_group` | Partial: same as `exit` until processes have several threads | None beyond being the caller | `exec.startup_state`, `exec.exit_status` (`keel-rt` exits through it) |
 | 0x1000 | `keel_test_add_one` | Temporary, Phase 1 self-tests only: returns `rdi + 1` (wrapping) | None; touches no memory. Removed before Phase 1 acceptance | `user.syscall` |
 
+## Device nodes
+
+| Path | Device | Authority and checks | Tests |
+| --- | --- | --- | --- |
+| `/dev/console` | 5:1 | Writes go to the kernel console, filtered to text (no control characters or escape sequences). Reads return end of file until the keyboard driver (P1-T14). Rights checks arrive with handles (P1-S1). | `fs.dev_nodes`, `fs.devices` |
+| `/dev/null` | 1:3 | Reads return end of file; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
+| `/dev/zero` | 1:5 | Reads return zeros; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
+| `/dev/urandom` | 1:9 | Reads return random bytes (interim source until P1-S5); writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
+
+`/dev/mem`, `/dev/kmem` and `/dev/port` do not exist and cannot be
+created: device nodes come only from a fixed list in the kernel (SR-9;
+test `fs.no_forbidden_devices`).
+
 ## Faults
 
 A fault in user mode (any exception vector below 32 except NMI and

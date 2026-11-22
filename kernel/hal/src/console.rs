@@ -63,6 +63,38 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
+/// Untrusted bytes shown as text: control characters other than tab,
+/// newline and carriage return (including ESC, so no terminal escape
+/// sequences, and the C1 controls U+0080 to U+009F) become U+FFFD, and so
+/// does each invalid UTF-8 sequence. Uses `core::str::Utf8Chunks`, so
+/// nothing is allocated.
+pub struct UserText<'a>(pub &'a [u8]);
+
+impl fmt::Display for UserText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for chunk in self.0.utf8_chunks() {
+            for c in chunk.valid().chars() {
+                let shown = if c.is_control() && !matches!(c, '\t' | '\n' | '\r') {
+                    char::REPLACEMENT_CHARACTER
+                } else {
+                    c
+                };
+                fmt::Write::write_char(f, shown)?;
+            }
+            if !chunk.invalid().is_empty() {
+                fmt::Write::write_char(f, char::REPLACEMENT_CHARACTER)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Writes bytes a user program sent to `/dev/console`, as [`UserText`],
+/// so a terminal reading the serial line sees only text.
+pub fn write_user_bytes(bytes: &[u8]) {
+    _print(format_args!("{}", UserText(bytes)));
+}
+
 /// Prints from the panic handler without waiting on any lock.
 ///
 /// The panicking code may hold `SERIAL` or `FRAMEBUFFER`, so this path
@@ -99,4 +131,27 @@ macro_rules! kprintln {
     ($($arg:tt)*) => {
         $crate::console::_print(::core::format_args!("{}\n", ::core::format_args!($($arg)*)))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserText;
+    use alloc::format;
+
+    #[test]
+    fn user_text_is_only_text() {
+        assert_eq!(
+            format!("{}", UserText(b"hello\tworld\r\n")),
+            "hello\tworld\r\n"
+        );
+        assert_eq!(format!("{}", UserText("Grüße ✓".as_bytes())), "Grüße ✓");
+        // ESC [ 2 J (clear screen), BEL, NUL, DEL.
+        assert_eq!(
+            format!("{}", UserText(b"\x1b[2J\x07\x00\x7f")),
+            "\u{fffd}[2J\u{fffd}\u{fffd}\u{fffd}"
+        );
+        // C1 control U+009B (CSI) in UTF-8, and invalid bytes.
+        assert_eq!(format!("{}", UserText(b"a\xc2\x9bb")), "a\u{fffd}b");
+        assert_eq!(format!("{}", UserText(b"a\xffb\xc3")), "a\u{fffd}b\u{fffd}");
+    }
 }

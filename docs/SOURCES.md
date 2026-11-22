@@ -64,6 +64,9 @@ against copies downloaded from the vendors:
 | Intel SDM Vol. 1 section 7.3.17.1 (CPUID.01H:ECX.RDRAND[30]; bounded retry while CF = 0, example limit 10); Vol. 2B "RDRAND" (CF = 1 on valid data, flags affected) | `kernel/hal/src/random.rs` |
 | Linux `arch/x86/kernel/cpu/rdrand.c` (`x86_init_rdrand`: 8 samples, at least 5 changes) and `amd.c` (`clear_rdrand_cpuid_bit`: firmware that breaks RDRAND after resume) at v6.12 | RDRAND self-test in `kernel/hal/src/random.rs` |
 | Steele, Lea, Flood, "Fast splittable pseudorandom number generators", OOPSLA 2014; Vigna, `splitmix64.c` (prng.di.unimi.it), constants 0xbf58476d1ce4e5b9 and 0x94d049bb133111eb, read 2026-11-22 | Weak interim mixing in `kernel/hal/src/random.rs` |
+| Linux `include/uapi/asm-generic/errno-base.h` and `errno.h` at v6.12 (errno values), `include/uapi/linux/limits.h` (PATH_MAX 4096, NAME_MAX 255), `include/uapi/linux/stat.h` (S_IFMT, S_IFREG, S_IFDIR, S_IFCHR), read 2026-11-22 | `kernel/core/src/errno.rs`, `kernel/core/src/vfs.rs` |
+| Linux `Documentation/admin-guide/devices.txt` at v6.12 (char 1:3 null, 1:5 zero, 1:9 urandom, 5:1 console; 1:1 mem, 1:2 kmem, 1:4 port are the forbidden ones) | `Device::number` in `kernel/core/src/vfs.rs`; `kernel/keel-kernel/src/fs.rs` |
+| Rust `core::str::Utf8Chunks` (stable since 1.79) and `char::is_control` (Unicode general category Cc: U+0000-U+001F, U+007F-U+009F) | `UserText` in `kernel/hal/src/console.rs` |
 | cpio(5), "New ASCII Format"; Linux `Documentation/driver-api/early-userspace/buffer-format.rst` | `kernel/core/src/cpio.rs` (reader), `xtask/src/cpio.rs` (writer) |
 | Linux `arch/x86/entry/syscalls/syscall_64.tbl`, `include/uapi/asm-generic/errno.h`, `arch/x86/include/uapi/asm/signal.h` at v6.12 (exit 60, exit_group 231, ENOSYS 38, SIGILL 4, SIGTRAP 5, SIGBUS 7, SIGFPE 8, SIGSEGV 11), read 2026-11-22 | `kernel/hal/src/syscall.rs`, `docs/syscalls.md` |
 

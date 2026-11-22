@@ -329,6 +329,7 @@ fn phase1(t: &mut Runner) {
     phase1_sched(t);
     phase1_vm(t);
     phase1_user(t);
+    phase1_fs(t);
     phase1_exec(t);
 }
 
@@ -855,6 +856,89 @@ pub fn phase1_vm(t: &mut Runner) {
     );
 }
 
+/// P1-T12: the root filesystem built at boot from the initramfs, path
+/// lookup, and the device nodes.
+pub fn phase1_fs(t: &mut Runner) {
+    use crate::fs;
+    use keel_core::errno::Errno;
+    use keel_core::vfs::{Device, Kind, ROOT, S_IFCHR, S_IFMT};
+
+    let release = fs::read_file(b"/etc/keel-release");
+    t.check(
+        "fs.initramfs",
+        release.as_deref().is_ok_and(|r| r.starts_with(b"Keel")),
+        "/etc/keel-release from the initramfs is readable in the tmpfs",
+    );
+    t.check(
+        "fs.dot_dot_clamped",
+        fs::lookup(b"/../../etc/./keel-release").is_ok()
+            && fs::lookup(b"/../../etc/./keel-release") == fs::lookup(b"/etc/keel-release")
+            && fs::lookup(b"/..") == Ok(ROOT),
+        "`..` at the root stays at the root (SR-4 groundwork)",
+    );
+    let nodes_ok = [
+        (&b"/dev/console"[..], Device::Console, (5, 1)),
+        (b"/dev/null", Device::Null, (1, 3)),
+        (b"/dev/zero", Device::Zero, (1, 5)),
+        (b"/dev/urandom", Device::Urandom, (1, 9)),
+    ]
+    .iter()
+    .all(|&(path, device, number)| {
+        fs::with(|f| {
+            let ino = f.lookup(ROOT, ROOT, path)?;
+            let stat = f.stat(ino)?;
+            Ok(f.kind(ino)? == Kind::Device(device)
+                && stat.mode & S_IFMT == S_IFCHR
+                && stat.rdev == number)
+        })
+        .unwrap_or(false)
+    });
+    t.check(
+        "fs.dev_nodes",
+        nodes_ok,
+        "/dev/console, null, zero and urandom exist with Linux's device numbers",
+    );
+    t.check(
+        "fs.no_forbidden_devices",
+        [&b"/dev/mem"[..], b"/dev/kmem", b"/dev/port"]
+            .iter()
+            .all(|p| fs::lookup(p) == Err(Errno::ENOENT)),
+        "no /dev/mem, /dev/kmem or /dev/port (SR-9)",
+    );
+
+    let mut zeros = [0xAAu8; 64];
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let devices_ok = fs::device_read(Device::Zero, &mut zeros) == 64
+        && zeros == [0; 64]
+        && fs::device_read(Device::Null, &mut a) == 0
+        && fs::device_read(Device::Urandom, &mut a) == 32
+        && fs::device_read(Device::Urandom, &mut b) == 32
+        && a != b
+        && fs::device_write(Device::Null, b"discarded") == 9
+        && fs::device_write(Device::Console, b"") == 0;
+    t.check(
+        "fs.devices",
+        devices_ok,
+        "zero reads zeros, null reads end of file, urandom gives fresh bytes, writes are consumed",
+    );
+
+    let written = fs::with(|f| {
+        let tmp = f.create_dir(ROOT, b"tmp-selftest", 0o755)?;
+        let file = f.create_file(tmp, b"note", 0o644)?;
+        f.write(file, 0, b"hello")?;
+        f.write(file, 5, b", tmpfs")?;
+        let mut buf = [0u8; 32];
+        let n = f.read(file, 0, &mut buf)?;
+        Ok(buf[..n] == *b"hello, tmpfs" && f.stat(file)?.size == 12)
+    });
+    t.check(
+        "fs.tmpfs_write",
+        written == Ok(true),
+        "files can be created, written and read back",
+    );
+}
+
 /// P1-T11: the initramfs, the ELF loader and the initial process state,
 /// checked from inside a real static executable (`user/tests`, built by
 /// xtask into the initramfs of test builds).
@@ -862,25 +946,16 @@ pub fn phase1_exec(t: &mut Runner) {
     use crate::exec::{self, LoadError};
     use keel_core::elf::{ElfError, PF_R, PF_W, PF_X, PT_LOAD};
 
-    let archive = boot::modules()
-        .find(|m| m.path.ends_with("/initramfs.cpio"))
-        .and_then(|m| keel_core::cpio::parse(m.data).ok());
+    let file = crate::fs::read_file(b"/test/startup");
     t.check(
-        "initramfs.parse",
-        archive.is_some(),
-        "the initramfs boot module parses as a cpio archive",
+        "fs.test_program",
+        file.is_ok(),
+        "test builds carry /test/startup in the root filesystem",
     );
-    let file = archive
-        .as_deref()
-        .and_then(|entries| keel_core::cpio::find(entries, b"test/startup"));
-    t.check(
-        "initramfs.test_program",
-        file.is_some(),
-        "test builds carry test/startup in the initramfs",
-    );
-    let Some(file) = file else {
+    let Ok(file) = file else {
         return;
     };
+    let file: &[u8] = &file;
 
     const PATH: &[u8] = b"/test/startup";
     let run = |argv: &[&[u8]]| {

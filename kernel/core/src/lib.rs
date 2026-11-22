@@ -9,8 +9,10 @@ extern crate alloc;
 pub mod acpi;
 pub mod cpio;
 pub mod elf;
+pub mod errno;
 pub mod exec;
 
 pub mod frame;
 pub mod paging;
+pub mod vfs;
 pub mod vm;

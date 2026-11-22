@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod exec;
+mod fs;
 mod selftest;
 
 use core::panic::PanicInfo;
@@ -127,6 +128,18 @@ extern "C" fn kmain() -> ! {
         panic!("scheduler setup failed: {error:?}");
     }
     interrupts::enable();
+
+    match fs::init() {
+        Ok(r) => kprintln!(
+            "fs: initramfs {} bytes, {} members unpacked into tmpfs ({} unsupported skipped); /dev has console, null, zero, urandom",
+            r.archive_bytes,
+            r.members - r.skipped,
+            r.skipped
+        ),
+        // Without a root filesystem no program can start; the kernel keeps
+        // running so the console shows why.
+        Err(error) => kprintln!("fs: root filesystem not available: {error}"),
+    }
 
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {
