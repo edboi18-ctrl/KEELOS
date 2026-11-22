@@ -402,70 +402,204 @@ fn check_licenses(root: &Path) -> Result<()> {
 /// The only workflow allowed to request a write permission (SR-33).
 const RELEASE_WORKFLOW_FILE: &str = "release.yml";
 
-/// Checks one workflow file against SR-32 and SR-33. Returns the problems
-/// found. Line-based on purpose: the rules are about what must never
-/// appear, and a line check cannot be fooled by YAML structure.
+/// Events a workflow may run on. `push` and `pull_request` for CI and
+/// releases, `schedule` and `workflow_dispatch` for `security.yml`. Every
+/// other trigger is refused: `pull_request_target`, `workflow_run` and
+/// `issue_comment` run with this repository's token on events outsiders
+/// control (SR-33).
+const ALLOWED_TRIGGERS: &[&str] = &["push", "pull_request", "schedule", "workflow_dispatch"];
+
+/// Runner labels a job may use: GitHub-hosted images only (SR-33).
+const ALLOWED_RUNNERS: &[&str] = &["ubuntu-24.04"];
+
+/// The only job that may request write scopes, and which (SR-33): the
+/// release workflow's `publish` job, which runs no repository code.
+const WRITE_JOB: (&str, &str) = (RELEASE_WORKFLOW_FILE, "publish");
+const WRITE_SCOPES: &[&str] = &["contents", "id-token", "attestations"];
+
+/// A key and its value from one line of block-style YAML.
+struct Entry<'a> {
+    indent: usize,
+    key: String,
+    value: &'a str,
+}
+
+/// Splits `key: value` (after an optional `- ` list marker), unquoting the
+/// key so `"permissions": x` cannot pass as something else.
+fn yaml_entry(code: &str) -> Option<Entry<'_>> {
+    let mut indent = code.len() - code.trim_start().len();
+    let mut rest = code.trim_start();
+    while let Some(item) = rest.strip_prefix("- ") {
+        indent += 2;
+        rest = item.trim_start();
+    }
+    let (key, value) = match rest.split_once(": ") {
+        Some((key, value)) => (key, value.trim()),
+        None => (rest.strip_suffix(':')?, ""),
+    };
+    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    if key.is_empty() || key.contains(' ') && !key.starts_with('$') {
+        return None;
+    }
+    Some(Entry {
+        indent,
+        key: key.to_string(),
+        value,
+    })
+}
+
+/// Checks one workflow file against SR-32 to SR-34. Returns the problems
+/// found.
+///
+/// Allow-lists throughout (audit finding 5): a deny-list of forbidden text
+/// missed job-level `write-all`, flow mappings, `secrets[...]`, runner
+/// lists and other triggers. The file is read as the block-style YAML
+/// subset these workflows use; YAML features outside it (anchors, aliases,
+/// merge keys, flow mappings, tags, tabs, several documents) are refused
+/// rather than interpreted, since a line-based reader could misread them.
+/// Contents of block scalars (`run: |`) are scripts, not structure, and
+/// are only searched for `secrets`.
 pub fn workflow_problems(file_name: &str, text: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    let mut in_top_permissions = false;
+    // (indent, key) of the enclosing mappings.
+    let mut path: Vec<(usize, String)> = Vec::new();
+    // Indent of the key that opened a block scalar we are inside.
+    let mut scalar_from: Option<usize> = None;
     let mut saw_top_permissions = false;
+    let mut saw_on = false;
     for (number, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
         let at = |message: &str| format!("{file_name}:{}: {message}", number + 1);
-        if line.trim_start().starts_with('#') {
-            continue; // a comment line; it is not top-level content either
+        let indent = line.len() - line.trim_start().len();
+        if line.trim_start().starts_with('#') || line.trim().is_empty() {
+            continue;
         }
-        let code = line.split(" #").next().unwrap_or(line);
-        let trimmed = code.trim_start().trim_start_matches("- ").trim();
+        if let Some(from) = scalar_from {
+            if indent > from {
+                if contains_word(line, "secrets") {
+                    problems.push(at("workflows must not use secrets (SR-34)"));
+                }
+                continue;
+            }
+            scalar_from = None;
+        }
+        let code = line.split(" #").next().unwrap_or(line).trim_end();
+        if line
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .any(|c| c == '\t')
+        {
+            problems.push(at("tabs are not allowed in workflow YAML"));
+            continue;
+        }
+        if contains_word(code, "secrets") {
+            problems.push(at("workflows must not use secrets (SR-34)"));
+        }
+        if code.trim() == "---" || code.trim() == "..." {
+            problems.push(at("one YAML document per workflow file"));
+            continue;
+        }
+        let Some(entry) = yaml_entry(code) else {
+            // A list item or plain scalar with no key, e.g. a tag pattern.
+            if code
+                .trim_start()
+                .trim_start_matches("- ")
+                .starts_with(['&', '*', '!', '{'])
+            {
+                problems.push(at(
+                    "YAML anchors, aliases, tags and flow mappings are not allowed",
+                ));
+            }
+            continue;
+        };
+        while path.last().is_some_and(|(i, _)| *i >= entry.indent) {
+            path.pop();
+        }
+        if entry.key == "<<"
+            || entry.key.starts_with(['&', '*', '!'])
+            || entry.value.starts_with(['&', '*', '!', '{'])
+        {
+            problems.push(at(
+                "YAML anchors, aliases, merge keys, tags and flow mappings are not allowed",
+            ));
+            path.push((entry.indent, entry.key));
+            continue;
+        }
+        if matches!(entry.value, "|" | ">") || entry.value.starts_with(['|', '>']) {
+            scalar_from = Some(entry.indent);
+        }
+        let keys: Vec<&str> = path.iter().map(|(_, k)| k.as_str()).collect();
+        let key = entry.key.as_str();
 
-        if let Some(action) = trimmed.strip_prefix("uses:") {
-            let action = action.trim();
-            let pinned = action.rsplit_once('@').is_some_and(|(_, reference)| {
-                reference.len() == 40
+        match (keys.as_slice(), key) {
+            ([], "on") => {
+                saw_on = true;
+                if !entry.value.is_empty() {
+                    problems.push(at("`on:` must be a block of trigger names (SR-33)"));
+                }
+            }
+            (["on"], trigger) if !ALLOWED_TRIGGERS.contains(&trigger) => {
+                problems.push(at(&format!(
+                    "trigger `{trigger}` is not allowed; allowed: {ALLOWED_TRIGGERS:?} (SR-33)"
+                )));
+            }
+            ([], "permissions") => saw_top_permissions = true,
+            _ => {}
+        }
+        if key == "permissions" && !entry.value.is_empty() {
+            problems.push(at(
+                "permissions must be a block of `<scope>: read` or `none` entries (SR-33)",
+            ));
+        }
+        if keys.last() == Some(&"permissions") {
+            let write_ok = file_name == WRITE_JOB.0
+                && keys == ["jobs", WRITE_JOB.1, "permissions"]
+                && WRITE_SCOPES.contains(&key);
+            match entry.value {
+                "read" | "none" => {}
+                "write" if write_ok => {}
+                "write" => problems.push(at(
+                    "write permission outside the release workflow's publish job (SR-33)",
+                )),
+                _ => problems.push(at("token permission must be `read` or `none` (SR-33)")),
+            }
+        }
+        if key == "runs-on" && !ALLOWED_RUNNERS.contains(&entry.value) {
+            problems.push(at(&format!(
+                "runner must be one of {ALLOWED_RUNNERS:?}; self-hosted and other runners are forbidden (SR-33)"
+            )));
+        }
+        if key == "uses" {
+            if keys.len() == 2 && keys[0] == "jobs" {
+                problems.push(at(
+                    "reusable workflows (job-level `uses:`) are not allowed (SR-32)",
+                ));
+            }
+            let action = entry.value;
+            let pinned = action.rsplit_once('@').is_some_and(|(name, reference)| {
+                name.split('/').count() >= 2
+                    && !name.starts_with('.')
+                    && reference.len() == 40
                     && reference
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             });
-            if !action.starts_with("./") {
-                if !pinned {
-                    problems.push(at("action is not pinned to a full commit SHA (SR-32)"));
-                } else if !line.contains(" # v") {
-                    problems.push(at(
-                        "pinned action lacks a `# vX.Y.Z` version comment (SR-32)",
-                    ));
-                }
+            if action.starts_with("./") || action.starts_with("docker://") {
+                problems.push(at(
+                    "local and Docker actions are not allowed: only pinned repository actions (SR-32)",
+                ));
+            } else if !pinned {
+                problems.push(at("action is not pinned to a full commit SHA (SR-32)"));
+            } else if !line.contains(" # v") {
+                problems.push(at(
+                    "pinned action lacks a `# vX.Y.Z` version comment (SR-32)",
+                ));
             }
         }
-        if code.contains("pull_request_target") {
-            problems.push(at("pull_request_target is forbidden (SR-33)"));
-        }
-        if code.contains("self-hosted") {
-            problems.push(at("self-hosted runners are forbidden (SR-33)"));
-        }
-        if code.contains("secrets.") {
-            problems.push(at("workflows must not use secrets (SR-34)"));
-        }
-        if trimmed.ends_with(": write") && file_name != RELEASE_WORKFLOW_FILE {
-            problems.push(at("write permission outside the release workflow (SR-33)"));
-        }
-
-        // The top-level `permissions:` block must grant read access only.
-        let top_level = !line.starts_with(' ') && !line.is_empty();
-        if top_level {
-            in_top_permissions = false;
-            if let Some(inline) = code.strip_prefix("permissions:") {
-                saw_top_permissions = true;
-                in_top_permissions = true;
-                let inline = inline.trim();
-                if !(inline.is_empty() || inline == "{}") {
-                    problems.push(at(
-                        "top-level permissions must be a block of `read` entries",
-                    ));
-                }
-            }
-        } else if in_top_permissions && !trimmed.is_empty() && !trimmed.ends_with(": read") {
-            problems.push(at("top-level token permission is not read-only (SR-33)"));
-        }
+        path.push((entry.indent, entry.key));
+    }
+    if !saw_on {
+        problems.push(format!("{file_name}: no top-level `on:` block"));
     }
     if !saw_top_permissions {
         problems.push(format!(
@@ -473,6 +607,16 @@ pub fn workflow_problems(file_name: &str, text: &str) -> Vec<String> {
         ));
     }
     problems
+}
+
+/// Whether `word` occurs in `text` with no letter, digit or `_` on either
+/// side (so `secrets.X`, `secrets['X']` and `toJSON(secrets)` all match).
+fn contains_word(text: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(ident)
+            && !text[i + word.len()..].chars().next().is_some_and(ident)
+    })
 }
 
 fn check_workflows(root: &Path) -> Result<()> {
@@ -755,10 +899,10 @@ mod tests {
         );
     }
 
-    const GOOD_WORKFLOW: &str = "name: ci\non: [push]\npermissions:\n  contents: read\njobs:\n  \
+    const GOOD_WORKFLOW: &str = "name: ci\non:\n  push:\npermissions:\n  contents: read\njobs:\n  \
         build:\n    runs-on: ubuntu-24.04\n    steps:\n      \
         - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      \
-        - run: cargo xtask test\n";
+        - run: |\n          cargo xtask test\n";
 
     #[test]
     fn accepts_a_pinned_read_only_workflow() {
@@ -780,7 +924,7 @@ mod tests {
                 "@3d3c42e # v7.0.1",
             ),
             (" # v7.0.1", ""),
-            ("on: [push]", "on: [pull_request_target]"),
+            ("  push:", "  pull_request_target:"),
             ("ubuntu-24.04", "self-hosted"),
             ("contents: read", "contents: write"),
             ("permissions:\n  contents: read\n", ""),
@@ -800,13 +944,118 @@ mod tests {
         }
     }
 
+    /// One case per row of audit finding 5's table, plus the YAML forms the
+    /// checker refuses rather than reads.
     #[test]
-    fn release_workflow_may_grant_job_level_write() {
-        let release = GOOD_WORKFLOW.replacen(
+    fn rejects_each_bypass_from_audit_finding_5() {
+        let job = "    runs-on: ubuntu-24.04";
+        let cases = [
+            // Job-level write-all and flow mappings.
+            (job, "    permissions: write-all\n    runs-on: ubuntu-24.04"),
+            (
+                job,
+                "    permissions: { contents: write }\n    runs-on: ubuntu-24.04",
+            ),
+            (
+                job,
+                "    permissions: {contents: write}\n    runs-on: ubuntu-24.04",
+            ),
+            (
+                job,
+                "    \"permissions\":\n      contents: write\n    runs-on: ubuntu-24.04",
+            ),
+            ("permissions:\n  contents: read", "permissions: read-all"),
+            ("contents: read", "contents: admin"),
+            // Secrets in any form, including inside a script.
+            ("cargo xtask test", "echo ${{ secrets['NAME'] }}"),
+            ("cargo xtask test", "echo ${{ toJSON(secrets) }}"),
+            ("      - run: |", "      - secrets: inherit\n      - run: |"),
+            // Runner lists, groups and other labels.
+            (job, "    runs-on: [linux, x64]"),
+            (job, "    runs-on:\n      group: big"),
+            (job, "    runs-on: ubuntu-latest"),
+            // Local, Docker and reusable-workflow actions.
+            (
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+                "./.github/actions/x",
+            ),
+            (
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+                "docker://alpine:3",
+            ),
+            (
+                job,
+                "    uses: o/r/.github/workflows/x.yml@3d3c42e5aac5ba805825da76410c181273ba90b1 # v1",
+            ),
+            // Triggers outside the allow-list, and the flow form of `on:`.
+            ("  push:", "  workflow_run:"),
+            ("  push:", "  issue_comment:"),
+            ("on:\n  push:", "on: [push]"),
+            // YAML the checker does not interpret.
+            (job, "    <<: *defaults\n    runs-on: ubuntu-24.04"),
+            (
+                "permissions:\n  contents: read",
+                "permissions: &p\n  contents: read",
+            ),
+            ("name: ci", "---\nname: ci"),
+            ("  contents: read", "\tcontents: read"),
+        ];
+        for (from, to) in cases {
+            assert!(GOOD_WORKFLOW.contains(from), "test setup: {from:?}");
+            let bad = GOOD_WORKFLOW.replacen(from, to, 1);
+            assert!(
+                !workflow_problems("ci.yml", &bad).is_empty(),
+                "should reject replacing {from:?} with {to:?}:\n{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_write_scopes_only_in_the_publish_job() {
+        let publish = GOOD_WORKFLOW.replacen("  build:", "  publish:", 1);
+        let with = |scope: &str| {
+            publish.replacen(
+                "    runs-on",
+                &format!("    permissions:\n      {scope}: write\n    runs-on"),
+                1,
+            )
+        };
+        assert_eq!(
+            workflow_problems("release.yml", &with("id-token")),
+            Vec::<String>::new()
+        );
+        assert!(!workflow_problems("release.yml", &with("actions")).is_empty());
+        assert!(!workflow_problems("ci.yml", &with("contents")).is_empty());
+        let other_job = GOOD_WORKFLOW.replacen(
             "    runs-on",
-            "    permissions:\n      contents: write\n      id-token: write\n    runs-on",
+            "    permissions:\n      contents: write\n    runs-on",
             1,
         );
+        assert!(!workflow_problems("release.yml", &other_job).is_empty());
+    }
+
+    #[test]
+    fn the_repository_workflows_pass() {
+        let dir = util::workspace_root().join(".github").join("workflows");
+        for name in ["ci.yml", "release.yml", "security.yml"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert_eq!(
+                workflow_problems(name, &text),
+                Vec::<String>::new(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_workflow_may_grant_job_level_write() {
+        let release = GOOD_WORKFLOW
+            .replacen("  build:", "  publish:", 1)
+            .replacen(
+                "    runs-on",
+                "    permissions:\n      contents: write\n      id-token: write\n    runs-on",
+                1,
+            );
         assert_eq!(
             workflow_problems("release.yml", &release),
             Vec::<String>::new()
