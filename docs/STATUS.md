@@ -133,6 +133,21 @@ Hardening notes for later Phase 1 work:
   results must travel on a channel user code cannot write (for example a
   second serial port, or the debug-exit code).
 
+## Phase 2 (toy PE loader): in progress
+
+Started 2026-11-22, after the third Phase 1 audit cleared it
+(`docs/PHASE1-AUDIT-3.md`; C1 fixed first, C2 and C3 due before
+Phase 3). Spec section 9 lists the steps but no task IDs; these are
+Keel's.
+
+| ID | Task | Status |
+| --- | --- | --- |
+| P2-T1 | PE parser (`user/pe`, `#![forbid(unsafe_code)]`): headers, sections, base relocations, imports; every offset and size checked; host tests and a malformed-file corpus | Not started |
+| P2-T2 | `peldr` (`user/peldr`): maps the image, relocates, resolves imports to the four stubs, applies section protections, fake TEB through `gs`, calls the entry point | Not started |
+| P2-T3 | `winetest/hello-console`: no-CRT Windows x64 `.exe` importing `GetStdHandle`, `WriteFile`, `ExitProcess` (`raw-dylib`), checked in as a pinned fixture with its build command | Done. Built with the pinned toolchain's `rust-lld` (lld-link mode), no Windows SDK; 2560 bytes, SHA-256 `7c09194a...b943b912`, reproducible (a clean rebuild gave the same hash). ADR 0013 records where `unsafe` may appear for Phase 2. Still to do by the owner: run it on Windows. |
+| P2-T4 | `cargo xtask test --phase 2`: `peldr /winetest/hello.exe` under Linux and on Keel; the exact line on serial and exit status 0 | Not started |
+| P2-S1 | Host fuzz target for the PE parser; 30 minutes with no crash | Not started |
+
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
