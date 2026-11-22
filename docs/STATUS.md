@@ -27,7 +27,7 @@ resume from here.
 | P0-T7 | `ci.yml` | Done: run 44011447886 on the working branch passed both jobs (audit and host tests; QEMU with KVM on a hosted runner). Not yet run on `main`. |
 | P0-T8 | `xtask dist`, `release.yml`, `xtask verify` | Written; artifacts build and the disk image boots in OVMF. The attestation path can only be exercised by a real tagged release. |
 | P0-T9 | Repository setup checklist | Written: `docs/REPOSITORY-SETUP.md`. Owner to carry out. |
-| P0-S1 | Verified downloads; BLAKE2B hashes in `limine.conf` | Done, with a tamper test for kernel and initramfs |
+| P0-S1 | Verified downloads; BLAKE2B hashes in `limine.conf` | Done, with a tamper test for kernel and initramfs. Since audit finding 2, the config's own BLAKE2B is enrolled in the shipped `BOOTX64.EFI` (ADR 0010), with a third tamper test. The boot chain detects corruption; it is not a verified boot until the executable is signed and Secure Boot is on (owner, SR-34). |
 | P0-S2 | `cargo xtask audit` | Done |
 
 ## Phase 1 (kernel core): complete (2026-11-22)
@@ -136,8 +136,10 @@ Hardening notes for later Phase 1 work:
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
-  read back from the framebuffer, plus `sr27.tamper.kernel` and
-  `sr27.tamper.initramfs` (Limine refuses a one-byte change).
+  read back from the framebuffer, plus `sr27.tamper.kernel`,
+  `sr27.tamper.initramfs` and `sr27.tamper.config` (Limine refuses a
+  one-byte change to each; the config's hash is enrolled in
+  `BOOTX64.EFI`).
 - `cargo xtask test --phase 1`: 87 in-kernel tests pass and `KEEL P1 OK`
   is on serial; the six fault scenarios (`double_fault`,
   `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`,

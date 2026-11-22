@@ -60,6 +60,13 @@ pub enum Scenario {
 }
 
 /// Extracts the scenario from a `scenario=<name>` word on the command line.
+///
+/// Scenarios are compiled into release kernels and chosen only by the
+/// command line, which comes from `limine.conf`. That file's hash is
+/// enrolled in `BOOTX64.EFI` (ADR 0010), so the command line is exactly as
+/// trustworthy as the bootloader executable: someone who can replace that
+/// can replace the kernel too. Until it is signed and Secure Boot is on,
+/// that is anyone who can write the boot disk.
 pub fn requested_scenario(cmdline: &str) -> Scenario {
     match cmdline
         .split_ascii_whitespace()

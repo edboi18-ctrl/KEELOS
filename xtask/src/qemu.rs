@@ -599,54 +599,78 @@ pub fn fuzz(minutes: u64, seed: u64, options: &RunOptions) -> Result<()> {
 /// Text Limine prints when a file does not match its pinned hash
 /// (Limine 12.9.6, `common/lib/uri.c`, `uri_hash_mismatch`).
 const LIMINE_HASH_PANIC: &str = "does not match";
+/// Limine v12.9.6 `common/lib/config.c`, `init_config`.
+const LIMINE_CONFIG_PANIC: &str = "CHECKSUM MISMATCH FOR CONFIG FILE";
 
 /// Judges a boot of a tampered image: it passes only if Limine reported
-/// the hash mismatch and the kernel never produced a line of output.
-pub fn tamper_verdict(lines: &[String]) -> std::result::Result<(), String> {
+/// `expected` in a panic and the kernel never produced a line of output.
+pub fn tamper_verdict(lines: &[String], expected: &str) -> std::result::Result<(), String> {
     if lines.iter().any(|line| line.starts_with("Keel ")) {
         return Err("the kernel booted from a tampered image".into());
     }
     if !lines
         .iter()
-        .any(|line| line.contains("PANIC") && line.contains(LIMINE_HASH_PANIC))
+        .any(|line| line.contains("PANIC") && line.contains(expected))
     {
-        return Err("Limine did not report a hash mismatch".into());
+        return Err(format!("Limine did not report \"{expected}\""));
     }
     Ok(())
 }
 
-/// SR-27 negative test: flip one byte of the kernel, then of the
-/// initramfs, and check that the bootloader refuses each image.
+/// SR-27 negative test: flip one byte of the kernel, the initramfs, then
+/// the config (whose hash is enrolled in the EFI executable, audit
+/// finding 2), and check that the bootloader refuses each image.
 fn test_tampered_boot(options: &RunOptions, timeout: Duration) -> Result<()> {
     let tree = build::build_tree(BootMode::Test(0, None))?;
-    for (name, target) in [
-        ("sr27.tamper.kernel", build::KERNEL_PATH),
-        ("sr27.tamper.initramfs", build::INITRAMFS_PATH),
+    // Make Limine report its panics on the serial port, which is the only
+    // output this headless test can read, and enrol that config: this is
+    // a legitimate edit, made before any tampering. (A config mismatch is
+    // reported before the config is read, through the firmware console,
+    // which OVMF also sends to serial.)
+    let file = |name: &str| {
+        tree.files
+            .iter()
+            .find(|(path, _)| *path == name)
+            .map(|(_, d)| d.clone())
+    };
+    let conf = String::from_utf8(file(build::CONFIG_PATH).ok_or("no config in the tree")?)?
+        .replacen("timeout: 0\n", "timeout: 0\nserial: yes\n", 1)
+        .into_bytes();
+    let mut efi = file(build::EFI_PATH).ok_or("no EFI executable in the tree")?;
+    build::enroll_config(&mut efi, &conf)?;
+    for (name, target, expected) in [
+        ("sr27.tamper.kernel", build::KERNEL_PATH, LIMINE_HASH_PANIC),
+        (
+            "sr27.tamper.initramfs",
+            build::INITRAMFS_PATH,
+            LIMINE_HASH_PANIC,
+        ),
+        (
+            "sr27.tamper.config",
+            build::CONFIG_PATH,
+            LIMINE_CONFIG_PANIC,
+        ),
     ] {
         let esp = util::workspace_root().join("target").join("esp-tampered");
         if esp.exists() {
             std::fs::remove_dir_all(&esp)?;
         }
         for (path, data) in &tree.files {
-            let mut data = data.clone();
+            let mut data = match *path {
+                build::CONFIG_PATH => conf.clone(),
+                build::EFI_PATH => efi.clone(),
+                _ => data.clone(),
+            };
             if *path == target {
                 let middle = data.len() / 2;
                 data[middle] ^= 0x01;
             }
-            if *path == build::CONFIG_PATH {
-                // Make Limine report its panic on the serial port, which
-                // is the only output this headless test can read.
-                let conf = String::from_utf8(data)?;
-                data = conf
-                    .replacen("timeout: 0\n", "timeout: 0\nserial: yes\n", 1)
-                    .into_bytes();
-            }
             util::write(&esp.join(path), &data)?;
         }
         let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |line| {
-            line.contains(LIMINE_HASH_PANIC) || line.starts_with("Keel ")
+            line.contains(expected) || line.starts_with("Keel ")
         })?;
-        match tamper_verdict(&capture.lines) {
+        match tamper_verdict(&capture.lines, expected) {
             Ok(()) => println!("  TEST {name} PASS bootloader refused the altered file"),
             Err(reason) => {
                 print_tail(&capture.lines);
@@ -906,11 +930,15 @@ mod tests {
     #[test]
     fn tamper_verdict_needs_a_refusal_and_a_silent_kernel() {
         let refused = lines("limine: Loading...PANIC: Blake2b hash for URI `x` does not match!");
-        assert_eq!(tamper_verdict(&refused), Ok(()));
-        assert!(tamper_verdict(&lines("limine: Loading executable")).is_err());
-        assert!(tamper_verdict(&[]).is_err());
+        assert_eq!(tamper_verdict(&refused, LIMINE_HASH_PANIC), Ok(()));
+        assert!(tamper_verdict(&lines("limine: Loading executable"), LIMINE_HASH_PANIC).is_err());
+        assert!(tamper_verdict(&[], LIMINE_HASH_PANIC).is_err());
         let booted = lines("PANIC: hash does not match\nKeel 0.0.0 booting");
-        assert!(tamper_verdict(&booted).is_err());
+        assert!(tamper_verdict(&booted, LIMINE_HASH_PANIC).is_err());
+        // The config case needs its own message, not just any panic.
+        let config = lines("PANIC: !!! CHECKSUM MISMATCH FOR CONFIG FILE !!!");
+        assert_eq!(tamper_verdict(&config, LIMINE_CONFIG_PANIC), Ok(()));
+        assert!(tamper_verdict(&refused, LIMINE_CONFIG_PANIC).is_err());
     }
 
     #[test]

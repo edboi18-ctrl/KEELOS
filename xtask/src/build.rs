@@ -326,6 +326,42 @@ pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
     conf
 }
 
+/// Marker that precedes the enrolled config checksum in Limine's EFI
+/// executable: 128 hex digits follow it, all `0` when none is enrolled
+/// (Limine v12.9.6 `common/lib/config.c`, `CONFIG_B2SUM_SIGNATURE` and
+/// `CONFIG_B2SUM_EMPTY`; the `limine enroll-config` command in
+/// `host/limine.c` writes the same 128 bytes).
+const CONFIG_B2SUM_SIGNATURE: &[u8] = b"++CONFIG_B2SUM_SIGNATURE++";
+
+/// Enrols the BLAKE2B of `conf` into `efi`, as `limine enroll-config`
+/// does, without needing that host tool (ADR 0010, audit finding 2).
+/// Limine then refuses any other config: on a mismatch it panics before
+/// reading it, and the config editor is disabled. Refuses an executable
+/// with no marker, or more than one, or no hex-digit slot after it, so a
+/// different Limine build cannot be patched in the wrong place.
+pub fn enroll_config(efi: &mut [u8], conf: &[u8]) -> Result<()> {
+    let marks: Vec<usize> = efi
+        .windows(CONFIG_B2SUM_SIGNATURE.len())
+        .enumerate()
+        .filter(|(_, window)| *window == CONFIG_B2SUM_SIGNATURE)
+        .map(|(at, _)| at)
+        .collect();
+    let [at] = marks[..] else {
+        return Err(format!(
+            "BOOTX64.EFI: expected one config checksum marker, found {}",
+            marks.len()
+        )
+        .into());
+    };
+    let start = at + CONFIG_B2SUM_SIGNATURE.len();
+    let slot = efi
+        .get_mut(start..start + 128)
+        .filter(|slot| slot.iter().all(u8::is_ascii_hexdigit))
+        .ok_or("BOOTX64.EFI: no 128-digit checksum slot after the marker")?;
+    slot.copy_from_slice(util::blake2b_hex(conf).as_bytes());
+    Ok(())
+}
+
 /// Builds everything and returns the boot tree in memory.
 pub fn build_tree(mode: BootMode) -> Result<BootTree> {
     let root = util::workspace_root();
@@ -348,9 +384,13 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
     let initramfs = archive.to_bytes()?;
 
     let conf = limine_conf(&kernel, &initramfs, mode);
+    // The pinned SHA-256 covers the file as downloaded; the shipped copy
+    // differs only in the enrolled checksum (docs/DEPENDENCIES.md).
+    let mut efi = util::read(&limine.bootx64_efi)?;
+    enroll_config(&mut efi, conf.as_bytes())?;
     Ok(BootTree {
         files: vec![
-            (EFI_PATH, util::read(&limine.bootx64_efi)?),
+            (EFI_PATH, efi),
             (CONFIG_PATH, conf.into_bytes()),
             (KERNEL_PATH, kernel),
             (INITRAMFS_PATH, initramfs),
@@ -375,6 +415,48 @@ pub fn build(mode: BootMode) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    fn efi_with(slot: &[u8]) -> Vec<u8> {
+        let mut efi = b"MZ...code...".to_vec();
+        efi.extend_from_slice(CONFIG_B2SUM_SIGNATURE);
+        efi.extend_from_slice(slot);
+        efi.extend_from_slice(b"...more");
+        efi
+    }
+
+    #[test]
+    fn enroll_config_writes_the_hash_after_the_marker() {
+        let mut efi = efi_with(&[b'0'; 128]);
+        let before = efi.clone();
+        enroll_config(&mut efi, b"timeout: 0\n").unwrap();
+        let start = 12 + CONFIG_B2SUM_SIGNATURE.len();
+        assert_eq!(
+            &efi[start..start + 128],
+            util::blake2b_hex(b"timeout: 0\n").as_bytes()
+        );
+        assert_eq!(efi[..start], before[..start]);
+        assert_eq!(efi[start + 128..], before[start + 128..]);
+        // Enrolling again (a test that edits the config) replaces it.
+        enroll_config(&mut efi, b"other").unwrap();
+        assert_eq!(
+            &efi[start..start + 128],
+            util::blake2b_hex(b"other").as_bytes()
+        );
+    }
+
+    #[test]
+    fn enroll_config_refuses_unexpected_executables() {
+        let mut none = b"no marker here".to_vec();
+        assert!(enroll_config(&mut none, b"c").is_err());
+        let mut two = efi_with(&[b'0'; 128]);
+        two.extend(efi_with(&[b'0'; 128]));
+        assert!(enroll_config(&mut two, b"c").is_err());
+        let mut short = efi_with(&[b'0'; 100]);
+        short.truncate(12 + CONFIG_B2SUM_SIGNATURE.len() + 100);
+        assert!(enroll_config(&mut short, b"c").is_err());
+        let mut not_hex = efi_with(&[b'z'; 128]);
+        assert!(enroll_config(&mut not_hex, b"c").is_err());
+    }
+
     use super::*;
 
     #[test]
