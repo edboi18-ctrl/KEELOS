@@ -1226,6 +1226,42 @@ pub fn phase1_mitigations(t: &mut Runner) {
         status == Some((0, None)),
         "with VERW on, a user program enters and leaves the kernel normally",
     );
+
+    // The legacy-IBRS entry/exit code and IBPB on switch, forced on where
+    // IA32_SPEC_CTRL and IA32_PRED_CMD accept writes. On a CPU that has
+    // them this is the real mitigation; QEMU's emulator accepts and
+    // ignores the writes, which still runs every instruction of the entry
+    // and exit paths. Where the writes are refused (a virtual CPU without
+    // them) the paths cannot run at all, and the check says so.
+    let value = keel_hal::mitigations::spec_ctrl_now().unwrap_or(0);
+    let writable = keel_hal::mitigations::speculation_msrs_writable();
+    let forced = writable.then(|| {
+        entry::set_mitigations(before.0, true, value, value);
+        sched::set_ibpb_on_switch(true);
+        let status = keel_linux_abi::fs::read_file(b"/test/syscalls")
+            .ok()
+            .and_then(|file| {
+                let path: &[u8] = b"/test/syscalls";
+                // A file name of its own: the first run created the default.
+                let argv: &[&[u8]] = &[path, b"/syscalls-test-file-ibrs"];
+                let loaded = keel_linux_abi::exec::load(&file, path, argv, &[]).ok()?;
+                let spawned = keel_linux_abi::process::spawn("ibrs", &loaded).ok()?;
+                sched::join(spawned.thread);
+                sched::exit_status(spawned.thread)
+            });
+        entry::set_mitigations(before.0, before.1, before.2, before.3);
+        sched::set_ibpb_on_switch(plan.ibpb_on_switch);
+        status
+    });
+    t.check(
+        "vuln.ibrs_entry_path",
+        forced.is_none_or(|status| status == Some((0, None))),
+        if forced.is_some() {
+            "with IBRS writes on every entry and exit, and IBPB on switch, the syscall conformance program passes"
+        } else {
+            "skipped: this CPU refuses IA32_SPEC_CTRL/IA32_PRED_CMD writes, so the paths cannot run here"
+        },
+    );
 }
 
 /// Loads a test program into a fresh address space and runs it as a user

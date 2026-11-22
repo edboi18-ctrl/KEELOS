@@ -115,3 +115,16 @@ pub fn init() -> Report {
 pub fn spec_ctrl_now() -> Option<u64> {
     cpu::rdmsr_safe(IA32_SPEC_CTRL)
 }
+
+/// Whether IA32_SPEC_CTRL and IA32_PRED_CMD accept writes here, for tests
+/// that force the IBRS and IBPB paths on. Rewrites SPEC_CTRL with the
+/// value it already holds and issues one IBPB, so nothing changes.
+pub fn speculation_msrs_writable() -> bool {
+    let Some(current) = spec_ctrl_now() else {
+        return false;
+    };
+    // SAFETY: writing IA32_SPEC_CTRL's own current value back, and an IBPB
+    // (IA32_PRED_CMD 49h, bit 0), change no state other code relies on;
+    // a refused write is caught.
+    unsafe { cpu::wrmsr_safe(IA32_SPEC_CTRL, current) && cpu::wrmsr_safe(0x49, 1) }
+}

@@ -72,7 +72,17 @@ fn hostile() -> impl Iterator<Item = Hostile> {
     HOSTILE.iter().filter_map(|&a| Hostile::new(a))
 }
 
-fn main(_: &Startup) -> i32 {
+fn main(startup: &Startup) -> i32 {
+    // The file the Keel-only checks create; argv[1] overrides it, so a
+    // second run in the same boot can use a fresh name.
+    let mut name_buf = [0u8; 64];
+    let default_name: &[u8] = b"/syscalls-test-file";
+    let name = startup.args().nth(1).unwrap_or(default_name);
+    let len = name.len().min(name_buf.len() - 1);
+    name_buf[..len].copy_from_slice(&name[..len]);
+    let test_file =
+        core::ffi::CStr::from_bytes_until_nul(&name_buf).unwrap_or(c"/syscalls-test-file");
+
     let mut c = Checks {
         number: 0,
         failed: None,
@@ -310,7 +320,7 @@ fn main(_: &Startup) -> i32 {
         // Files: create, write, stat, exclusive create, read back.
         let f = sys::openat(
             sys::AT_FDCWD,
-            c"/syscalls-test-file",
+            test_file,
             sys::O_CREAT | sys::O_EXCL | sys::O_RDWR,
             0o644,
         ) as i32;
@@ -330,12 +340,12 @@ fn main(_: &Startup) -> i32 {
             "Keel only: O_EXCL on an existing file is EEXIST",
             sys::openat(
                 sys::AT_FDCWD,
-                c"/syscalls-test-file",
+                test_file,
                 sys::O_CREAT | sys::O_EXCL | sys::O_RDWR,
                 0o644,
             ) == EEXIST,
         );
-        let g = sys::openat(sys::AT_FDCWD, c"/syscalls-test-file", sys::O_RDONLY, 0) as i32;
+        let g = sys::openat(sys::AT_FDCWD, test_file, sys::O_RDONLY, 0) as i32;
         let mut back = [0u8; 8];
         c.check(
             "Keel only: read back what was written",
