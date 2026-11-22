@@ -27,6 +27,10 @@ Commands:
                             Build, then boot in QEMU with serial on stdio
   test  [--phase N] [--kvm] [--accel NAME] [--timeout SECONDS]
                             Build, boot headless, run the in-guest tests
+  fuzz  [--minutes N] [--seed S] [--kvm] [--accel NAME]
+                            Boot the in-guest system-call fuzzer for N
+                            minutes (default 60); fails on a kernel panic
+                            or a hung fuzz process
   dist  [--version V] [--allow-dirty]
                             Build release artifacts into target/dist
   boot-check <image> [--kvm] [--accel NAME]
@@ -124,6 +128,26 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
             qemu::test(phase, &options, timeout)
+        }
+        "fuzz" => {
+            let options = run_options(&mut args)?;
+            let minutes = take_value(&mut args, "--minutes")?
+                .map(|v| v.parse::<u64>().map_err(|_| "--minutes needs a number"))
+                .transpose()?
+                .unwrap_or(60);
+            // Without --seed, one from the clock; it is printed, so the
+            // session can be repeated.
+            let seed = match take_value(&mut args, "--seed")? {
+                Some(v) => v.parse::<u64>().map_err(|_| "--seed needs a number")?,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            };
+            no_extra_args(&args)?;
+            if options.gdb {
+                return Err("--gdb is only for `cargo xtask run`".into());
+            }
+            qemu::fuzz(minutes, seed, &options)
         }
         "dist" => {
             let version = take_value(&mut args, "--version")?;

@@ -10,7 +10,7 @@
 //! `Frame` the allocator currently has allocated, so a stray physical
 //! address cannot be used to read or write arbitrary memory.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::IrqMutex;
 use keel_core::frame::{FRAME_SIZE, Frame, FrameAllocator, FrameError, bookkeeping_len};
@@ -108,6 +108,10 @@ pub fn init() -> Result<MemoryStats, MemoryInitError> {
         bookkeeping: base..base + bytes,
     };
     HHDM.store(hhdm, Ordering::Release);
+    USER_RESERVE.store(
+        (stats.frames_managed / 16).clamp(USER_RESERVE_MIN, USER_RESERVE_MAX),
+        Ordering::Relaxed,
+    );
     *frames = Some(allocator);
     Ok(stats)
 }
@@ -124,6 +128,54 @@ pub fn allocate_zeroed() -> Option<Frame> {
     // SAFETY: the frame was just allocated, so nobody else owns it; it is
     // in a `Usable` region, which the HHDM maps read-write; the write
     // covers exactly the frame's 4096 bytes.
+    unsafe { frame_pointer(frame).write_bytes(0, FRAME_SIZE as usize) };
+    Some(frame)
+}
+
+/// Frames user page faults may never take: 1/16 of memory, between 16 MiB
+/// and 256 MiB. A program that touches all the memory it can map (the
+/// fuzzer found one) then gets its fault refused while the kernel still
+/// has frames for page tables, its heap and thread stacks. Interim floor
+/// until per-compartment memory limits (SR-8, P3-S4).
+static USER_RESERVE: AtomicUsize = AtomicUsize::new(USER_RESERVE_MIN);
+const USER_RESERVE_MIN: usize = 4096;
+const USER_RESERVE_MAX: usize = 65536;
+static USER_RESERVE_HIT: AtomicBool = AtomicBool::new(false);
+
+/// The kernel's reserve, in frames (see [`allocate_zeroed_user`]).
+pub fn user_reserve() -> usize {
+    USER_RESERVE.load(Ordering::Relaxed)
+}
+
+/// Sets the reserve and returns the old one (tests raise it to check the
+/// refusal, then put it back).
+pub fn set_user_reserve(frames: usize) -> usize {
+    USER_RESERVE.swap(frames, Ordering::Relaxed)
+}
+
+/// As [`allocate_zeroed`], for a page of user memory: fails once only the
+/// kernel's reserve is left. The first refusal is logged.
+pub fn allocate_zeroed_user() -> Option<Frame> {
+    let reserve = user_reserve();
+    let frame = {
+        let mut frames = FRAMES.lock();
+        let allocator = frames.as_mut()?;
+        if allocator.free_frames() <= reserve {
+            None
+        } else {
+            allocator.allocate()
+        }
+    };
+    let Some(frame) = frame else {
+        if !USER_RESERVE_HIT.swap(true, Ordering::Relaxed) {
+            crate::kprintln!(
+                "memory: user page refused: only the kernel reserve ({reserve} frames) is free; further refusals are not logged"
+            );
+        }
+        return None;
+    };
+    // SAFETY: as in `allocate_zeroed`: the frame was just allocated and
+    // is mapped read-write by the HHDM; exactly its 4096 bytes are written.
     unsafe { frame_pointer(frame).write_bytes(0, FRAME_SIZE as usize) };
     Some(frame)
 }

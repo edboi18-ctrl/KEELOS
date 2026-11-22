@@ -32,6 +32,18 @@ pub fn requested_phase(cmdline: &str) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
+/// `fuzz=<minutes> seed=<n>` on the command line: a fuzzing session
+/// instead of the phase tests (`cargo xtask fuzz`).
+pub fn requested_fuzz(cmdline: &str) -> Option<(u64, u64)> {
+    let value = |key: &str| {
+        cmdline
+            .split_ascii_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    Some((value("fuzz=")?, value("seed=").unwrap_or(0)))
+}
+
 /// Scenarios: boots that test one behaviour which ends the kernel, such as
 /// a double fault. Selected with `scenario=<name>` next to `test=<n>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +347,8 @@ fn phase1(t: &mut Runner) {
     phase1_rights(t);
     phase1_exec(t);
     phase1_mitigations(t);
+    phase1_robustness(t);
+    phase1_fuzz_smoke(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -1099,6 +1113,269 @@ pub fn phase1_musl(t: &mut Runner) {
             used
         );
     }
+}
+
+/// System calls per fuzz run (`user/tests/fuzz`). A run ends when they
+/// are made, or earlier if the program kills itself (by unmapping its own
+/// code, say); either way a new run starts with the next seed.
+const FUZZ_CALLS: u64 = 2_000;
+/// A fuzz run that has not ended by then counts as a hang: Keel has no
+/// way to stop a thread yet, and the fuzzer avoids every call that can
+/// wait for long, so a hang is a kernel bug to investigate. Generous,
+/// because a single legitimate call can move 2 GiB (MAX_RW_COUNT), which
+/// takes over a minute without hardware acceleration.
+const FUZZ_RUN_LIMIT_MS: u64 = 600_000;
+/// The harness wakes every second while a run goes on. If it is ever kept
+/// from running for longer than this, the kernel failed to preempt the
+/// fuzz process (as before system calls became preemptible).
+const FUZZ_MAX_WAKE_MS: u64 = 5_000;
+
+/// What a fuzzing session did.
+struct FuzzReport {
+    runs: u64,
+    calls: u64,
+    /// Runs the kernel ended with a user fault (the fuzzer harmed itself).
+    faulted: u64,
+    /// Seed of a run that did not end in time.
+    hung: Option<u64>,
+    /// Longest the harness thread waited past its one-second wake-up.
+    worst_wake_ms: u64,
+}
+
+/// Runs fuzz processes one after another, run `i` with seed `seed + i`,
+/// until `deadline_ns` (monotonic) or `max_runs`. Each seed is logged
+/// before its run, so the last one in the log is the one to replay.
+fn fuzz_session(seed: u64, deadline_ns: u64, max_runs: u64, verbose: bool) -> FuzzReport {
+    use alloc::format;
+    const PATH: &[u8] = b"/test/fuzz";
+    let mut report = FuzzReport {
+        runs: 0,
+        calls: 0,
+        faulted: 0,
+        hung: None,
+        worst_wake_ms: 0,
+    };
+    let Ok(file) = keel_linux_abi::fs::read_file(PATH) else {
+        kprintln!(
+            "fuzz: {} missing",
+            core::str::from_utf8(PATH).unwrap_or("?")
+        );
+        return report;
+    };
+    let calls_before = keel_linux_abi::syscall::count();
+    let calls = format!("{FUZZ_CALLS}");
+    let start = time::monotonic_nanos();
+    let mut next_report = start + 60_000_000_000;
+    while report.runs < max_runs && time::monotonic_nanos() < deadline_ns {
+        let run_seed = seed.wrapping_add(report.runs);
+        let seed_text = format!("{run_seed}");
+        let args: [&[u8]; 3] = [PATH, seed_text.as_bytes(), calls.as_bytes()];
+        if verbose {
+            kprintln!("fuzz: run {} seed {run_seed}", report.runs);
+        }
+        let spawned = keel_linux_abi::exec::load(&file, PATH, &args, &[])
+            .ok()
+            .and_then(|loaded| keel_linux_abi::process::spawn("fuzz", &loaded).ok());
+        let Some(spawned) = spawned else {
+            kprintln!(
+                "fuzz: could not start run {} (seed {run_seed})",
+                report.runs
+            );
+            report.hung = Some(run_seed);
+            break;
+        };
+        let run_start = time::monotonic_nanos();
+        let mut last_wake = run_start;
+        let ended = loop {
+            let ended = sched::join_timeout(spawned.thread, 1000);
+            let now = time::monotonic_nanos();
+            let late_ms = (now - last_wake).saturating_sub(1_000_000_000) / 1_000_000;
+            report.worst_wake_ms = report.worst_wake_ms.max(late_ms);
+            last_wake = now;
+            if verbose && now >= next_report {
+                next_report = now + 60_000_000_000;
+                kprintln!(
+                    "fuzz: {} min: {} runs done, {} system calls, {} free frames, worst wake-up delay {} ms",
+                    (now - start) / 60_000_000_000,
+                    report.runs,
+                    keel_linux_abi::syscall::count() - calls_before,
+                    memory::free_frames(),
+                    report.worst_wake_ms
+                );
+            }
+            if ended {
+                break true;
+            }
+            if now - run_start > FUZZ_RUN_LIMIT_MS * 1_000_000 {
+                break false;
+            }
+        };
+        if !ended {
+            kprintln!(
+                "fuzz: run {} (seed {run_seed}) did not end within {} s",
+                report.runs,
+                FUZZ_RUN_LIMIT_MS / 1000
+            );
+            report.hung = Some(run_seed);
+            break;
+        }
+        if let Some((_, Some(_))) = sched::exit_status(spawned.thread) {
+            report.faulted += 1;
+        }
+        report.runs += 1;
+    }
+    report.calls = keel_linux_abi::syscall::count() - calls_before;
+    report
+}
+
+/// The fuzzing boot (`cargo xtask fuzz`): `minutes` of runs from `seed`.
+/// Security acceptance P1 item 6 is a 60-minute session that passes.
+pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
+    let mut runner = Runner {
+        passed: 0,
+        failed: 0,
+    };
+    kprintln!("fuzz: {minutes} min from seed {seed}, {FUZZ_CALLS} calls per run");
+    keel_linux_abi::syscall::set_slow_log(true);
+    let frames_before = memory::free_frames();
+    let start = time::monotonic_nanos();
+    let deadline = start.saturating_add(minutes.saturating_mul(60_000_000_000));
+    let report = fuzz_session(seed, deadline, u64::MAX, true);
+    let elapsed_s = (time::monotonic_nanos() - start) / 1_000_000_000;
+    kprintln!(
+        "fuzz: done: {} runs, {} system calls, {} runs ended by a fault, {} s, worst harness wake-up delay {} ms, free frames {} -> {}",
+        report.runs,
+        report.calls,
+        report.faulted,
+        elapsed_s,
+        report.worst_wake_ms,
+        frames_before,
+        memory::free_frames()
+    );
+    runner.check(
+        "fuzz.syscalls",
+        report.hung.is_none() && report.runs > 0 && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
+        "random system calls from user programs: no kernel panic, no hung run, and the kernel stays responsive, for the whole session",
+    );
+    kprintln!(
+        "TEST SUMMARY passed={} failed={}",
+        runner.passed,
+        runner.failed
+    );
+    runner.failed == 0
+}
+
+/// Regression tests for what the fuzzer found (F-0005 to F-0008).
+pub fn phase1_robustness(t: &mut Runner) {
+    use keel_core::vm::{Placement, Prot};
+    use keel_hal::vm::AddressSpace;
+
+    // F-0005: distinct unknown numbers outside the table do not each add
+    // a log line (nor kernel memory).
+    let before = keel_linux_abi::syscall::unimplemented_lines();
+    for number in 0..1000u64 {
+        let call = keel_hal::syscall::SyscallArgs {
+            number: 0x1_0000_0000 + number * 7919,
+            args: [0; 6],
+            user_rsp: 0,
+        };
+        let _ = keel_linux_abi::syscall::handle(&call);
+    }
+    let added = keel_linux_abi::syscall::unimplemented_lines() - before;
+    t.check(
+        "syscall.log_bounded",
+        added <= 1,
+        "1000 distinct unknown numbers outside the table add at most one log line (F-0005)",
+    );
+
+    // F-0006: protecting and unmapping a 64 TiB reservation costs time in
+    // proportion to the pages present (none), not to its length.
+    let huge = AddressSpace::new().ok().and_then(|space| {
+        let start = space
+            .map(Placement::Anywhere { hint: 0 }, 1 << 46, Prot::NONE)
+            .ok()?;
+        let begin = time::monotonic_nanos();
+        space.protect(start, 1 << 46, Prot::READ_WRITE).ok()?;
+        space.protect(start, 1 << 46, Prot::NONE).ok()?;
+        space.unmap(start, 1 << 46).ok()?;
+        Some((time::monotonic_nanos() - begin) / 1_000_000)
+    });
+    t.check(
+        "vm.huge_range_fast",
+        huge.is_some_and(|ms| ms < 2000),
+        "mprotect twice and munmap of an empty 64 TiB reservation take under 2 s (F-0006)",
+    );
+    if let Some(ms) = huge {
+        kprintln!("  64 TiB mprotect/mprotect/munmap: {ms} ms");
+    }
+
+    // F-0007: user page faults never take the kernel's reserve.
+    let old = memory::set_user_reserve(memory::free_frames() + 16);
+    let user = memory::allocate_zeroed_user();
+    let kernel = memory::allocate_zeroed();
+    memory::set_user_reserve(old);
+    let refused = user.is_none() && kernel.is_some();
+    for frame in [user, kernel].into_iter().flatten() {
+        let _ = memory::release(frame);
+    }
+    t.check(
+        "memory.user_reserve",
+        refused,
+        "a user page is refused once only the kernel reserve is free; the kernel still gets frames (F-0007)",
+    );
+
+    // F-0008: a long system call is preempted. A kernel thread counting
+    // 5 ms sleeps keeps running while `user/tests/longcall` spends
+    // seconds (without acceleration) in one 128 MiB getrandom.
+    static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    STOP.store(false, Ordering::Relaxed);
+    let ticker = sched::spawn("ticker", || {
+        while !STOP.load(Ordering::Relaxed) {
+            sched::sleep_ms(5);
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    const PATH: &[u8] = b"/test/longcall";
+    let ticks_before = TICKS.load(Ordering::Relaxed);
+    let begin = time::monotonic_nanos();
+    let status = keel_linux_abi::fs::read_file(PATH).ok().and_then(|file| {
+        let loaded = keel_linux_abi::exec::load(&file, PATH, &[PATH], &[]).ok()?;
+        let spawned = keel_linux_abi::process::spawn("longcall", &loaded).ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    });
+    let elapsed_ms = (time::monotonic_nanos() - begin) / 1_000_000;
+    let ticks = TICKS.load(Ordering::Relaxed) - ticks_before;
+    STOP.store(true, Ordering::Relaxed);
+    if let Ok(id) = ticker {
+        join(id);
+    }
+    // At least one tick per 50 ms of the call, on average (a 5 ms sleep
+    // with 10 ms time slices); without preemption there is about one.
+    t.check(
+        "sched.syscall_preemptible",
+        status == Some((0, None)) && ticker.is_ok() && ticks >= (elapsed_ms / 50).max(1),
+        "a kernel thread keeps running while a user program is inside one long system call (F-0008)",
+    );
+    kprintln!("  longcall: {elapsed_ms} ms, ticker ran {ticks} times, exit {status:?}");
+}
+
+/// A short fuzzing smoke test in every phase 1 boot: three runs with fixed
+/// seeds (the full session is `cargo xtask fuzz`).
+pub fn phase1_fuzz_smoke(t: &mut Runner) {
+    let report = fuzz_session(0x6b65_656c, u64::MAX, 3, false);
+    t.check(
+        "fuzz.smoke",
+        report.hung.is_none() && report.runs == 3 && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
+        "three runs of random system calls end without a kernel panic or a hung call",
+    );
+    kprintln!(
+        "  fuzz smoke: {} runs, {} system calls, {} ended by a fault",
+        report.runs,
+        report.calls,
+        report.faulted
+    );
 }
 
 /// Security acceptance P1 item 4: a write through a read-only handle (and

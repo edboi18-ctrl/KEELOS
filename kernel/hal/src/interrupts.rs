@@ -204,6 +204,11 @@ pub fn enable() {
     unsafe { crate::arch::x86_64::cpu::enable_interrupts() }
 }
 
+/// Whether [`enable`] has run (interrupts are in use).
+pub fn are_enabled() -> bool {
+    ENABLED.load(Ordering::Acquire)
+}
+
 /// Halts until the next interrupt. Only valid after `enable`.
 pub fn wait() {
     assert!(

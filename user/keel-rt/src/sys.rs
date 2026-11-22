@@ -368,6 +368,11 @@ impl Region {
         call3(nr::MPROTECT, self.address, self.length, prot)
     }
 
+    /// getrandom(2) of `len` bytes into the region (one call).
+    pub fn getrandom(&self, len: u64) -> i64 {
+        call3(nr::GETRANDOM, self.address, len.min(self.length), 0)
+    }
+
     /// poll(2) on `nfds` `struct pollfd`s at the start of the region, with
     /// timeout 0.
     pub fn poll(&self, nfds: u64) -> i64 {

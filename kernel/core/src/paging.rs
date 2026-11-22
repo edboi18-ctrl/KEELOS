@@ -231,6 +231,38 @@ pub fn unmap_small<A: TableAccess>(access: &mut A, root: Frame, virt: u64) -> Op
     Some(phys)
 }
 
+/// The lowest page address in `[from, to)` of the lower (user) half with a
+/// present 4 KiB leaf, or `None`. Where an upper-level entry is absent (or
+/// is a large page), the whole span it covers is skipped at once, so the
+/// cost follows the page tables that exist, not the length of the range:
+/// a 64 TiB reservation with nothing in it costs a few hundred steps.
+pub fn next_present_small<A: TableAccess>(
+    access: &mut A,
+    root: Frame,
+    from: u64,
+    to: u64,
+) -> Option<u64> {
+    const LOWER_HALF_END: u64 = 1 << 47;
+    let end = to.min(LOWER_HALF_END);
+    let mut virt = from & !(PageSize::Small.bytes() - 1);
+    'search: while virt < end {
+        let mut table = root;
+        for level in 0..4 {
+            let entry = access.table(table)[index(virt, level)];
+            let span = 1u64 << (39 - 9 * level);
+            if entry & PRESENT == 0 || (level > 0 && level < 3 && entry & HUGE != 0) {
+                virt = (virt & !(span - 1)).checked_add(span)?;
+                continue 'search;
+            }
+            if level == 3 {
+                return Some(virt);
+            }
+            table = Frame::containing(entry & ADDRESS_MASK);
+        }
+    }
+    None
+}
+
 /// Replaces the 4 KiB leaf at `virt` with a mapping of `phys` and
 /// returns the physical address it pointed to before. The intermediate
 /// tables must already exist (the page must have been mapped). The caller
@@ -711,6 +743,45 @@ mod tests {
         assert_eq!(
             map(&mut t, root, KERNEL, 0, PageSize::Large, Flags::DATA),
             Err(MapError::AlreadyMapped)
+        );
+    }
+
+    #[test]
+    fn next_present_small_skips_empty_spans() {
+        let (mut t, root) = HeapTables::new();
+        let pages = [0x40_0000u64, 0x40_1000, 0x7f00_0000_0000, 0x7fff_ffff_e000];
+        for &p in &pages {
+            map(&mut t, root, p, 0x1000, PageSize::Small, Flags::DATA).unwrap();
+        }
+        let mut found = Vec::new();
+        let mut at = 0;
+        let mut steps = 0;
+        while let Some(p) = next_present_small(&mut t, root, at, u64::MAX) {
+            found.push(p);
+            at = p + 0x1000;
+            steps += 1;
+            assert!(steps < 10);
+        }
+        assert_eq!(found, pages);
+        // Bounds: `to` is exclusive, `from` is rounded down to its page.
+        assert_eq!(
+            next_present_small(&mut t, root, 0x40_0fff, 0x40_1000),
+            Some(0x40_0000)
+        );
+        assert_eq!(
+            next_present_small(&mut t, root, 0x40_1001, 0x40_2000),
+            Some(0x40_1000)
+        );
+        assert_eq!(
+            next_present_small(&mut t, root, 0x40_2000, 0x7f00_0000_0000),
+            None
+        );
+        assert_eq!(next_present_small(&mut t, root, 0, 0x40_0000), None);
+        // Kernel half: never reported.
+        map(&mut t, root, KERNEL, 0x1000, PageSize::Small, Flags::DATA).unwrap();
+        assert_eq!(
+            next_present_small(&mut t, root, 0x8000_0000_0000, u64::MAX),
+            None
         );
     }
 

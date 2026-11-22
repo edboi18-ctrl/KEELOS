@@ -44,10 +44,28 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
     // Copy the handler out so the lock is not held during the call, which
     // may block or switch threads.
     let handler = *HANDLER.lock();
+    // The call runs with interrupts enabled, as on Linux, so the timer
+    // can preempt a long one (a 2 GiB getrandom took 70 s under emulation
+    // with every other thread stalled; found by the fuzzer). This is safe
+    // because every kernel lock is an IrqMutex, which disables interrupts
+    // while held, so no thread is ever preempted holding a lock
+    // (docs/locking.md); kernel threads already run preemptibly on the
+    // same code. The register state is all in `frame` on this thread's
+    // kernel stack, and the entry code's per-CPU scratch is not used
+    // after the frame is built. Interrupts are disabled again before
+    // returning: the exit path switches to the user-view page tables and
+    // the trampoline stack and must not be interrupted.
+    let preemptible = crate::interrupts::are_enabled();
+    if preemptible {
+        // SAFETY: interrupts are set up (`are_enabled`), and this thread
+        // holds no lock here: `HANDLER`'s guard was dropped above.
+        unsafe { crate::arch::x86_64::cpu::enable_interrupts() };
+    }
     let result = match handler {
         Some(handler) => handler(&call),
         None => -ENOSYS,
     };
+    crate::arch::x86_64::cpu::disable_interrupts();
     frame.rax = result as u64;
 }
 

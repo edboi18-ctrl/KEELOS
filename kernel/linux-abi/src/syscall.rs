@@ -7,12 +7,11 @@
 //! lock is held while user memory is copied, so a page fault during the
 //! copy cannot deadlock.
 
-use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use keel_core::errno::Errno;
 
 use keel_core::handle::{Handle, Refusal, Rights};
@@ -65,7 +64,13 @@ pub fn init() {
     sched::set_exit_hook(process::on_thread_exit);
 }
 
-static LOGGED: IrqMutex<BTreeSet<u64>> = IrqMutex::new(BTreeSet::new());
+/// Which unimplemented numbers below TABLE_SIZE have been logged: a fixed
+/// bitmap, so no sequence of calls can make it grow. Numbers at or above
+/// TABLE_SIZE are logged once in all (F-0005: one entry per distinct
+/// 64-bit number let a program grow kernel memory and flood the serial
+/// line without limit).
+static LOGGED: IrqMutex<([u64; TABLE_SIZE as usize / 64], bool)> =
+    IrqMutex::new(([0; TABLE_SIZE as usize / 64], false));
 
 type ProcessRef = Arc<IrqMutex<Process>>;
 /// A table entry: the process and the six raw arguments.
@@ -102,8 +107,60 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t
 };
 
+/// System calls made since boot (the fuzzer reports it).
+static CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn count() -> u64 {
+    CALLS.load(Ordering::Relaxed)
+}
+
+/// When on (the fuzzer turns it on), calls that take over a second are
+/// logged with their arguments, the first `SLOW_LOG_MAX` of them.
+static SLOW_LOG: AtomicBool = AtomicBool::new(false);
+static SLOW_LOGGED: AtomicU64 = AtomicU64::new(0);
+const SLOW_LOG_MAX: u64 = 20;
+const SLOW_NS: u64 = 1_000_000_000;
+
+/// Lines the unimplemented-call log has printed (F-0005's regression
+/// test checks it stays bounded).
+static UNIMPLEMENTED_LINES: AtomicU64 = AtomicU64::new(0);
+
+pub fn unimplemented_lines() -> u64 {
+    UNIMPLEMENTED_LINES.load(Ordering::Relaxed)
+}
+
+pub fn set_slow_log(on: bool) {
+    SLOW_LOG.store(on, Ordering::Relaxed);
+}
+
 /// The system-call entry point.
 pub fn handle(call: &SyscallArgs) -> i64 {
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    if !SLOW_LOG.load(Ordering::Relaxed) {
+        return dispatch(call);
+    }
+    let start = time::monotonic_nanos();
+    let result = dispatch(call);
+    let took = time::monotonic_nanos() - start;
+    if took > SLOW_NS && SLOW_LOGGED.fetch_add(1, Ordering::Relaxed) < SLOW_LOG_MAX {
+        let a = call.args;
+        kprintln!(
+            "syscall: slow: {} ({}) took {} ms; args {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} -> {result:#x}",
+            names::name(call.number).unwrap_or("unknown"),
+            call.number,
+            took / 1_000_000,
+            a[0],
+            a[1],
+            a[2],
+            a[3],
+            a[4],
+            a[5]
+        );
+    }
+    result
+}
+
+fn dispatch(call: &SyscallArgs) -> i64 {
     let a = call.args;
     let number = call.number;
     let result: SysResult = match number {
@@ -134,7 +191,26 @@ pub fn handle(call: &SyscallArgs) -> i64 {
 }
 
 fn unimplemented(number: u64, a: &[u64; 6]) -> SysResult {
-    if LOGGED.lock().insert(number) {
+    let first = {
+        let mut logged = LOGGED.lock();
+        if number < TABLE_SIZE {
+            let (word, bit) = ((number / 64) as usize, 1u64 << (number % 64));
+            let first = logged.0[word] & bit == 0;
+            logged.0[word] |= bit;
+            first
+        } else {
+            !core::mem::replace(&mut logged.1, true)
+        }
+    };
+    if first {
+        UNIMPLEMENTED_LINES.fetch_add(1, Ordering::Relaxed);
+    }
+    if first && number >= TABLE_SIZE {
+        kprintln!(
+            "syscall: {number:#x} is outside the table (0-{}); not implemented -> ENOSYS. Further numbers outside the table are not logged.",
+            TABLE_SIZE - 1
+        );
+    } else if first {
         kprintln!(
             "syscall: {} ({number}) not implemented; args {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} -> ENOSYS",
             names::name(number).unwrap_or("unknown"),

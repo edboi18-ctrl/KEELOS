@@ -35,3 +35,13 @@ bench = false
 name = "rights"
 test = false
 bench = false
+
+[[bin]]
+name = "fuzz"
+test = false
+bench = false
+
+[[bin]]
+name = "longcall"
+test = false
+bench = false

@@ -167,30 +167,19 @@ impl AddressSpace {
     pub fn protect(&self, start: u64, length: u64, prot: Prot) -> Result<(), AsError> {
         let mut inner = self.inner.lock();
         let none = prot == Prot::NONE;
+        // Only present pages and parked frames are visited, never every
+        // page of the range: a range can be terabytes (a reservation).
         for (from, to) in inner.layout.protect(start, length, prot)? {
-            let mut page = from;
-            while page < to {
+            let mut at = from;
+            while let Some(page) =
+                paging::next_present_small(&mut DirectMapTables, self.root, at, to)
+            {
+                at = page + PAGE;
                 if none {
                     // Take the frame out of the page tables entirely.
                     if let Some(phys) = paging::unmap_small(&mut DirectMapTables, self.root, page) {
                         cpu::invalidate_page(page);
                         inner.parked.insert(page, Frame::containing(phys));
-                    }
-                } else if let Some(frame) = inner.parked.remove(&page) {
-                    let exclusive = memory::references(frame) == 1;
-                    let mapped = paging::map(
-                        &mut DirectMapTables,
-                        self.root,
-                        page,
-                        frame.address(),
-                        PageSize::Small,
-                        user_flags(prot, exclusive),
-                    );
-                    if mapped.is_err() {
-                        // Only possible when a page table cannot be
-                        // allocated: keep the data parked and report it.
-                        inner.parked.insert(page, frame);
-                        return Err(AsError::OutOfMemory);
                     }
                 } else if let Some(t) = paging::translate(&mut DirectMapTables, self.root, page) {
                     let exclusive = memory::references(Frame::containing(t.phys)) == 1;
@@ -203,24 +192,61 @@ impl AddressSpace {
                     );
                     cpu::invalidate_page(page);
                 }
-                page += PAGE;
+            }
+            if none {
+                continue;
+            }
+            // Parked PROT_NONE frames in the range get mapped again.
+            let parked: alloc::vec::Vec<u64> = inner
+                .parked
+                .range(from..to)
+                .map(|(&page, _)| page)
+                .collect();
+            for page in parked {
+                let Some(frame) = inner.parked.remove(&page) else {
+                    continue;
+                };
+                let exclusive = memory::references(frame) == 1;
+                let mapped = paging::map(
+                    &mut DirectMapTables,
+                    self.root,
+                    page,
+                    frame.address(),
+                    PageSize::Small,
+                    user_flags(prot, exclusive),
+                );
+                if mapped.is_err() {
+                    // Only possible when a page table cannot be
+                    // allocated: keep the data parked and report it.
+                    inner.parked.insert(page, frame);
+                    return Err(AsError::OutOfMemory);
+                }
             }
         }
         self.sync_user_view();
         Ok(())
     }
 
+    /// Frees every page in `[from, to)`. Visits only present pages and
+    /// parked frames (the range can be terabytes; found by the fuzzer).
     fn unmap_pages(&self, inner: &mut Inner, from: u64, to: u64) {
-        let mut page = from;
-        while page < to {
+        let mut at = from;
+        while let Some(page) = paging::next_present_small(&mut DirectMapTables, self.root, at, to) {
+            at = page + PAGE;
             if let Some(phys) = paging::unmap_small(&mut DirectMapTables, self.root, page) {
                 cpu::invalidate_page(page);
                 let _ = memory::release(Frame::containing(phys));
             }
+        }
+        let parked: alloc::vec::Vec<u64> = inner
+            .parked
+            .range(from..to)
+            .map(|(&page, _)| page)
+            .collect();
+        for page in parked {
             if let Some(frame) = inner.parked.remove(&page) {
                 let _ = memory::release(frame);
             }
-            page += PAGE;
         }
     }
 
@@ -239,7 +265,7 @@ impl AddressSpace {
         match action {
             FaultAction::Violation => false,
             FaultAction::DemandZero(prot) => {
-                let Some(frame) = memory::allocate_zeroed() else {
+                let Some(frame) = memory::allocate_zeroed_user() else {
                     return false;
                 };
                 let mapped = paging::map(
@@ -266,7 +292,7 @@ impl AddressSpace {
                     // Last user: take the page over.
                     old_frame
                 } else {
-                    let Some(copy) = memory::allocate_zeroed() else {
+                    let Some(copy) = memory::allocate_zeroed_user() else {
                         return false;
                     };
                     if memory::copy_frame(old_frame, copy).is_err() {

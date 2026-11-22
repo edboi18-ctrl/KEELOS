@@ -551,6 +551,50 @@ fn test_boot(
     }
 }
 
+/// `cargo xtask fuzz`: boots the system-call fuzzer (Phase 1 security
+/// acceptance item 6) for `minutes`, from `seed`. Passes when the kernel
+/// reports the session passed: no panic, no hung fuzz process, and QEMU
+/// exited cleanly. The full serial log goes to `target/test-logs/fuzz.log`;
+/// each run's seed is in it, so a failure can be replayed.
+pub fn fuzz(minutes: u64, seed: u64, options: &RunOptions) -> Result<()> {
+    println!("xtask: ---- system-call fuzzing: {minutes} min, seed {seed} ----");
+    let esp = build::build(BootMode::Fuzz { minutes, seed })?;
+    // The last run may end up to 10 minutes after the deadline (the
+    // kernel's FUZZ_RUN_LIMIT_MS), and boot and setup take well under five
+    // minutes even without hardware acceleration.
+    let timeout = Duration::from_secs(minutes * 60 + 600 + 300);
+    let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
+    let mut text = capture.lines.join("\n");
+    text.push('\n');
+    let log = util::workspace_root()
+        .join("target")
+        .join("test-logs")
+        .join("fuzz.log");
+    util::write(&log, text.as_bytes())?;
+    let result = if capture.timed_out {
+        Err(format!("timed out after {} s", timeout.as_secs()))
+    } else {
+        verdict(None, &capture.lines, capture.exit_code)
+    };
+    match result {
+        Ok(()) => {
+            for line in capture
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("TEST ") || l.starts_with("fuzz: "))
+            {
+                println!("  {line}");
+            }
+            println!("xtask: fuzzing PASSED (log: {})", log.display());
+            Ok(())
+        }
+        Err(reason) => {
+            print_tail(&capture.lines);
+            Err(format!("fuzzing FAILED: {reason} (log: {})", log.display()).into())
+        }
+    }
+}
+
 /// Text Limine prints when a file does not match its pinned hash
 /// (Limine 12.9.6, `common/lib/uri.c`, `uri_hash_mismatch`).
 const LIMINE_HASH_PANIC: &str = "does not match";
@@ -650,7 +694,11 @@ fn test_user_programs_on_host() -> Result<()> {
     }
     println!("xtask: ---- user programs on the host (Linux) ----");
     let binaries = build::build_user_tests(&util::workspace_root())?;
-    for (program, binary) in build::TEST_PROGRAMS.iter().zip(binaries) {
+    for (program, binary) in build::TEST_PROGRAMS
+        .iter()
+        .zip(binaries)
+        .filter(|(program, _)| program.host)
+    {
         let mut child = Command::new(&binary)
             .args(program.args)
             .env_clear()

@@ -175,6 +175,15 @@ extern "C" fn kmain_on_boot_stack() -> ! {
         Err(error) => kprintln!("keyboard: not available ({error:?}); /dev/console is output only"),
     }
 
+    if let Some((minutes, seed)) = selftest::requested_fuzz(boot::cmdline()) {
+        TEST_MODE.store(true, Ordering::Relaxed);
+        let passed = selftest::run_fuzz(minutes, seed);
+        exit_qemu(if passed {
+            ExitCode::Success
+        } else {
+            ExitCode::Failure
+        });
+    }
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {
         TEST_MODE.store(true, Ordering::Relaxed);

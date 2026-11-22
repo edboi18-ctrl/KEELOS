@@ -17,6 +17,9 @@ pub enum BootMode {
     /// Run the self-tests of a phase (or one named scenario of it), then
     /// exit QEMU.
     Test(u32, Option<&'static str>),
+    /// Run the system-call fuzzer for `minutes` from `seed` (with the
+    /// phase 1 test programs in the initramfs), then exit QEMU.
+    Fuzz { minutes: u64, seed: u64 },
 }
 
 /// The files of a finished build, in the order they sit on the boot volume.
@@ -93,15 +96,27 @@ pub struct TestProgram {
     pub env: &'static [(&'static str, &'static str)],
     /// Standard input for the Linux run (Keel's self-test types it).
     pub stdin: &'static [u8],
+    /// Whether it also runs natively on the Linux host. Only the fuzzer
+    /// does not: random system calls must never reach a real kernel.
+    pub host: bool,
 }
 
 pub const TEST_PROGRAMS: &[TestProgram] = &[
+    TestProgram {
+        path: "test/fuzz",
+        binary: "fuzz",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     TestProgram {
         path: "test/startup",
         binary: "startup",
         args: &["alpha"],
         env: &[("KEEL_TEST", "1")],
         stdin: b"",
+        host: true,
     },
     TestProgram {
         path: "test/syscalls",
@@ -109,6 +124,7 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         args: &[],
         env: &[],
         stdin: b"",
+        host: true,
     },
     TestProgram {
         path: "test/reserve",
@@ -116,6 +132,15 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         args: &[],
         env: &[],
         stdin: b"",
+        host: true,
+    },
+    TestProgram {
+        path: "test/longcall",
+        binary: "longcall",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
     },
     TestProgram {
         path: "test/rights",
@@ -123,6 +148,7 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         args: &[],
         env: &[],
         stdin: b"",
+        host: true,
     },
     TestProgram {
         path: "test/readline",
@@ -130,6 +156,7 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         args: &[],
         env: &[],
         stdin: b"keel\n",
+        host: true,
     },
 ];
 
@@ -289,6 +316,9 @@ pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
     match mode {
         BootMode::Normal => {}
         BootMode::Test(phase, None) => conf.push_str(&format!("    cmdline: test={phase}\n")),
+        BootMode::Fuzz { minutes, seed } => {
+            conf.push_str(&format!("    cmdline: test=1 fuzz={minutes} seed={seed}\n"))
+        }
         BootMode::Test(phase, Some(scenario)) => {
             conf.push_str(&format!("    cmdline: test={phase} scenario={scenario}\n"))
         }
@@ -304,7 +334,7 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
 
     let mut archive = cpio::Archive::default();
     archive.add_tree(&root.join("initramfs"))?;
-    if let BootMode::Test(..) = mode {
+    if let BootMode::Test(..) | BootMode::Fuzz { .. } = mode {
         for (program, binary) in TEST_PROGRAMS.iter().zip(build_user_tests(&root)?) {
             archive.add_file(program.path, util::read(&binary)?);
         }
