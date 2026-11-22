@@ -22,6 +22,7 @@ pub mod heap;
 #[cfg(target_os = "none")]
 pub mod interrupts;
 pub mod memory;
+pub mod random;
 #[cfg(target_os = "none")]
 pub mod sched;
 pub mod sync;

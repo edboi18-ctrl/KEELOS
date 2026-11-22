@@ -10,7 +10,7 @@ occurrence of each number is logged to serial.
 | Number | Name | Status | Authority and checks | Tests |
 | --- | --- | --- | --- | --- |
 | 60 | `exit` | Partial: ends the calling thread; its status is `rdi` as a 32-bit integer | None beyond being the caller | `user.syscall`, `user.syscall_registers` |
-| 231 | `exit_group` | Partial: same as `exit` until processes have several threads | None beyond being the caller | None yet (same code path as `exit`) |
+| 231 | `exit_group` | Partial: same as `exit` until processes have several threads | None beyond being the caller | `exec.startup_state`, `exec.exit_status` (`keel-rt` exits through it) |
 | 0x1000 | `keel_test_add_one` | Temporary, Phase 1 self-tests only: returns `rdi + 1` (wrapping) | None; touches no memory. Removed before Phase 1 acceptance | `user.syscall` |
 
 ## Faults

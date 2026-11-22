@@ -329,6 +329,7 @@ fn phase1(t: &mut Runner) {
     phase1_sched(t);
     phase1_vm(t);
     phase1_user(t);
+    phase1_exec(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -851,6 +852,111 @@ pub fn phase1_vm(t: &mut Runner) {
         "vm.teardown",
         memory::free_frames() + 8 >= frames_at_start,
         "dropping address spaces returns their pages and page tables",
+    );
+}
+
+/// P1-T11: the initramfs, the ELF loader and the initial process state,
+/// checked from inside a real static executable (`user/tests`, built by
+/// xtask into the initramfs of test builds).
+pub fn phase1_exec(t: &mut Runner) {
+    use crate::exec::{self, LoadError};
+    use keel_core::elf::{ElfError, PF_R, PF_W, PF_X, PT_LOAD};
+
+    let archive = boot::modules()
+        .find(|m| m.path.ends_with("/initramfs.cpio"))
+        .and_then(|m| keel_core::cpio::parse(m.data).ok());
+    t.check(
+        "initramfs.parse",
+        archive.is_some(),
+        "the initramfs boot module parses as a cpio archive",
+    );
+    let file = archive
+        .as_deref()
+        .and_then(|entries| keel_core::cpio::find(entries, b"test/startup"));
+    t.check(
+        "initramfs.test_program",
+        file.is_some(),
+        "test builds carry test/startup in the initramfs",
+    );
+    let Some(file) = file else {
+        return;
+    };
+
+    const PATH: &[u8] = b"/test/startup";
+    let run = |argv: &[&[u8]]| {
+        let loaded = exec::load(file, PATH, argv, &[b"KEEL_TEST=1"]).ok()?;
+        let id =
+            sched::spawn_user("startup", loaded.space.clone(), loaded.entry, loaded.rsp, 0).ok()?;
+        sched::join(id);
+        Some((sched::exit_status(id)?, loaded))
+    };
+    let passed = run(&[PATH, b"alpha"]);
+    t.check(
+        "exec.startup_state",
+        passed.as_ref().is_some_and(|((status, fault), _)| *status == 0 && fault.is_none()),
+        "a static ELF finds argc, argv, envp, auxv, entry registers, data, bss and stack as the psABI defines them",
+    );
+    if let Some((_, loaded)) = &passed {
+        // A CPU with a working RDRAND must not fall back to the weak mix.
+        let hardware = keel_hal::random::rdrand_usable();
+        t.check(
+            "exec.random_source",
+            (loaded.random == keel_hal::random::Quality::Hardware) == hardware,
+            if hardware {
+                "AT_RANDOM comes from RDRAND"
+            } else {
+                "no usable RDRAND: AT_RANDOM uses the weak interim source (P1-S5)"
+            },
+        );
+        // SR-12, SR-14 for a real program: the only kernel pages are the
+        // trampoline and nothing is writable and executable.
+        let summary = loaded.space.user_view_walk(|_, _| {});
+        t.check(
+            "exec.user_view",
+            summary.writable_and_executable == 0,
+            "a loaded program's page tables hold no writable and executable page",
+        );
+    }
+    t.check(
+        "exec.exit_status",
+        run(&[PATH, b"beta"]).is_some_and(|((status, _), _)| status == 5),
+        "a failed check inside the program comes back as its exit status",
+    );
+
+    // Malformed files are refused before anything runs.
+    let mut writable_code = file.to_vec();
+    let phoff = u64::from_le_bytes(file[32..40].try_into().unwrap_or_default()) as usize;
+    let phnum = usize::from(u16::from_le_bytes([file[56], file[57]]));
+    for i in 0..phnum {
+        let at = phoff + i * keel_core::elf::PHDR_SIZE;
+        let Some(header) = writable_code.get_mut(at..at + 8) else {
+            break;
+        };
+        let p_type = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let flags = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if p_type == PT_LOAD && flags & PF_X != 0 {
+            header[4..8].copy_from_slice(&(PF_R | PF_W | PF_X).to_le_bytes());
+        }
+    }
+    let refused = |bytes: &[u8]| exec::load(bytes, PATH, &[PATH], &[]).err();
+    t.check(
+        "exec.refuses_malformed",
+        refused(&file[..100]) == Some(LoadError::Elf(ElfError::Truncated))
+            && refused(&writable_code) == Some(LoadError::Elf(ElfError::WritableAndExecutable))
+            && refused(b"#!/bin/sh\n") == Some(LoadError::Elf(ElfError::Truncated)),
+        "truncated files, writable code segments and non-ELF files are refused (SR-12)",
+    );
+
+    // A load that fails after its segments are mapped (arguments too large
+    // for the stack) leaves nothing behind.
+    let huge = alloc::vec![b'x'; exec::ARG_LIMIT];
+    let before = memory::free_frames();
+    let too_big = exec::load(file, PATH, &[&huge], &[]).err();
+    t.check(
+        "exec.failure_cleans_up",
+        too_big == Some(LoadError::Stack(keel_core::exec::ExecError::TooLarge))
+            && memory::free_frames() + 8 >= before,
+        "a load that fails half-way returns every frame it took",
     );
 }
 

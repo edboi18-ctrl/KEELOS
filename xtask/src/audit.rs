@@ -6,6 +6,7 @@
 //!   format      `cargo fmt --check`
 //!   lint        `cargo clippy -D warnings` for the host crates and the kernel
 //!   unsafe      count of `unsafe` in our own code; none outside `kernel/hal`
+//!               and the user runtime `user/keel-rt` (ADR 0006)
 //!   licenses    every locked crate is vendored and under an allowed license
 //!   workflows   actions pinned by commit SHA, least-privilege tokens
 //!   advisories  RustSec advisory database, through a pinned `cargo-deny`
@@ -222,10 +223,15 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// The one place outside `kernel/hal` where the keyword may appear: the
-/// `#[unsafe(no_mangle)]` on the kernel entry point, which must carry the
-/// exact symbol name the linker script's `ENTRY` refers to.
+/// The one place in the kernel outside `kernel/hal` where the keyword may
+/// appear: the `#[unsafe(no_mangle)]` on the kernel entry point, which
+/// must carry the exact symbol name the linker script's `ENTRY` refers to.
 const ENTRY_POINT_FILE: &str = "kernel/keel-kernel/src/main.rs";
+
+/// The user-space runtime: process entry and raw system calls for Keel's
+/// own user programs (ADR 0006). It runs in ring 3, so its `unsafe` can
+/// harm only the program using it, never the kernel.
+const USER_RUNTIME_DIR: &str = "user/keel-rt/";
 
 fn check_unsafe(root: &Path) -> Result<()> {
     let mut files = Vec::new();
@@ -252,6 +258,7 @@ fn check_unsafe(root: &Path) -> Result<()> {
         per_crate.entry(krate).or_default().add(count);
 
         let allowed = relative.starts_with("kernel/hal/")
+            || relative.starts_with(USER_RUNTIME_DIR)
             || (relative == ENTRY_POINT_FILE
                 && count
                     == UnsafeCount {
@@ -280,7 +287,7 @@ fn check_unsafe(root: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(format!(
-            "`unsafe` outside kernel/hal (spec section 7):\n  {}",
+            "`unsafe` outside kernel/hal and user/keel-rt (spec section 7, ADR 0006):\n  {}",
             violations.join("\n  ")
         )
         .into())
@@ -580,6 +587,10 @@ pub fn audit(offline: bool) -> Result<()> {
                         "--workspace",
                         "--exclude",
                         "keel-kernel",
+                        "--exclude",
+                        "keel-rt",
+                        "--exclude",
+                        "keel-user-tests",
                         "--all-targets",
                         "--",
                         "-D",
@@ -601,6 +612,30 @@ pub fn audit(offline: bool) -> Result<()> {
                         "keel-kernel",
                         "--target",
                         "x86_64-unknown-none",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                )
+            }),
+        ),
+        (
+            "lint (user programs)",
+            Box::new(|| {
+                cargo_step(
+                    &root,
+                    &[
+                        "clippy",
+                        "--locked",
+                        "--release",
+                        "--package",
+                        "keel-rt",
+                        "--package",
+                        "keel-user-tests",
+                        "--target",
+                        "x86_64-unknown-none",
+                        "--target-dir",
+                        "target/user",
                         "--",
                         "-D",
                         "warnings",

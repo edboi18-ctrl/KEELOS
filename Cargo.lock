@@ -137,6 +137,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-rt"
+version = "0.0.0"
+
+[[package]]
+name = "keel-user-tests"
+version = "0.0.0"
+dependencies = [
+ "keel-rt",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,5 +188,6 @@ version = "0.0.0"
 dependencies = [
  "blake2",
  "fatfs",
+ "keel-core",
  "sha2",
 ]

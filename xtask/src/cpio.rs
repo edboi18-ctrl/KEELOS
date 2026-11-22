@@ -37,6 +37,16 @@ impl Archive {
         Ok(())
     }
 
+    /// Adds one file, and its parent directories, at `path`.
+    pub fn add_file(&mut self, path: &str, data: Vec<u8>) {
+        for (slash, _) in path.match_indices('/') {
+            self.members
+                .entry(path[..slash].to_string())
+                .or_insert(None);
+        }
+        self.members.insert(path.to_string(), Some(data));
+    }
+
     fn add_dir_entries(&mut self, dir: &Path, prefix: &str) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -121,6 +131,28 @@ fn write_member(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel's reader (`keel_core::cpio`) accepts what this writer
+    /// produces, with the same names, kinds and contents.
+    #[test]
+    fn kernel_reader_reads_the_archive() {
+        let mut archive = Archive::default();
+        archive.add_file("test/startup", vec![1, 2, 3, 4, 5]);
+        archive.add_file("etc/a/b", b"nested".to_vec());
+        let bytes = archive.to_bytes().unwrap();
+        let entries = keel_core::cpio::parse(&bytes).unwrap();
+        let names: Vec<&[u8]> = entries.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            [&b"etc"[..], b"etc/a", b"etc/a/b", b"test", b"test/startup"]
+        );
+        assert_eq!(
+            keel_core::cpio::find(&entries, b"test/startup"),
+            Some(&[1u8, 2, 3, 4, 5][..])
+        );
+        assert_eq!(entries[0].kind, keel_core::cpio::Kind::Directory);
+        assert_eq!(entries[2].permissions, 0o644);
+    }
 
     #[test]
     fn single_file_archive_has_the_documented_layout() {

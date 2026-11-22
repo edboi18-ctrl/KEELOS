@@ -31,14 +31,12 @@ pub const CONFIG_PATH: &str = "boot/limine.conf";
 pub const KERNEL_PATH: &str = "boot/keel-kernel";
 pub const INITRAMFS_PATH: &str = "boot/initramfs.cpio";
 
-/// Compiles the kernel and returns the path of the ELF file.
-fn build_kernel(root: &Path) -> Result<PathBuf> {
-    // Flags for the kernel target only (with `--target`, RUSTFLAGS do not
-    // apply to host build scripts):
-    //  - frame pointers for backtraces (spec section 15; SR-17);
-    //  - path remapping so no host or home-directory path ends up in the
-    //    image (SR-30, SR-37). 0x1f separates CARGO_ENCODED_RUSTFLAGS
-    //    entries (Cargo book, "Environment variables").
+/// Rust flags for code built for the Keel target (with `--target`,
+/// RUSTFLAGS do not apply to host build scripts):
+///  - frame pointers for backtraces (spec section 15; SR-17);
+///  - path remapping so no host or home-directory path ends up in the
+///    image (SR-30, SR-37).
+fn target_flags(root: &Path) -> Vec<String> {
     let mut flags = vec![
         "-Cforce-frame-pointers=yes".to_string(),
         format!("--remap-path-prefix={}=/keel", root.display()),
@@ -62,18 +60,76 @@ fn build_kernel(root: &Path) -> Result<PathBuf> {
         ));
     }
 
+    flags
+}
+
+/// Compiles the kernel and returns the path of the ELF file.
+fn build_kernel(root: &Path) -> Result<PathBuf> {
+    // 0x1f separates CARGO_ENCODED_RUSTFLAGS entries (Cargo book,
+    // "Environment variables").
     util::run(
         Command::new(util::cargo())
             .current_dir(root)
             .args(["build", "--release", "--locked", "--package", "keel-kernel"])
             .args(["--target", KERNEL_TARGET])
-            .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f")),
+            .env("CARGO_ENCODED_RUSTFLAGS", target_flags(root).join("\x1f")),
     )?;
     Ok(root
         .join("target")
         .join(KERNEL_TARGET)
         .join("release")
         .join("keel-kernel"))
+}
+
+/// A program from `user/tests`, placed in the initramfs of test builds
+/// only. The kernel self-tests run it with the same arguments.
+pub struct TestProgram {
+    /// Path inside the initramfs.
+    pub path: &'static str,
+    /// Binary name in `user/tests`.
+    pub binary: &'static str,
+    /// Arguments after argv[0], and the environment, for a passing run.
+    pub args: &'static [&'static str],
+    pub env: &'static [(&'static str, &'static str)],
+}
+
+pub const TEST_PROGRAMS: &[TestProgram] = &[TestProgram {
+    path: "test/startup",
+    binary: "startup",
+    args: &["alpha"],
+    env: &[("KEEL_TEST", "1")],
+}];
+
+/// Compiles the user test programs (static, non-PIE ELF executables for
+/// the Linux x86-64 ABI) and returns the path of each, in `TEST_PROGRAMS`
+/// order.
+///
+/// They use their own target directory: their flags differ from the
+/// kernel's, and sharing one would rebuild both every time.
+pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
+    let target_dir = root.join("target").join("user");
+    let mut flags = target_flags(root);
+    // Fixed-address executables (ET_EXEC): no load bias until ASLR
+    // (P1-S5). Debug info is stripped; symbols stay for backtraces.
+    flags.push("-Crelocation-model=static".to_string());
+    flags.push("-Cstrip=debuginfo".to_string());
+    util::run(
+        Command::new(util::cargo())
+            .current_dir(root)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--package",
+                "keel-user-tests",
+            ])
+            .args(["--target", KERNEL_TARGET])
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f")),
+    )?;
+    let out = target_dir.join(KERNEL_TARGET).join("release");
+    Ok(TEST_PROGRAMS.iter().map(|p| out.join(p.binary)).collect())
 }
 
 /// Renders `limine.conf` with BLAKE2B hashes pinned on every loaded file
@@ -114,6 +170,11 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
 
     let mut archive = cpio::Archive::default();
     archive.add_tree(&root.join("initramfs"))?;
+    if let BootMode::Test(..) = mode {
+        for (program, binary) in TEST_PROGRAMS.iter().zip(build_user_tests(&root)?) {
+            archive.add_file(program.path, util::read(&binary)?);
+        }
+    }
     let initramfs = archive.to_bytes()?;
 
     let conf = limine_conf(&kernel, &initramfs, mode);

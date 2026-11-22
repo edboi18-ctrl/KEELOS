@@ -7,6 +7,9 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod cpio;
+pub mod elf;
+pub mod exec;
 
 pub mod frame;
 pub mod paging;

@@ -538,6 +538,38 @@ pub fn boot_image_until(image: &Path, options: &RunOptions, marker: &str) -> Res
 }
 
 /// `cargo xtask test [--phase N]`.
+/// Runs the `user/tests` programs natively when the host is x86-64 Linux,
+/// so each one is checked against the real Linux ABI as well as against
+/// Keel (spec section 4, `user/tests`). Elsewhere (Windows) the step is
+/// skipped and says so; CI runs it on Linux.
+fn test_user_programs_on_host() -> Result<()> {
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        println!("xtask: user programs on the host: SKIPPED (needs x86-64 Linux; CI runs it)");
+        return Ok(());
+    }
+    println!("xtask: ---- user programs on the host (Linux) ----");
+    let binaries = build::build_user_tests(&util::workspace_root())?;
+    for (program, binary) in build::TEST_PROGRAMS.iter().zip(binaries) {
+        let output = Command::new(&binary)
+            .args(program.args)
+            .env_clear()
+            .envs(program.env.iter().copied())
+            .output()?;
+        let name = format!("host.{}", program.binary);
+        if output.status.success() {
+            println!("  TEST {name} PASS runs to exit 0 under Linux");
+        } else {
+            return Err(format!(
+                "{name} failed under Linux ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Result<()> {
     let selected: Vec<&Phase> = match phase {
         None => PHASES.iter().collect(),
@@ -551,6 +583,9 @@ pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Resu
             }
         },
     };
+    if selected.iter().any(|p| p.number >= 1) {
+        test_user_programs_on_host()?;
+    }
     for phase in selected {
         test_boot(phase, None, options, timeout)?;
         for &scenario in phase.scenarios {

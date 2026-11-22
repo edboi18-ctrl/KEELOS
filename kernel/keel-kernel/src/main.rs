@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+mod exec;
 mod selftest;
 
 use core::panic::PanicInfo;

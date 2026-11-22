@@ -47,7 +47,9 @@ to `main` with PR #1.
 | P1-T8 | Kernel threads, context switch, preemptive round-robin scheduler, sleep and wait queues, FPU/SSE/AVX state | Done. Each thread has a 64 KiB kernel stack with an unmapped guard page and its own XSAVE area (FXSAVE where XSAVE is missing), sized from CPUID; XCR0 enables x87, SSE, AVX, and AVX-512 when complete. 10 ms time slices from the 1 kHz tick; switches happen after the EOI. The heap, page-table, frame and scheduler locks disable interrupts while held, so no thread is preempted holding one. Tests: round robin, preemption of a non-yielding thread, sleep accuracy, wait-queue wake-up, XMM isolation across 400 switches (checked to fail when save/restore is removed), reclamation of exited threads, and a stack-overflow scenario caught on the guard page. |
 | P1-T9 | Address spaces: VMAs, demand paging, copy-on-write, free PROT_NONE reservations | Done for anonymous memory. VMA bookkeeping (mmap/munmap/mprotect semantics incl. MAP_FIXED, MAP_FIXED_NOREPLACE and splitting) in `keel-core::vm` with host tests; page-table side in `hal::vm`. Writable+executable user mappings refused (SR-12). Every address space shares the kernel's upper half (all 256 entries pre-created at boot). File-backed and shared mappings come with the VFS (P1-T12, P3-T7). Tests: 64 GiB reservation costs no frames (acceptance item 4), demand paging, mprotect, copy-on-write isolation, teardown returns all frames. |
 | P1-T10 | Ring 3 entry and the `syscall` path | Done, with returns by IRETQ instead of SYSRET and no SWAPGS (ADR 0005). STAR/LSTAR/FMASK set, EFER.SCE on; Linux register convention; `exit`, `exit_group` and a temporary test call; unknown numbers return ENOSYS and are logged once (`docs/syscalls.md`). User faults end the thread with 128 + signal. User RFLAGS sanitized on every return (IOPL 0, SR-9). Tests: syscall round trip, all callee registers preserved, ENOSYS, CLI and port I/O refused, user code read-only, user stack no-execute, UMIP, kernel survives every refused program. |
-| P1-T11 to P1-T14 | | Not started |
+| P1-T11 | Static ELF64 loader; initial stack with argc/argv/envp and auxiliary vector | Done. Parser in `keel-core::elf` (safe, every offset checked; ET_EXEC and static-PIE ET_DYN; refuses PT_INTERP until P3-T2, W+X segments, executable-stack requests, overlapping or misaligned segments, anything outside the user half). Stack builder in `keel-core::exec` per psABI Figure 3.9 (AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_FLAGS, AT_ENTRY, AT_SECURE, AT_RANDOM, AT_EXECFN). Loader in `keel-kernel::exec`, no `unsafe`. AT_RANDOM from RDRAND after a Linux-style self-test, else a weak interim source that reports itself (P1-S5 replaces it). Host tests and random-input loops for both parsers. In-kernel: `user/tests/startup`, a real static Rust executable, checks its own entry state (alignment, RDX = 0, DF = 0, argv, envp, auxv, AT_PHDR, AT_RANDOM, AT_EXECFN, .data, .bss, 256 KiB of stack) under Keel, and the same binary passes under Linux (`host.startup`). Also: malformed files refused, failed loads return their frames, no W+X page in a loaded program. |
+| P1-T12 | cpio unpacker, tmpfs, VFS, device nodes | Started: cpio "newc" reader in `keel-core::cpio` (host tests, random-input loop, cross-checked against the xtask writer). tmpfs, VFS and device nodes not started. |
+| P1-T13, P1-T14 | | Not started |
 | P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Done. `hal::vm::copy_to_user`/`copy_from_user` are the only code that touches user memory: they check the range against the user half with checked arithmetic, lift SMAP (STAC/CLAC) only around one `rep movsb`, resolve demand-paging faults, and turn anything else into EFAULT through a fixup. Tests: bad-pointer sweep (kernel, null, unmapped, straddling, wrapping) and a `smap` scenario proving a direct kernel read of a present user page faults. Both the SMAP and no-SMAP routines are exercised. |
 | P1-S3 | Page-table isolation with a trampoline entry path | Done. Each address space has a kernel view and a user view; the user view's kernel half is one top-level entry mapping only `.text.keel_entry` (RX), `.data.keel_entry` and `.bss.keel_entry` (RW+NX). Every entry switches to the kernel view; every exit to user mode switches back from the trampoline stack. Always on until P1-S4 reads RDCL_NO; no PCIDs yet. Tests: `pti.user_view` (walks the user view: only trampoline pages, no W+X), `pti.kernel_absent` (user reads of kernel text, rodata, data, direct map and heap find no page). Finding F-0001 fixed on the way (`user.ac_cleared_on_entry`). |
 | P1-S1, P1-S4 to P1-S7 | | Not started |
@@ -100,8 +102,9 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 110 | 344 | 37 | 15 |
+| `kernel/hal` | 111 | 353 | 37 | 15 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
+| `user/keel-rt` | 14 | 62 | 4 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
 the CPU register reads, and the self-test triggers, each with its
@@ -121,7 +124,9 @@ user-copy routines (the one sanctioned place for user-memory access),
 frame copying, and the SMAP self-test read; then P1-T10/P1-S3: the
 SYSCALL MSR setup, the entry/exit trampoline (`global_asm!`, one
 reasoning block), the user test programs, and loading CR3 for the
-two page-table views. The single item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
+two page-table views; then P1-T11: RDRAND in `hal::random`. `user/keel-rt` is
+the user-space runtime (ADR 0006): `_start`, the initial-stack reader and
+the `syscall` wrapper. The single kernel item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
 
 ## Image hashes
