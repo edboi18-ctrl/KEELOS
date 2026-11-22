@@ -21,7 +21,7 @@
 use core::arch::{asm, global_asm};
 #[cfg(target_os = "none")]
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use super::gdt::DescriptorTablePointer;
@@ -310,7 +310,8 @@ static FATAL_CR2: AtomicU64 = AtomicU64::new(0);
 /// printed (or later, in the panic handler) re-enters `fatal`; without
 /// this it would print again, fault again, and never halt (audit
 /// finding 7).
-static FATAL_ENTERED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "none")]
+static FATAL_ENTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The fatal exception that caused the current panic, if any.
 pub fn last_fatal_exception() -> Option<FatalException> {
