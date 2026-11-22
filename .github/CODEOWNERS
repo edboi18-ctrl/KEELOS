@@ -1,3 +1,9 @@
 # Workflow files build the images that boot a real machine. Changes to
 # them are reviewed and merged only by the repository owner (SR-36).
 /.github/ @edboi18-ctrl
+
+# xtask enforces the workflow policy (`audit.rs`), verifies release
+# downloads (`verify.rs`) and pins every downloaded input, so weakening
+# it would weaken those checks without touching a workflow file (audit
+# finding 4). Owner review here too.
+/xtask/ @edboi18-ctrl
