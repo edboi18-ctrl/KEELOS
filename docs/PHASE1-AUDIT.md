@@ -23,7 +23,7 @@ finding was re-checked there before it was fixed.
 | 5 | Open |
 | 6 | Fixed. The same check over all 20 `asm!` blocks on the working branch that claim `preserves_flags` found two more: `xrstor64` and `fxrstor64` in `fpu.rs` load the x87 status word and MXCSR, which that option also covers (the Rust Reference, asm.rules.preserved-registers). All three no longer claim it. |
 | 7 | Fixed. Guard pages were done in P1-T4. Recursion: `idt::fatal` and the panic handler each set a flag on first entry; a nested entry prints one fixed line to COM1 (no formatting, no framebuffer) and halts, or exits QEMU in test mode. Scenario `fault_in_panic` panics, then faults inside the panic handler; it hangs (180 s timeout) with the panic handler's guard disabled. |
-| 8 | Open; now more important, since KASLR (P1-S5) is on and the kernel base is still printed |
+| 8 | Fixed. `memory::init` refuses an HHDM offset that is not page-aligned and in the higher half (`MemoryInitError::BadHhdm`) and uses only usable entries that are page-aligned, non-empty, non-wrapping and overlap no other entry of any kind (`keel_core::frame::sound_usable_regions`, host tests); skipped entries are counted in the boot log. A normal boot no longer prints the kernel base or HHDM offset (checked: a release-image boot's serial log has no `0xffff` address); test boots still do, for `kaslr.layout_varies`. Fatal dumps still print addresses, which is expected for a crash report. |
 
 ## Scope and limits
 

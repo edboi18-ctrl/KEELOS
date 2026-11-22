@@ -34,6 +34,9 @@ pub struct MemoryStats {
     pub frames_free: usize,
     /// Physical range holding the allocator's own bookkeeping.
     pub bookkeeping: core::ops::Range<u64>,
+    /// Usable memory-map entries left out because they were misaligned or
+    /// overlapped another entry (audit finding 8).
+    pub regions_skipped: usize,
 }
 
 /// Why `init` failed.
@@ -43,6 +46,9 @@ pub enum MemoryInitError {
     AlreadyInitialised,
     /// The bootloader did not report the direct-map offset.
     NoHhdm,
+    /// The direct-map offset is not page-aligned or not in the higher
+    /// half (audit finding 8).
+    BadHhdm(u64),
     /// No usable region was large enough for the bookkeeping.
     NoRoomForBookkeeping,
 }
@@ -56,11 +62,24 @@ pub fn init() -> Result<MemoryStats, MemoryInitError> {
         return Err(MemoryInitError::AlreadyInitialised);
     }
     let hhdm = boot::hhdm_offset().ok_or(MemoryInitError::NoHhdm)?;
+    if !keel_core::frame::hhdm_is_sound(hhdm) {
+        return Err(MemoryInitError::BadHhdm(hhdm));
+    }
 
-    let usable = || {
-        boot::memory_map()
-            .filter(|region| region.kind == RegionKind::Usable && region.base < MAX_PHYSICAL)
+    // Only usable entries that are page-aligned and overlap nothing else
+    // (`sound_usable_regions`): the bookkeeping slices below are built at
+    // `hhdm + base`, so a malformed entry must never reach them.
+    let map = || {
+        boot::memory_map().map(|region| keel_core::frame::MapEntry {
+            base: region.base,
+            length: region.length,
+            usable: region.kind == RegionKind::Usable,
+        })
     };
+    let usable =
+        || keel_core::frame::sound_usable_regions(map).filter(|region| region.base < MAX_PHYSICAL);
+    let skipped =
+        map().filter(|e| e.usable).count() - keel_core::frame::sound_usable_regions(map).count();
     let top = usable()
         .map(|region| region.base.saturating_add(region.length).min(MAX_PHYSICAL))
         .max()
@@ -72,15 +91,16 @@ pub fn init() -> Result<MemoryStats, MemoryInitError> {
     let bytes = (words * 8 + counts * 2) as u64;
     let bytes = bytes.div_ceil(FRAME_SIZE) * FRAME_SIZE;
 
-    // The protocol guarantees usable regions are 4 KiB aligned and never
-    // overlap other entries ("Memory Map Feature"). Skip the region
-    // containing physical address 0 so that frame 0 stays unused.
+    // Skip the region containing physical address 0 so that frame 0 stays
+    // unused.
     let base = usable()
         .find(|region| region.base >= FRAME_SIZE && region.length >= bytes)
         .map(|region| region.base)
         .ok_or(MemoryInitError::NoRoomForBookkeeping)?;
 
-    // SAFETY: `[base, base + bytes)` lies in one `Usable` region, which the
+    // SAFETY: `hhdm` is page-aligned and in the higher half and `base` is
+    // page-aligned (both checked above), so the start is aligned for u64.
+    // `[base, base + bytes)` lies in one `Usable` region, which the
     // protocol defines as free RAM holding nothing the kernel or bootloader
     // still uses, and which base revision 3 and later map in the HHDM as
     // read-write ("Memory Layout at Entry"). The lock above ensures this
@@ -106,6 +126,7 @@ pub fn init() -> Result<MemoryStats, MemoryInitError> {
         frames_managed: allocator.frame_count(),
         frames_free: allocator.free_frames(),
         bookkeeping: base..base + bytes,
+        regions_skipped: skipped,
     };
     HHDM.store(hhdm, Ordering::Release);
     USER_RESERVE.store(

@@ -31,6 +31,59 @@ impl Frame {
     }
 }
 
+/// Lowest address of the higher half: the HHDM offset must be at or above
+/// it (Limine protocol, "Memory Layout at Entry"; x86-64 canonical
+/// addresses with 48-bit virtual addresses, SDM Vol. 1 section 3.3.7.1).
+pub const HIGHER_HALF: u64 = 0xffff_8000_0000_0000;
+
+/// Whether a direct-map offset from the bootloader can be used: in the
+/// higher half and page-aligned (audit finding 8). The protocol promises
+/// both; the kernel checks rather than trusts it (SR-19).
+pub fn hhdm_is_sound(offset: u64) -> bool {
+    offset >= HIGHER_HALF && offset.is_multiple_of(FRAME_SIZE)
+}
+
+/// One memory-map entry, as far as the allocator cares: where it is and
+/// whether it is free RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    pub base: u64,
+    pub length: u64,
+    pub usable: bool,
+}
+
+/// The usable entries of `map` that the allocator may take: non-empty,
+/// base and length multiples of 4 KiB, not wrapping past the top of the
+/// address space, and overlapping no other entry of any kind. The Limine
+/// protocol promises all of this for usable entries ("Memory Map
+/// Feature"); an entry that breaks it is skipped rather than trusted
+/// (audit finding 8). `map` is called once per entry checked, so the
+/// check needs no allocation (memory maps have tens to a few hundred
+/// entries).
+pub fn sound_usable_regions<I>(map: impl Fn() -> I) -> impl Iterator<Item = MapEntry>
+where
+    I: Iterator<Item = MapEntry>,
+{
+    let candidates = map().enumerate();
+    candidates
+        .filter(move |&(index, entry)| {
+            let Some(end) = entry.base.checked_add(entry.length) else {
+                return false;
+            };
+            entry.usable
+                && entry.length != 0
+                && entry.base.is_multiple_of(FRAME_SIZE)
+                && entry.length.is_multiple_of(FRAME_SIZE)
+                && map().enumerate().all(|(other_index, other)| {
+                    other_index == index
+                        || other.length == 0
+                        || other.base >= end
+                        || other.base.saturating_add(other.length) <= entry.base
+                })
+        })
+        .map(|(_, entry)| entry)
+}
+
 /// Errors from reference-count operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
@@ -221,6 +274,79 @@ impl<'a> FrameAllocator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usable(base: u64, length: u64) -> MapEntry {
+        MapEntry {
+            base,
+            length,
+            usable: true,
+        }
+    }
+
+    fn reserved(base: u64, length: u64) -> MapEntry {
+        MapEntry {
+            base,
+            length,
+            usable: false,
+        }
+    }
+
+    fn sound(map: &[MapEntry]) -> Vec<(u64, u64)> {
+        sound_usable_regions(|| map.iter().copied())
+            .map(|e| (e.base, e.length))
+            .collect()
+    }
+
+    #[test]
+    fn hhdm_must_be_higher_half_and_page_aligned() {
+        assert!(hhdm_is_sound(HIGHER_HALF));
+        assert!(hhdm_is_sound(0xffff_9000_0000_0000));
+        assert!(!hhdm_is_sound(0x0000_7fff_ffff_f000), "lower half");
+        assert!(!hhdm_is_sound(0), "zero");
+        assert!(!hhdm_is_sound(HIGHER_HALF + 8), "misaligned");
+    }
+
+    #[test]
+    fn a_well_formed_map_is_kept_whole() {
+        let map = [
+            reserved(0, 0x1000),
+            usable(0x1000, 0x9_f000),
+            reserved(0xa_0000, 0x6_0000),
+            usable(0x10_0000, 0x7ff0_0000),
+        ];
+        assert_eq!(sound(&map), [(0x1000, 0x9_f000), (0x10_0000, 0x7ff0_0000)]);
+    }
+
+    #[test]
+    fn misaligned_empty_and_wrapping_regions_are_skipped() {
+        let map = [
+            usable(0x1008, 0x1000),
+            usable(0x2000, 0x1800),
+            usable(0x4000, 0),
+            usable(0xffff_ffff_ffff_f000, 0x2000),
+            usable(0x10_0000, 0x1000),
+        ];
+        assert_eq!(sound(&map), [(0x10_0000, 0x1000)]);
+    }
+
+    #[test]
+    fn overlapping_regions_are_skipped_whatever_the_other_kind() {
+        // Two usable entries overlapping each other: neither is trusted.
+        let map = [usable(0x1000, 0x3000), usable(0x3000, 0x2000)];
+        assert_eq!(sound(&map), []);
+        // A usable entry overlapping a reserved one is skipped; one that
+        // only touches it is kept.
+        let map = [
+            reserved(0x1000, 0x2000),
+            usable(0x2000, 0x2000),
+            usable(0x3000_0000, 0x1000),
+            reserved(0x3000_1000, 0x1000),
+        ];
+        assert_eq!(sound(&map), [(0x3000_0000, 0x1000)]);
+        // Empty reserved entries overlap nothing.
+        let map = [usable(0x1000, 0x2000), reserved(0x2000, 0)];
+        assert_eq!(sound(&map), [(0x1000, 0x2000)]);
+    }
 
     fn allocator(frames: usize) -> (Vec<u64>, Vec<u16>) {
         let (words, counts) = bookkeeping_len(frames);

@@ -241,12 +241,16 @@ hashes) is Phase 4 work (SR-30).
   and `vendor/`.
 - The spec's "source bundle" release artifact is, in Phase 0, the
   `-notices.zip` of license texts. Wine sources join it in Phase 4.
-- `wine-image.yml` and `security.yml` do not exist yet: there is no Wine
-  build and no fuzzer or escape suite before Phases 1 to 4.
+- `wine-image.yml` does not exist yet: there is no Wine build before
+  Phase 4. `security.yml` (nightly system-call fuzzing) is on the working
+  branch for the owner to review and merge; the escape suite comes in
+  Phase 3.
 - `cargo xtask usb`, `linux-test`, and `wine-build` are not implemented;
   they belong to later phases.
-- KASLR (`kaslr: yes` in `limine.conf`) is off until P1-S5. The kernel is
-  already linked position-independent so it can be turned on then.
+- KASLR is on (P1-S5). A normal boot does not print the kernel base or
+  the HHDM offset; test boots do, so `cargo xtask test` can check that
+  they vary (audit finding 8). Fatal exception dumps still print kernel
+  addresses.
 - QEMU and OVMF come from the runner's distribution packages and are not
   hash-pinned; they are test tools, not image inputs.
 

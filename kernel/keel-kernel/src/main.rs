@@ -60,14 +60,22 @@ extern "C" fn kmain() -> ! {
     report_boot_info(serial_ok, fb_size);
 
     match memory::init() {
-        Ok(stats) => kprintln!(
-            "mem: {} frames managed, {} free ({} MiB); bookkeeping at {:#x}..{:#x}",
-            stats.frames_managed,
-            stats.frames_free,
-            stats.frames_free * 4096 / (1024 * 1024),
-            stats.bookkeeping.start,
-            stats.bookkeeping.end
-        ),
+        Ok(stats) => {
+            kprintln!(
+                "mem: {} frames managed, {} free ({} MiB); bookkeeping at {:#x}..{:#x}",
+                stats.frames_managed,
+                stats.frames_free,
+                stats.frames_free * 4096 / (1024 * 1024),
+                stats.bookkeeping.start,
+                stats.bookkeeping.end
+            );
+            if stats.regions_skipped != 0 {
+                kprintln!(
+                    "mem: {} usable memory-map entries skipped (misaligned or overlapping)",
+                    stats.regions_skipped
+                );
+            }
+        }
         // Nothing past this point can work without physical memory.
         Err(error) => panic!("frame allocator setup failed: {error:?}"),
     }
@@ -221,17 +229,28 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
         Some((cols, rows)) => kprintln!("boot: framebuffer console {cols}x{rows} characters"),
         None => kprintln!("boot: no usable framebuffer"),
     }
-    match boot::hhdm_offset() {
-        Some(offset) => kprintln!("boot: HHDM offset {offset:#018x}"),
-        None => kprintln!("boot: no HHDM response"),
-    }
-    match boot::kernel_address() {
-        Some(k) => kprintln!(
-            "boot: kernel at virt {:#018x} phys {:#018x}",
-            k.virtual_base,
-            k.physical_base
-        ),
-        None => kprintln!("boot: no kernel address response"),
+    // Where the kernel and the direct map are would undo KASLR (P1-S5),
+    // so a normal boot does not print them (audit finding 8). Test boots
+    // do: `cargo xtask test` compares them across boots
+    // (`kaslr.layout_varies`). The command line comes from `limine.conf`,
+    // which is trusted only as far as the boot chain is (audit finding 2);
+    // whoever can edit it can also replace the kernel.
+    let cmdline = boot::cmdline();
+    if selftest::requested_phase(cmdline).is_some() || selftest::requested_fuzz(cmdline).is_some() {
+        match boot::hhdm_offset() {
+            Some(offset) => kprintln!("boot: HHDM offset {offset:#018x}"),
+            None => kprintln!("boot: no HHDM response"),
+        }
+        match boot::kernel_address() {
+            Some(k) => kprintln!(
+                "boot: kernel at virt {:#018x} phys {:#018x}",
+                k.virtual_base,
+                k.physical_base
+            ),
+            None => kprintln!("boot: no kernel address response"),
+        }
+    } else {
+        kprintln!("boot: kernel and direct-map addresses not shown (KASLR)");
     }
     let mut regions = 0u64;
     let mut usable = 0u64;
