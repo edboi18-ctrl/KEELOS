@@ -50,9 +50,6 @@ pub mod nr {
     pub const EXIT_GROUP: u64 = 231;
     pub const OPENAT: u64 = 257;
     pub const GETRANDOM: u64 = 318;
-    /// Keel self-test call outside the Linux range: returns `rdi + 1`.
-    /// Removed before Phase 1 acceptance.
-    pub const KEEL_TEST_ADD_ONE: u64 = 0x1000;
 }
 
 /// Size of the kernel buffer user data passes through.
@@ -109,7 +106,6 @@ pub fn handle(call: &SyscallArgs) -> i64 {
     let number = call.number;
     let result: SysResult = match number {
         nr::EXIT | nr::EXIT_GROUP => sched::exit_with((a[0] & 0xff) as i64),
-        nr::KEEL_TEST_ADD_ONE => Ok(a[0].wrapping_add(1)),
         // Outside the table: it also needs the caller's stack pointer.
         nr::SIGALTSTACK => match process::current() {
             Some(p) => sigaltstack(&p, a[0], a[1], call.user_rsp),
@@ -123,7 +119,7 @@ pub fn handle(call: &SyscallArgs) -> i64 {
             match (TABLE[index], process::current()) {
                 (Some(handler), Some(p)) => handler(&p, &a),
                 // Threads without a process (kernel self-test programs) get
-                // only exit and the test call.
+                // only exit; everything else is ENOSYS.
                 _ => unimplemented(number, &a),
             }
         }

@@ -1540,12 +1540,12 @@ pub fn phase1_user(t: &mut Runner) {
     use idt::page_fault::{INSTRUCTION_FETCH, PRESENT, USER, WRITE};
     use keel_hal::arch::x86_64::userprog::Program;
 
-    let add = run_user_program(Program::AddOne);
+    let add = run_user_program(Program::SyscallResult);
     t.check(
         "user.syscall",
         add.as_ref()
             .is_some_and(|(status, fault, _)| *status == 42 && fault.is_none()),
-        "a user program made two system calls and exited with status 42",
+        "a user program got a system call's result in rax and exited with status 42",
     );
     let regs = run_user_program(Program::Registers);
     t.check(

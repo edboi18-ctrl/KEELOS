@@ -381,6 +381,11 @@ fn main(startup: &Startup) -> i32 {
         "unassigned syscall 500 is ENOSYS",
         sys::unassigned_syscall(500) == ENOSYS,
     );
+    // Keel's temporary Phase 1 test call is gone (and was never Linux's).
+    c.check(
+        "former test call 0x1000 is ENOSYS",
+        sys::unassigned_syscall(0x1000) == ENOSYS,
+    );
 
     match c.failed {
         None => {

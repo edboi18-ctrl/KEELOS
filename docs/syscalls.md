@@ -59,7 +59,6 @@ addresses.
 | 231 | `exit_group` | Partial: same as `exit` until processes have several threads | none | |
 | 257 | `openat` | Files, directories and devices in the tmpfs | ENUMERATE on `dirfd` when it is not AT_FDCWD | Lookups never leave the process root (SR-4 groundwork). Flags outside the supported set (O_DSYNC, O_SYNC, O_DIRECT, O_NOATIME, O_PATH, O_TMPFILE and unknown bits) are EINVAL (SR-10; Linux ignores unknown bits). O_CREAT applies umask 022. No permission checks by mode or user ID (SR-6). Rights granted: READ/WRITE by access mode, plus STAT, SEEK, DUPLICATE; ENUMERATE for directories; MAP_EXEC with READ on regular files (Linux compatibility; compartment manifests can withhold it from Phase 3). |
 | 318 | `getrandom` | Complete | none | Unknown flags, and GRND_RANDOM with GRND_INSECURE, are EINVAL, as Linux. Bytes come from the kernel generator (`hal::random`: BLAKE2s pool, ChaCha20 with fast key erasure, seeded from RDSEED/RDRAND and timing, reseeded every 60 s). GRND_NONBLOCK never matters: the generator is seeded before the first process starts. |
-| 0x1000 | `keel_test_add_one` | Temporary, Phase 1 self-tests only: returns `rdi + 1` | none | Touches no memory. Removed before Phase 1 acceptance. |
 
 Numbers checked against Linux v6.12 `arch/x86/entry/syscalls/syscall_64.tbl`,
 flags and structures against the uapi headers listed in

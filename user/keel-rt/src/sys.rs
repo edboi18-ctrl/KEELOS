@@ -409,7 +409,10 @@ pub fn read_into_heap(fd: i32, start: u64, end: u64) -> i64 {
 /// number is refused here, because even all-zero arguments are not
 /// harmless for every call (vfork would share this stack).
 pub fn unassigned_syscall(number: u64) -> i64 {
-    if !(500..512).contains(&number) {
+    // 0x1000 is above Linux's NR_syscalls and below the x32 bit, so Linux
+    // v6.12 sends it to sys_ni_syscall (arch/x86/entry/common.c,
+    // do_syscall_64); on Keel it was the Phase 1 test call, now removed.
+    if !(500..512).contains(&number) && number != 0x1000 {
         return -22;
     }
     call3(number, 0, 0, 0)

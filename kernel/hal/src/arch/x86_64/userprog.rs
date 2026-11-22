@@ -3,8 +3,9 @@
 //! They are assembled by LLVM into a read-only, non-executable kernel data
 //! section; the kernel never runs them. A test copies one into a user page,
 //! makes the page read+execute, and starts a user thread there. System
-//! call numbers follow the Linux x86-64 table (60 = exit) plus the Keel
-//! test call 0x1000 (returns its argument + 1).
+//! call numbers follow the Linux x86-64 table (60 = exit). These threads
+//! have no process, so every other call returns -ENOSYS, which is what
+//! the programs use to see a result come back in RAX.
 //!
 //! Each program is position-independent and ends in a system call or a
 //! deliberate fault; `ud2` after the last instruction catches a fall-through.
@@ -15,17 +16,23 @@ global_asm!(
     r#"
     .pushsection .rodata.keel_user_programs, "a", @progbits
 
-    // exit(add_one(41)) -> status 42
-    .global keel_user_add_one, keel_user_add_one_end
-    keel_user_add_one:
-        mov edi, 41
-        mov eax, 0x1000
+    // A result comes back in RAX and an argument reaches the kernel:
+    // exit(syscall(500) + 80) -> status 42.
+    //   mov eax, 500: a 32-bit write zero-extends into RAX (Intel SDM
+    //     Vol. 1, 3.4.1.1), so RAX = 500, a number inside the 512-entry
+    //     table with no handler: the result is -ENOSYS (-38).
+    //   lea edi, [rax + 80]: the 64-bit sum -38 + 80 = 42, low 32 bits
+    //     kept (SDM Vol. 2A, LEA, address size 64, operand size 32), and
+    //     the write to EDI zero-extends: RDI = 42, exit's status.
+    .global keel_user_syscall_result, keel_user_syscall_result_end
+    keel_user_syscall_result:
+        mov eax, 500
         syscall
-        mov rdi, rax
+        lea edi, [rax + 80]
         mov eax, 60
         syscall
         ud2
-    keel_user_add_one_end:
+    keel_user_syscall_result_end:
 
     // Callee-saved registers survive a system call; RAX holds the result.
     .global keel_user_regs, keel_user_regs_end
@@ -36,10 +43,12 @@ global_asm!(
         mov r13, 0x4444
         mov r14, 0x5555
         mov r15, 0x6666
-        mov edi, 1
-        mov eax, 0x1000
+        // The result is -ENOSYS: cmp r64, imm32 sign-extends the
+        // immediate (SDM Vol. 2A, CMP REX.W 81 /7 id), so -38 compares
+        // as 0xffff_ffff_ffff_ffda.
+        mov eax, 500
         syscall
-        cmp rax, 2
+        cmp rax, -38
         jne 2f
         cmp rbx, 0x1111
         jne 2f
@@ -168,7 +177,7 @@ macro_rules! programs {
 }
 
 programs! {
-    AddOne: keel_user_add_one, keel_user_add_one_end;
+    SyscallResult: keel_user_syscall_result, keel_user_syscall_result_end;
     Registers: keel_user_regs, keel_user_regs_end;
     UnknownSyscall: keel_user_enosys, keel_user_enosys_end;
     Cli: keel_user_cli, keel_user_cli_end;
