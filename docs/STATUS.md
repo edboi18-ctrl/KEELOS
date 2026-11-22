@@ -30,7 +30,7 @@ resume from here.
 | P0-S1 | Verified downloads; BLAKE2B hashes in `limine.conf` | Done, with a tamper test for kernel and initramfs |
 | P0-S2 | `cargo xtask audit` | Done |
 
-## Phase 1 (kernel core): in progress
+## Phase 1 (kernel core): complete (2026-11-22)
 
 Started 2026-11-21 at the owner's request. P1-T1 to P1-T3 were merged
 to `main` with PR #1.
@@ -82,8 +82,9 @@ runs under Linux (`host.heap64`) and under Keel, and both must print
 `poll`, `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, now
 implemented (state only for the signal calls; ADR 0008) and covered by
 `user/tests/syscalls` on both systems. All four Phase 1 acceptance items
-are now covered; the temporary test syscall is removed; the phase stays
-open for the remaining checks.
+are covered, and the temporary test syscall is removed. The phase 1 boot
+prints `KEEL P1 OK` only when all of its tests pass, and `cargo xtask test`
+requires that line as well as the acceptance programs' own lines.
 
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel
@@ -136,7 +137,16 @@ Hardening notes for later Phase 1 work:
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
-- `cargo test`: 84 host unit tests pass (30 `keel-core`, 26 `keel-hal`, 28 `xtask`).
+- `cargo xtask test --phase 1`: 86 in-kernel tests pass and `KEEL P1 OK`
+  is on serial; the five fault scenarios (`double_fault`,
+  `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`) pass; the
+  boots land at different kernel addresses (KASLR); and the user test
+  programs, `musl-hello` and `heap64` pass under Linux too. Checked to
+  fail when the marker is not printed.
+- `cargo xtask fuzz --minutes 60 --seed 20261122`: passes (see security
+  acceptance item 6 above).
+- `cargo test`: 158 host unit tests pass (94 `keel-core`, 29 `keel-hal`,
+  5 `keel-linux-abi`, 30 `xtask`).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.

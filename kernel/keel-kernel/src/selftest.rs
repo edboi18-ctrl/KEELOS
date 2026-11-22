@@ -349,6 +349,13 @@ fn phase1(t: &mut Runner) {
     phase1_mitigations(t);
     phase1_robustness(t);
     phase1_fuzz_smoke(t);
+
+    // Phase 1 acceptance marker, printed only when every test above
+    // passed (the four acceptance items are among them). `cargo xtask
+    // test` also checks the acceptance programs' own serial lines.
+    if t.failed == 0 {
+        kprintln!("KEEL P1 OK");
+    }
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable

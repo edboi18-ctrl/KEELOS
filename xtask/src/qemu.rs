@@ -43,7 +43,7 @@ pub const PHASES: &[Phase] = &[
     },
     Phase {
         number: 1,
-        complete: false,
+        complete: true,
         scenarios: &[
             "double_fault",
             "write_kernel_text",
