@@ -10,6 +10,10 @@ and only the first number at or above 512 (the log is a fixed bitmap, so
 no program can make it grow: F-0005). System calls run with interrupts
 enabled and can be preempted (F-0008).
 
+Which calls Wine actually makes, how often and with which flags, is
+measured in `syscall-inventory.md` (P3-T1); Phase 3 adds calls here in
+the order they first appear there.
+
 Implementation: `kernel/linux-abi/src/syscall.rs`. Every file descriptor
 is a handle with a rights mask (P1-S1, SR-1); the "Right" column is what
 the handler asks the handle table for. A missing handle and a missing

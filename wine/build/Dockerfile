@@ -61,14 +61,19 @@ RUN ./configure --prefix=/opt/wine \
 # The trace (spec section 10, "trace first"): on the CI runner's real
 # Linux kernel, through musl. The prefix is created first and traced on
 # its own, then the command Phase 3 must run is traced warm, in full and
-# as counts.
+# as counts. -s 256 keeps arguments such as command lines readable (paths
+# are printed in full regardless). "Warm" still includes wineboot: the
+# first process of every session runs `wineboot --init` (Wine 11.0
+# dlls/ntdll/unix/env.c, build_initial_params), which redoes the wine.inf
+# install only when .update-timestamp is stale (programs/wineboot/
+# wineboot.c, update_wineprefix).
 FROM build AS trace
 RUN apk add --no-cache strace
 ENV WINEPREFIX=/tmp/prefix WINEDEBUG=-all PATH=/opt/wine/bin:$PATH
 WORKDIR /trace
-RUN strace -f -o prefix-trace.txt wineboot --init > prefix-stdout.txt 2>&1; \
+RUN strace -f -s 256 -o prefix-trace.txt wineboot --init > prefix-stdout.txt 2>&1; \
     echo "exit $?" >> prefix-stdout.txt; \
-    strace -f -o trace.txt wine cmd /c echo hello > hello-stdout.txt 2>&1; \
+    strace -f -s 256 -o trace.txt wine cmd /c echo hello > hello-stdout.txt 2>&1; \
     echo "exit $?" >> hello-stdout.txt; \
     strace -f -c -o counts.txt wine cmd /c echo hello > /dev/null 2>&1; \
     apk list --installed | sort > packages.txt; \

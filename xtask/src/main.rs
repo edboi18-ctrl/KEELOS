@@ -45,7 +45,7 @@ Commands:
                             entry and GitHub build-provenance attestation
   syscalls <trace> [--counts FILE] [--out FILE] [--source TEXT]
                             Write the system-call inventory (default
-                            docs/syscalls.md) from an strace -f trace
+                            docs/syscall-inventory.md) from an strace -f trace
   audit [--offline]         Format, lint, unsafe count, licenses, workflow
                             policy, dependency advisories
 
@@ -195,7 +195,7 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
             let counts = take_value(&mut args, "--counts")?;
             let out = take_value(&mut args, "--out")?
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| util::workspace_root().join("docs/syscalls.md"));
+                .unwrap_or_else(|| util::workspace_root().join("docs/syscall-inventory.md"));
             let source = take_value(&mut args, "--source")?
                 .unwrap_or_else(|| "an strace -f trace".to_string());
             if args.len() != 1 {
