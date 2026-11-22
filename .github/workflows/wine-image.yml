@@ -36,6 +36,11 @@ jobs:
           cat out/SHA256SUMS
           cat out/hello-stdout.txt
           head -50 out/counts.txt
+      # Wine must actually run: the line, then exit status 0.
+      - name: Check wine cmd /c echo hello worked
+        run: |
+          tr -d '\r' < out/hello-stdout.txt | grep -qx 'hello'
+          grep -qx 'exit 0' out/hello-stdout.txt
       - name: Keep the output
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

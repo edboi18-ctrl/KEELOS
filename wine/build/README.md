@@ -37,5 +37,16 @@
   cross-compiler, `mingw-w64-gcc`), no tests, no Win16, no X11 or Wayland,
   and every optional library off.
 
+## Notes on musl
+
+- Wine's Unix libraries get an `$ORIGIN` rpath. Without it musl's dynamic
+  linker cannot resolve their `ntdll.so` dependency and Wine stops with
+  `could not load kernel32.dll, status c0000135`; the Dockerfile comment
+  cites the musl source. Setting `LD_LIBRARY_PATH` to
+  `lib/wine/x86_64-unix` also works; the rpath needs no environment.
+- `wineboot --init` reports `failed to start
+  L"C:\\windows\\syswow64\\rundll32.exe": c0000135`. Expected: the build
+  is 64-bit only, so there are no 32-bit (WoW64) programs to run.
+
 Alpine packages are not pinned by hash; `packages.txt` records exactly
 which versions a build used, so two builds can be compared.
