@@ -1,0 +1,12 @@
+binutils: 10 MiB
+binutils: Tools necessary to build programs
+binutils: https://www.gnu.org/software/binutils/
+gcc: 159 MiB
+gcc: The GNU Compiler Collection
+gcc: https://gcc.gnu.org
+musl-dev: 9671 KiB
+musl-dev: https://musl.libc.org/
+musl-dev: the musl c library (libc) implementation (development files)
+musl: 654 KiB
+musl: https://musl.libc.org/
+musl: the musl c library (libc) implementation
