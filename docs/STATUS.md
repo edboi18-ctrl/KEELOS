@@ -111,6 +111,10 @@ run that does not end within 10 minutes, or a harness wake-up more than
 5 s late (kernel not preempting). Every phase 1 boot also runs a short
 smoke (`fuzz.smoke`). The first sessions found F-0005 to F-0008, all
 fixed with regression tests. The one-hour session is in progress.
+`.github/workflows/security.yml` (nightly and manual) runs four
+60-minute fuzz shards with distinct seeds under KVM and keeps each serial
+log; it is on the working branch for the owner to review and merge
+(SR-36).
 
 Hardening notes for later Phase 1 work:
 - User programs share the serial line with the kernel's `TEST` report lines,

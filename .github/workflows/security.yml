@@ -1,0 +1,79 @@
+# Nightly security testing (spec section 7, `security.yml`; security
+# acceptance P1 item 6, and P3's eight-hour gate later).
+#
+# Workflows contain no build logic: each job calls `cargo xtask`, as a
+# developer does locally. Same rules as ci.yml (SR-32 to SR-34), enforced
+# by `cargo xtask audit`: actions pinned by full commit SHA, read-only
+# token, no secrets, no pull_request_target, GitHub-hosted runners only.
+#
+# System-call fuzzing runs as parallel shards with distinct seeds, because
+# a hosted job is capped at six hours (GitHub "Usage limits"); the shards'
+# total is the session length. Four 60-minute shards: four hours a night,
+# above Phase 1's one-hour gate. Each shard's seed is printed and its full
+# serial log is kept for 14 days, so a failure can be replayed with
+# `cargo xtask fuzz --minutes 60 --seed <seed>`.
+#
+# Still to come here, as their pieces land: the escape suite (P3-S8),
+# host parser fuzzing, and the two-build reproducibility check.
+name: security
+
+on:
+  schedule:
+    # 03:17 UTC nightly (off the hour, when scheduled runs are busiest).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  syscall-fuzz:
+    name: System-call fuzzing (shard ${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    # 60 minutes of fuzzing, up to 10 more for the last run to end, plus
+    # build and boot.
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Install QEMU and UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 ovmf
+      - name: Allow this user to use KVM
+        # From GitHub's changelog entry on hardware acceleration for hosted
+        # Linux runners (2024-04-02).
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Fuzz for 60 minutes
+        # Distinct per run and shard. Both values are numbers set by
+        # GitHub, passed through the environment rather than expanded into
+        # the script.
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          seed=$(( RUN_ID * 16 + SHARD ))
+          echo "fuzz seed: $seed"
+          cargo xtask fuzz --kvm --minutes 60 --seed "$seed"
+      - name: Keep the serial log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-log-shard-${{ matrix.shard }}
+          path: target/test-logs/fuzz.log
+          retention-days: 14
+          if-no-files-found: warn
