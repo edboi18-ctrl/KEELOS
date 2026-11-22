@@ -21,6 +21,7 @@ const EPERM: i64 = -1;
 const EACCES: i64 = -13;
 const ENOTTY: i64 = -25;
 const ENOSYS: i64 = -38;
+const ENOMEM: i64 = -12;
 const CLOCK_MONOTONIC: u64 = 1;
 const TIOCGWINSZ: u64 = 0x5413;
 const TCGETS: u64 = 0x5401;
@@ -70,6 +71,12 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 
 fn hostile() -> impl Iterator<Item = Hostile> {
     HOSTILE.iter().filter_map(|&a| Hostile::new(a))
+}
+
+/// The hostile addresses without 0, for arguments where NULL means "none"
+/// (signal calls) rather than a bad pointer.
+fn hostile_nonnull() -> impl Iterator<Item = Hostile> {
+    hostile().filter(|h| h.address() != 0)
 }
 
 fn main(startup: &Startup) -> i32 {
@@ -366,6 +373,9 @@ fn main(startup: &Startup) -> i32 {
         );
     }
 
+    poll_checks(&mut c, keel);
+    signal_checks(&mut c);
+
     // Unknown system calls fail closed.
     c.check(
         "unassigned syscall 500 is ENOSYS",
@@ -379,6 +389,240 @@ fn main(startup: &Startup) -> i32 {
         }
         Some(n) => n,
     }
+}
+
+const POLLIN: u16 = 0x1;
+const POLLOUT: u16 = 0x4;
+const POLLNVAL: u16 = 0x20;
+
+fn pollfd(fd: i32, events: u16) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[..4].copy_from_slice(&fd.to_le_bytes());
+    b[4..6].copy_from_slice(&events.to_le_bytes());
+    // revents starts as garbage: poll must overwrite it.
+    b[6..8].copy_from_slice(&0xffffu16.to_le_bytes());
+    b
+}
+
+fn revents(b: &[u8; 8]) -> u16 {
+    u16::from_le_bytes([b[6], b[7]])
+}
+
+/// poll(2), against Linux v6.12 fs/select.c.
+fn poll_checks(c: &mut Checks, keel: bool) {
+    // Standard output with no events (Rust std's startup probe): nothing
+    // reported. A negative fd is skipped; a closed one is POLLNVAL.
+    let mut fds = [pollfd(1, 0), pollfd(-1, POLLIN), pollfd(900, 0)];
+    let n = sys::poll(&mut fds, 0);
+    c.check(
+        "poll: open fd with no events, negative fd, closed fd",
+        n == 1 && revents(&fds[0]) == 0 && revents(&fds[1]) == 0 && revents(&fds[2]) == POLLNVAL,
+    );
+    let null = sys::openat(sys::AT_FDCWD, c"/dev/null", sys::O_RDWR, 0) as i32;
+    let mut fds = [pollfd(null, POLLIN | POLLOUT)];
+    c.check(
+        "poll: /dev/null read/write is readable and writable",
+        sys::poll(&mut fds, 0) == 1 && revents(&fds[0]) == POLLIN | POLLOUT,
+    );
+    sys::close(null);
+    if keel {
+        // SR-1: readiness only for what the handle may do (Linux reports
+        // POLLOUT here too).
+        let ro = sys::openat(sys::AT_FDCWD, c"/dev/null", sys::O_RDONLY, 0) as i32;
+        let mut fds = [pollfd(ro, POLLIN | POLLOUT)];
+        c.check(
+            "Keel only: poll on a read-only handle reports no POLLOUT (SR-1)",
+            sys::poll(&mut fds, 0) == 1 && revents(&fds[0]) == POLLIN,
+        );
+        sys::close(ro);
+        c.check(
+            "Keel only: poll of more fds than the handle limit is EINVAL",
+            Hostile::new(0).is_some_and(|h| sys::poll_from(h, 1025) == EINVAL),
+        );
+    }
+    // Nothing ready: the timeout passes (20 ms), and 0 is returned.
+    let mut t1 = [0u8; 16];
+    let mut t2 = [0u8; 16];
+    let mut fds = [pollfd(-1, POLLIN)];
+    let ok = sys::clock_gettime(CLOCK_MONOTONIC, &mut t1) == 0
+        && sys::poll(&mut fds, 20) == 0
+        && sys::clock_gettime(CLOCK_MONOTONIC, &mut t2) == 0;
+    let nanos = |t: &[u8; 16]| u64_at(t, 0) * 1_000_000_000 + u64_at(t, 8);
+    c.check(
+        "poll: times out after at least the timeout",
+        ok && nanos(&t2) - nanos(&t1) >= 20_000_000,
+    );
+    c.check(
+        "poll: unreadable array is EFAULT",
+        hostile().all(|h| sys::poll_from(h, 1) == EFAULT),
+    );
+    // A read-only array can be read but revents cannot be written back.
+    if let Ok(region) = Region::map(4096, sys::PROT_READ) {
+        c.check("poll: read-only array is EFAULT", region.poll(1) == EFAULT);
+        let _ = region.unmap();
+    }
+}
+
+const SIGKILL: i32 = 9;
+const SIGUSR1: i32 = 10;
+const SIGUSR2: i32 = 12;
+const SIGSTOP: i32 = 19;
+const SIG_IGN: u64 = 1;
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_UNSUPPORTED: u64 = 0x400;
+const SS_DISABLE: u32 = 2;
+const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
+
+fn sigaction_bytes(handler: u64, flags: u64, mask: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0..8].copy_from_slice(&handler.to_le_bytes());
+    b[8..16].copy_from_slice(&flags.to_le_bytes());
+    b[24..32].copy_from_slice(&mask.to_le_bytes());
+    b
+}
+
+fn stack_bytes(sp: u64, flags: u32, size: u64) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[0..8].copy_from_slice(&sp.to_le_bytes());
+    b[8..12].copy_from_slice(&flags.to_le_bytes());
+    b[16..24].copy_from_slice(&size.to_le_bytes());
+    b
+}
+
+/// rt_sigaction, rt_sigprocmask, sigaltstack, against Linux v6.12
+/// kernel/signal.c. Only the recorded state is checked: Keel delivers no
+/// signals before P3-T6. Every change is undone.
+fn signal_checks(c: &mut Checks) {
+    use sys::{Arg, Out};
+    let mut old = [0u8; 32];
+    let ignore = sigaction_bytes(SIG_IGN, SA_RESTORER | SA_UNSUPPORTED, u64::MAX);
+    c.check(
+        "rt_sigaction: sigsetsize other than 8 is EINVAL",
+        sys::rt_sigaction(SIGUSR1, Arg::Null, Out::Buf(&mut old), 4) == EINVAL,
+    );
+    c.check(
+        "rt_sigaction: signals 0 and 65 are EINVAL",
+        sys::rt_sigaction(0, Arg::Null, Out::Buf(&mut old), 8) == EINVAL
+            && sys::rt_sigaction(65, Arg::Null, Out::Buf(&mut old), 8) == EINVAL,
+    );
+    c.check(
+        "rt_sigaction: SIGKILL/SIGSTOP can be read but not set",
+        sys::rt_sigaction(SIGKILL, Arg::Null, Out::Buf(&mut old), 8) == 0
+            && sys::rt_sigaction(SIGKILL, Arg::Buf(&ignore), Out::Null, 8) == EINVAL
+            && sys::rt_sigaction(SIGSTOP, Arg::Buf(&ignore), Out::Null, 8) == EINVAL,
+    );
+    let mut original = [0u8; 32];
+    let mut back = [0u8; 32];
+    let set = sys::rt_sigaction(SIGUSR1, Arg::Buf(&ignore), Out::Buf(&mut original), 8);
+    let read = sys::rt_sigaction(SIGUSR1, Arg::Null, Out::Buf(&mut back), 8);
+    c.check(
+        "rt_sigaction: set and read back, unknown flags and SIGKILL/SIGSTOP mask bits cleared",
+        set == 0
+            && read == 0
+            && u64_at(&back, 0) == SIG_IGN
+            && u64_at(&back, 8) == SA_RESTORER
+            && u64_at(&back, 24) == !UNBLOCKABLE,
+    );
+    c.check(
+        "rt_sigaction: unreadable act is EFAULT",
+        hostile_nonnull()
+            .all(|h| sys::rt_sigaction(SIGUSR2, Arg::Hostile(h), Out::Null, 8) == EFAULT),
+    );
+    // The new action is set before the old one is written out.
+    let marker = sigaction_bytes(0x1234_5000, SA_RESTORER, 0);
+    let mut seen = [0u8; 32];
+    let mut first = [0u8; 32];
+    let saved = sys::rt_sigaction(SIGUSR2, Arg::Null, Out::Buf(&mut first), 8) == 0;
+    c.check(
+        "rt_sigaction: unwritable oldact is EFAULT after the change",
+        saved
+            && hostile_nonnull().all(|h| {
+                sys::rt_sigaction(SIGUSR2, Arg::Buf(&marker), Out::Hostile(h), 8) == EFAULT
+            })
+            && sys::rt_sigaction(SIGUSR2, Arg::Null, Out::Buf(&mut seen), 8) == 0
+            && u64_at(&seen, 0) == 0x1234_5000,
+    );
+    sys::rt_sigaction(SIGUSR2, Arg::Buf(&first), Out::Null, 8);
+    sys::rt_sigaction(SIGUSR1, Arg::Buf(&original), Out::Null, 8);
+
+    // rt_sigprocmask.
+    let mut mask = 0u64;
+    let all = u64::MAX;
+    c.check(
+        "rt_sigprocmask: sigsetsize other than 8 is EINVAL",
+        sys::rt_sigprocmask(0, Arg::Null, Out::Buf(&mut mask), 16) == EINVAL,
+    );
+    let mut before = 0u64;
+    let mut blocked = 0u64;
+    let ok = sys::rt_sigprocmask(0, Arg::Buf(&all), Out::Buf(&mut before), 8) == 0
+        && sys::rt_sigprocmask(0, Arg::Null, Out::Buf(&mut blocked), 8) == 0;
+    c.check(
+        "rt_sigprocmask: SIG_BLOCK of everything leaves SIGKILL/SIGSTOP unblocked",
+        ok && blocked == !UNBLOCKABLE,
+    );
+    let usr1 = 1u64 << (SIGUSR1 - 1);
+    let ok = sys::rt_sigprocmask(1, Arg::Buf(&usr1), Out::Null, 8) == 0
+        && sys::rt_sigprocmask(0, Arg::Null, Out::Buf(&mut blocked), 8) == 0;
+    c.check(
+        "rt_sigprocmask: SIG_UNBLOCK",
+        ok && blocked == !UNBLOCKABLE & !usr1,
+    );
+    c.check(
+        "rt_sigprocmask: bad how is EINVAL with a set, ignored without",
+        sys::rt_sigprocmask(7, Arg::Buf(&all), Out::Null, 8) == EINVAL
+            && sys::rt_sigprocmask(7, Arg::Null, Out::Null, 8) == 0,
+    );
+    c.check(
+        "rt_sigprocmask: unreadable set is EFAULT",
+        hostile_nonnull().all(|h| sys::rt_sigprocmask(0, Arg::Hostile(h), Out::Null, 8) == EFAULT),
+    );
+    let ok = sys::rt_sigprocmask(2, Arg::Buf(&before), Out::Null, 8) == 0
+        && sys::rt_sigprocmask(0, Arg::Null, Out::Buf(&mut blocked), 8) == 0;
+    c.check(
+        "rt_sigprocmask: SIG_SETMASK restores",
+        ok && blocked == before,
+    );
+
+    // sigaltstack.
+    let mut st = [0u8; 24];
+    c.check(
+        "sigaltstack: none at start (SS_DISABLE, size 0)",
+        sys::sigaltstack(Arg::Null, Out::Buf(&mut st)) == 0
+            && u32_at(&st, 8) == SS_DISABLE
+            && u64_at(&st, 16) == 0,
+    );
+    if let Ok(region) = Region::map(16384, sys::PROT_READ | sys::PROT_WRITE) {
+        let base = region.address();
+        c.check(
+            "sigaltstack: below MINSIGSTKSZ (2048) is ENOMEM",
+            sys::sigaltstack(Arg::Buf(&stack_bytes(base, 0, 2047)), Out::Null) == ENOMEM,
+        );
+        c.check(
+            "sigaltstack: unknown mode is EINVAL",
+            sys::sigaltstack(Arg::Buf(&stack_bytes(base, 4, 16384)), Out::Null) == EINVAL,
+        );
+        let ok = sys::sigaltstack(Arg::Buf(&stack_bytes(base, 0, 16384)), Out::Null) == 0
+            && sys::sigaltstack(Arg::Null, Out::Buf(&mut st)) == 0;
+        c.check(
+            "sigaltstack: set and read back",
+            ok && st == stack_bytes(base, 0, 16384),
+        );
+        let ok = sys::sigaltstack(Arg::Buf(&stack_bytes(base, SS_DISABLE, 99)), Out::Null) == 0
+            && sys::sigaltstack(Arg::Null, Out::Buf(&mut st)) == 0;
+        c.check(
+            "sigaltstack: SS_DISABLE clears pointer and size",
+            ok && st == stack_bytes(0, SS_DISABLE, 0),
+        );
+        let _ = region.unmap();
+    }
+    c.check(
+        "sigaltstack: unreadable ss is EFAULT",
+        hostile_nonnull().all(|h| sys::sigaltstack(Arg::Hostile(h), Out::Null) == EFAULT),
+    );
+    c.check(
+        "sigaltstack: unwritable old_ss is EFAULT",
+        hostile_nonnull().all(|h| sys::sigaltstack(Arg::Null, Out::Hostile(h)) == EFAULT),
+    );
 }
 
 keel_rt::main!(main);

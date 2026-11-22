@@ -8,6 +8,7 @@ members = [
     "kernel/keel-kernel",
     "user/keel-rt",
     "user/tests",
+    "user/std-tests",
 ]
 # Plain `cargo build` / `cargo test` on the host only touch host-buildable
 # crates. The kernel and the user programs are built for x86_64-unknown-none

@@ -197,6 +197,63 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(TEST_PROGRAMS.iter().map(|p| out.join(p.binary)).collect())
 }
 
+/// Target of the programs in `user/std-tests`, which use Rust's standard
+/// library: static musl executables, as Phase 1 acceptance item 2 asks.
+pub const STD_TARGET: &str = "x86_64-unknown-linux-musl";
+
+/// A program from `user/std-tests`, placed in the initramfs of test builds
+/// only, with the standard output it must print, the same on Linux and on
+/// Keel.
+pub struct StdProgram {
+    /// Path inside the initramfs.
+    pub path: &'static str,
+    /// Binary name in `user/std-tests`.
+    pub binary: &'static str,
+    /// Its whole standard output.
+    pub stdout: &'static str,
+}
+
+/// Phase 1 acceptance item 2: allocate 64 MB on the heap, touch every
+/// page, print a checksum. The checksum is of fixed data, so it is known
+/// in advance.
+pub const STD_PROGRAMS: &[StdProgram] = &[StdProgram {
+    path: "test/heap64",
+    binary: "heap64",
+    stdout: "heap64: 67108864 bytes in 16384 pages, checksum 0x7f282b735ac8d3f2\n",
+}];
+
+/// Compiles the `user/std-tests` programs and returns the path of each, in
+/// `STD_PROGRAMS` order. They stay static PIE (the musl target's default),
+/// so Keel loads them at a random bias.
+///
+/// They link with `rust-lld` and the target's bundled musl start files
+/// (rustc `-Clink-self-contained`, on by default for this target), so no
+/// C toolchain is needed and the build works on Windows too.
+pub fn build_std_tests(root: &Path) -> Result<Vec<PathBuf>> {
+    let target_dir = root.join("target").join("std");
+    let mut flags = target_flags(root);
+    flags.push("-Clinker=rust-lld".to_string());
+    flags.push("-Clinker-flavor=ld.lld".to_string());
+    flags.push("-Cstrip=debuginfo".to_string());
+    util::run(
+        Command::new(util::cargo())
+            .current_dir(root)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--package",
+                "keel-std-tests",
+            ])
+            .args(["--target", STD_TARGET])
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f")),
+    )?;
+    let out = target_dir.join(STD_TARGET).join("release");
+    Ok(STD_PROGRAMS.iter().map(|p| out.join(p.binary)).collect())
+}
+
 /// Renders `limine.conf` with BLAKE2B hashes pinned on every loaded file
 /// (SR-27; Limine CONFIG.md, "Paths": `path#<blake2b hash>`).
 pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
@@ -246,6 +303,9 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
         }
         for fixture in TEST_FIXTURES {
             archive.add_file(fixture.path, load_fixture(&root, fixture)?);
+        }
+        for (program, binary) in STD_PROGRAMS.iter().zip(build_std_tests(&root)?) {
+            archive.add_file(program.path, util::read(&binary)?);
         }
     }
     let initramfs = archive.to_bytes()?;

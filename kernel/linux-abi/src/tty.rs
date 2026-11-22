@@ -83,6 +83,12 @@ pub fn read(buf: &mut [u8]) -> usize {
     }
 }
 
+/// Whether a read would return without waiting (a finished line, or end
+/// of file), for poll(2).
+pub fn readable() -> bool {
+    TERMINAL.lock().line.readable()
+}
+
 /// Types `bytes` (set-1 scancodes) through the controller, for tests.
 pub fn type_scancodes(bytes: &[u8]) -> Result<(), ps2::Ps2Error> {
     for &b in bytes {

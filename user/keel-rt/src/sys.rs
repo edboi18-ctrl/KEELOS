@@ -18,12 +18,16 @@ pub mod nr {
     pub const WRITE: u64 = 1;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
+    pub const POLL: u64 = 7;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
+    pub const RT_SIGACTION: u64 = 13;
+    pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
     pub const WRITEV: u64 = 20;
+    pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;
@@ -183,6 +187,79 @@ pub fn arch_prctl_get_into(code: u64, target: Hostile) -> i64 {
     call3(nr::ARCH_PRCTL, code, target.0, 0)
 }
 
+/// poll(2) on `fds`, each a raw `struct pollfd` (fd, events, revents).
+pub fn poll(fds: &mut [[u8; 8]], timeout_ms: i32) -> i64 {
+    call3(
+        nr::POLL,
+        fds.as_mut_ptr() as u64,
+        fds.len() as u64,
+        timeout_ms as u64,
+    )
+}
+
+/// poll(2) with the array at a hostile address.
+pub fn poll_from(fds: Hostile, nfds: u64) -> i64 {
+    call3(nr::POLL, fds.0, nfds, 0)
+}
+
+/// Where a signal call reads its input or writes its output: nothing
+/// (NULL), this program's own buffer, or a hostile address.
+pub enum Arg<'a, T> {
+    Null,
+    Buf(&'a T),
+    Hostile(Hostile),
+}
+
+pub enum Out<'a, T> {
+    Null,
+    Buf(&'a mut T),
+    Hostile(Hostile),
+}
+
+fn arg<T>(a: &Arg<'_, T>) -> u64 {
+    match a {
+        Arg::Null => 0,
+        Arg::Buf(b) => *b as *const T as u64,
+        Arg::Hostile(h) => h.0,
+    }
+}
+
+fn out<T>(o: &mut Out<'_, T>) -> u64 {
+    match o {
+        Out::Null => 0,
+        Out::Buf(b) => *b as *mut T as u64,
+        Out::Hostile(h) => h.0,
+    }
+}
+
+/// rt_sigaction(2) with raw 32-byte kernel `struct sigaction`s. Setting a
+/// handler is sound only for a signal this program never receives; the
+/// tests use SIG_IGN or handlers for signals nothing sends.
+pub fn rt_sigaction(
+    sig: i32,
+    act: Arg<'_, [u8; 32]>,
+    mut old: Out<'_, [u8; 32]>,
+    size: u64,
+) -> i64 {
+    call6(
+        nr::RT_SIGACTION,
+        [sig as u64, arg(&act), out(&mut old), size, 0, 0],
+    )
+}
+
+pub fn rt_sigprocmask(how: i32, set: Arg<'_, u64>, mut old: Out<'_, u64>, size: u64) -> i64 {
+    call6(
+        nr::RT_SIGPROCMASK,
+        [how as u64, arg(&set), out(&mut old), size, 0, 0],
+    )
+}
+
+/// sigaltstack(2) with raw 24-byte `stack_t`s. The kernel only records
+/// the stack; it is used only if a signal handler runs on it.
+pub fn sigaltstack(ss: Arg<'_, [u8; 24]>, mut old: Out<'_, [u8; 24]>) -> i64 {
+    call3(nr::SIGALTSTACK, arg(&ss), out(&mut old), 0)
+}
+
 /// Sets the FS base to `value`'s address, reads the 8 bytes at FS:0, and
 /// puts the old base back. Returns `(set result, value read)`. This
 /// runtime keeps no thread-local data, so FS is free to change.
@@ -288,6 +365,12 @@ impl Region {
 
     pub fn protect(&self, prot: u64) -> i64 {
         call3(nr::MPROTECT, self.address, self.length, prot)
+    }
+
+    /// poll(2) on `nfds` `struct pollfd`s at the start of the region, with
+    /// timeout 0.
+    pub fn poll(&self, nfds: u64) -> i64 {
+        call3(nr::POLL, self.address, nfds, 0)
     }
 
     /// munmap(2). The address stays useful as a pointer to nothing.

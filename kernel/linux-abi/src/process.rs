@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 
 use keel_core::errno::Errno;
 use keel_core::handle::{Handle, HandleTable, Rights};
+use keel_core::signal::SignalState;
 use keel_core::vfs::{Device, Ino, Kind, ROOT};
 use keel_hal::sched::{self, ThreadId};
 use keel_hal::sync::IrqMutex;
@@ -68,6 +69,9 @@ pub struct Process {
     /// set_tid_address(2): where the TID is cleared at thread exit (used
     /// with futexes once threads exist; stored only for now).
     pub clear_child_tid: u64,
+    /// Signal dispositions, blocked mask and alternate stack, recorded
+    /// only until delivery arrives (P3-T6).
+    pub signals: SignalState,
 }
 
 /// Processes by thread ID.
@@ -122,6 +126,7 @@ pub fn spawn(name: &'static str, loaded: &Loaded) -> Result<Spawned, Errno> {
         root: ROOT,
         cwd: ROOT,
         clear_child_tid: 0,
+        signals: SignalState::new(),
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.

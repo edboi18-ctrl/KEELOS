@@ -1032,6 +1032,26 @@ pub fn phase1_musl(t: &mut Runner) {
         kprintln!("  musl-hello: pid {pid}, exit {status:?}");
     }
 
+    // Acceptance item 2: a Rust program using the standard library, built
+    // for x86_64-unknown-linux-musl, allocates 64 MB on the heap, touches
+    // every page and prints a checksum; cargo xtask test checks the line
+    // against the one it prints under Linux.
+    const HEAP: &[u8] = b"/test/heap64";
+    let heap = keel_linux_abi::fs::read_file(HEAP).ok().and_then(|file| {
+        let loaded = keel_linux_abi::exec::load(&file, HEAP, &[HEAP], &[]).ok()?;
+        let spawned = keel_linux_abi::process::spawn("heap64", &loaded).ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    });
+    t.check(
+        "acceptance.rust_std_heap64",
+        heap == Some((0, None)),
+        "a Rust std musl program touches 64 MB of heap and exits 0 (its line is checked on serial)",
+    );
+    if heap != Some((0, None)) {
+        kprintln!("  heap64: exit {heap:?}");
+    }
+
     // Acceptance item 3: a null-pointer read in a user program ends that
     // program with a logged #PF at address 0 (cargo xtask test checks the
     // log line), and the kernel carries on.
@@ -1152,7 +1172,7 @@ pub fn phase1_exec(t: &mut Runner) {
     t.check(
         "syscalls.conformance",
         syscalls == Some((0, None)),
-        "write, writev, read, openat, close, fstat, mmap, mprotect, munmap, brk, arch_prctl, set_tid_address, clock_gettime, getrandom, ioctl behave as on Linux, and every pointer argument refuses hostile addresses with EFAULT",
+        "write, writev, read, openat, close, fstat, mmap, mprotect, munmap, brk, arch_prctl, set_tid_address, clock_gettime, getrandom, ioctl, poll, rt_sigaction, rt_sigprocmask, sigaltstack behave as on Linux, and every pointer argument refuses hostile addresses with EFAULT",
     );
     if let Some((status, fault)) = syscalls
         && (status != 0 || fault.is_some())

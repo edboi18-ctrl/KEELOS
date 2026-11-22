@@ -33,13 +33,17 @@ pub mod nr {
     pub const WRITE: u64 = 1;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
+    pub const POLL: u64 = 7;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
+    pub const RT_SIGACTION: u64 = 13;
+    pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
     pub const WRITEV: u64 = 20;
     pub const EXIT: u64 = 60;
+    pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;
@@ -81,11 +85,16 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::WRITEV as usize] = Some(|p, a| writev(p, a[0] as u32 as i32, a[1], a[2]));
     t[nr::CLOSE as usize] = Some(|p, a| close(p, a[0] as u32 as i32));
     t[nr::FSTAT as usize] = Some(|p, a| fstat(p, a[0] as u32 as i32, a[1]));
+    t[nr::POLL as usize] = Some(|p, a| poll(p, a[0], a[1] as u32, a[2] as u32 as i32));
     t[nr::OPENAT as usize] = Some(|p, a| openat(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
     t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
     t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
     t[nr::BRK as usize] = Some(|p, a| Ok(brk(p, a[0])));
+    t[nr::RT_SIGACTION as usize] =
+        Some(|p, a| rt_sigaction(p, a[0] as u32 as i32, a[1], a[2], a[3]));
+    t[nr::RT_SIGPROCMASK as usize] =
+        Some(|p, a| rt_sigprocmask(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     t[nr::IOCTL as usize] = Some(|p, a| ioctl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
     t[nr::ARCH_PRCTL as usize] = Some(|_, a| arch_prctl(a[0], a[1]));
     t[nr::SET_TID_ADDRESS as usize] = Some(|p, a| Ok(set_tid_address(p, a[0])));
@@ -101,6 +110,11 @@ pub fn handle(call: &SyscallArgs) -> i64 {
     let result: SysResult = match number {
         nr::EXIT | nr::EXIT_GROUP => sched::exit_with((a[0] & 0xff) as i64),
         nr::KEEL_TEST_ADD_ONE => Ok(a[0].wrapping_add(1)),
+        // Outside the table: it also needs the caller's stack pointer.
+        nr::SIGALTSTACK => match process::current() {
+            Some(p) => sigaltstack(&p, a[0], a[1], call.user_rsp),
+            None => unimplemented(number, &a),
+        },
         _ if number < TABLE_SIZE => {
             // Spectre v1: the number is user-controlled; clamp it without
             // a branch before indexing (Linux does the same with
@@ -599,4 +613,172 @@ fn getrandom(buf: u64, count: u64, flags: u64) -> SysResult {
         done += n;
     }
     Ok(done as u64)
+}
+
+/// Longest wait between readiness checks in a blocking poll. Phase 1 has
+/// no readiness notification (P3-T10 adds one), so a poll that must wait
+/// re-checks its files at this interval until one is ready or the timeout
+/// passes.
+const POLL_INTERVAL_MS: u64 = 10;
+
+/// What `file` is ready for, as `vfs_poll` would report it, limited to
+/// what the handle's rights allow (SR-1): readable only through a handle
+/// with READ, writable only through one with WRITE. Linux reports both
+/// whatever the access mode; Keel does not reveal readiness for an
+/// operation the handle cannot perform (docs/syscalls.md).
+fn poll_ready(file: &Arc<IrqMutex<OpenFile>>, rights: Rights) -> u16 {
+    use keel_core::poll::*;
+    // Copy the kind out: the file lock is not held while the terminal's
+    // is taken.
+    let kind = file.lock().kind;
+    let ready = match kind {
+        // n_tty_poll: writable while output has room (console output never
+        // waits); readable once a line or end of file is ready.
+        Kind::Device(Device::Console) => {
+            let input = if crate::tty::readable() {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            };
+            input | POLLOUT | POLLWRNORM
+        }
+        // Regular files, directories, /dev/null, /dev/zero and
+        // /dev/urandom have no poll method: DEFAULT_POLLMASK.
+        _ => DEFAULT_POLLMASK,
+    };
+    let mut allowed = POLLERR | POLLHUP;
+    if rights.contains(Rights::READ) {
+        allowed |= POLLIN | POLLRDNORM | POLLPRI;
+    }
+    if rights.contains(Rights::WRITE) {
+        allowed |= POLLOUT | POLLWRNORM;
+    }
+    ready & allowed
+}
+
+/// poll(2) (`fs/select.c`, `do_sys_poll`): EINVAL above the handle limit
+/// (Linux: RLIMIT_NOFILE); EFAULT if the array cannot be read, or its
+/// `revents` written back; otherwise the number of entries with events.
+/// A negative timeout waits without limit.
+fn poll(p: &Arc<IrqMutex<Process>>, fds: u64, nfds: u32, timeout_ms: i32) -> SysResult {
+    use keel_core::poll::{POLLFD_SIZE, PollFd, REVENTS_OFFSET, revents};
+    if nfds as usize > process::HANDLE_LIMIT {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = vec![0u8; nfds as usize * POLLFD_SIZE];
+    copy_from_user(&mut raw, fds).map_err(fault)?;
+    let entries: Vec<PollFd> = raw
+        .as_chunks::<POLLFD_SIZE>()
+        .0
+        .iter()
+        .map(PollFd::from_bytes)
+        .collect();
+    let deadline = u64::try_from(timeout_ms)
+        .ok()
+        .map(|ms| time::monotonic_nanos().saturating_add(ms.saturating_mul(1_000_000)));
+    let mut results = vec![0u16; entries.len()];
+    loop {
+        let mut count = 0u64;
+        for (entry, result) in entries.iter().zip(results.iter_mut()) {
+            // A negative fd is skipped without a lookup; any other number
+            // either names an open handle or gets POLLNVAL.
+            let handle = (entry.fd >= 0)
+                .then(|| {
+                    let process = p.lock();
+                    let object = process.handles.get(entry.fd, Rights::NONE).ok()?.clone();
+                    Some((object, process.handles.rights(entry.fd).ok()?))
+                })
+                .flatten();
+            let ready = handle.map(|(Object::File(file), rights)| poll_ready(&file, rights));
+            *result = revents(entry.fd, entry.events, ready);
+            if *result != 0 {
+                count += 1;
+            }
+        }
+        let now = time::monotonic_nanos();
+        let expired = deadline.is_some_and(|d| now >= d);
+        if count > 0 || expired {
+            for (i, result) in results.iter().enumerate() {
+                let at = fds + (i * POLLFD_SIZE + REVENTS_OFFSET) as u64;
+                copy_to_user(at, &result.to_le_bytes()).map_err(fault)?;
+            }
+            return Ok(count);
+        }
+        let wait_ms = deadline.map_or(POLL_INTERVAL_MS, |d| {
+            (d - now).div_ceil(1_000_000).clamp(1, POLL_INTERVAL_MS)
+        });
+        sched::sleep_ms(wait_ms);
+    }
+}
+
+/// rt_sigaction(2): records the action (no delivery until P3-T6). The
+/// order is Linux's: size check, copy in (EFAULT), validate and set, copy
+/// the old action out (EFAULT, after the change took effect).
+fn rt_sigaction(
+    p: &Arc<IrqMutex<Process>>,
+    sig: i32,
+    act: u64,
+    oldact: u64,
+    sigsetsize: u64,
+) -> SysResult {
+    use keel_core::signal::{SIGACTION_SIZE, SIGSET_SIZE, SigAction};
+    if sigsetsize != SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let new = if act != 0 {
+        let mut b = [0u8; SIGACTION_SIZE];
+        copy_from_user(&mut b, act).map_err(fault)?;
+        Some(SigAction::from_bytes(&b))
+    } else {
+        None
+    };
+    let old = p.lock().signals.sigaction(sig, new)?;
+    if oldact != 0 {
+        copy_to_user(oldact, &old.to_bytes()).map_err(fault)?;
+    }
+    Ok(0)
+}
+
+/// rt_sigprocmask(2): records the blocked mask.
+fn rt_sigprocmask(
+    p: &Arc<IrqMutex<Process>>,
+    how: i32,
+    set: u64,
+    oldset: u64,
+    sigsetsize: u64,
+) -> SysResult {
+    use keel_core::signal::SIGSET_SIZE;
+    if sigsetsize != SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let new = if set != 0 {
+        let mut b = [0u8; 8];
+        copy_from_user(&mut b, set).map_err(fault)?;
+        Some(u64::from_le_bytes(b))
+    } else {
+        None
+    };
+    let old = p.lock().signals.sigprocmask(how, new)?;
+    if oldset != 0 {
+        copy_to_user(oldset, &old.to_le_bytes()).map_err(fault)?;
+    }
+    Ok(0)
+}
+
+/// sigaltstack(2): records the alternate signal stack. `user_rsp` decides
+/// whether the caller runs on it (then a change is EPERM).
+fn sigaltstack(p: &Arc<IrqMutex<Process>>, ss: u64, old_ss: u64, user_rsp: u64) -> SysResult {
+    use keel_core::signal::{AltStack, STACK_T_SIZE};
+    let new = if ss != 0 {
+        let mut b = [0u8; STACK_T_SIZE];
+        copy_from_user(&mut b, ss).map_err(fault)?;
+        Some(AltStack::from_bytes(&b))
+    } else {
+        None
+    };
+    let old = p.lock().signals.sigaltstack(new, user_rsp)?;
+    if old_ss != 0 {
+        copy_to_user(old_ss, &old.to_bytes()).map_err(fault)?;
+    }
+    Ok(0)
 }

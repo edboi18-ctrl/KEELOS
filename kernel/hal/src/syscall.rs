@@ -18,6 +18,8 @@ const ENOSYS: i64 = 38;
 pub struct SyscallArgs {
     pub number: u64,
     pub args: [u64; 6],
+    /// The caller's user stack pointer (sigaltstack(2) checks it).
+    pub user_rsp: u64,
 }
 
 /// The registered system-call handler: arguments in, RAX out.
@@ -37,6 +39,7 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
         args: [
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ],
+        user_rsp: frame.rsp,
     };
     // Copy the handler out so the lock is not held during the call, which
     // may block or switch threads.

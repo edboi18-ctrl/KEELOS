@@ -53,7 +53,11 @@ pub const PHASES: &[Phase] = &[
         ],
         // Phase 1 acceptance item 1: the musl fixture's output reaches
         // serial (it runs as PID 1; the kernel checks PID and status).
-        expect_lines: &["Hello from musl on Keel"],
+        // Item 2: the Rust std program's line, identical to its Linux run.
+        expect_lines: &[
+            "Hello from musl on Keel",
+            "heap64: 67108864 bytes in 16384 pages, checksum 0x7f282b735ac8d3f2",
+        ],
         expect_prefixes: &["user fault: #PF page fault at 0x400000 (error 0x4, address 0x0)"],
     },
 ];
@@ -693,6 +697,26 @@ fn test_user_programs_on_host() -> Result<()> {
             fixture.path.rsplit('/').next().unwrap_or(fixture.path)
         );
         if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+            println!("  TEST {name} PASS prints the expected line under Linux");
+        } else {
+            return Err(format!(
+                "{name} under Linux: {} printing {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            )
+            .into());
+        }
+    }
+    for (program, binary) in build::STD_PROGRAMS
+        .iter()
+        .zip(build::build_std_tests(&root)?)
+    {
+        let output = Command::new(&binary)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()?;
+        let name = format!("host.{}", program.binary);
+        if output.status.success() && output.stdout == program.stdout.as_bytes() {
             println!("  TEST {name} PASS prints the expected line under Linux");
         } else {
             return Err(format!(

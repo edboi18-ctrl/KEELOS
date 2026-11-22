@@ -72,7 +72,18 @@ plus the serial check for the fault line. Item 4 (64 GB
 `acceptance.reserve_64gib`, run by `user/tests/reserve`, which also passes
 under Linux: 64 GiB mapped, 16 KiB resident, 12 frames used during the run.
 Item 2 (a Rust x86_64-unknown-linux-musl program, 64 MB heap checksum,
-identical output on Linux and Keel) remains.
+identical output on Linux and Keel) is `acceptance.rust_std_heap64`:
+`user/std-tests/heap64`, built with the real standard library for the
+musl target (static PIE, linked by `rust-lld` with the target's bundled
+musl start files, so no C toolchain is needed and it builds on Windows),
+runs under Linux (`host.heap64`) and under Keel, and both must print
+`heap64: 67108864 bytes in 16384 pages, checksum 0x7f282b735ac8d3f2`
+(checked against that fixed line in both places). Its startup needed
+`poll`, `rt_sigaction`, `rt_sigprocmask` and `sigaltstack`, now
+implemented (state only for the signal calls; ADR 0008) and covered by
+`user/tests/syscalls` on both systems. All four Phase 1 acceptance items
+are now covered; the phase stays open for the temporary test syscall's
+removal and the remaining checks.
 
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel
