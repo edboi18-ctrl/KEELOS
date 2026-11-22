@@ -387,6 +387,7 @@ fn phase1(t: &mut Runner) {
     phase1_exec(t);
     phase1_mitigations(t);
     phase1_robustness(t);
+    phase1_resource_limits(t);
     phase1_fuzz_smoke(t);
 
     // Phase 1 acceptance marker, printed only when every test above
@@ -1473,6 +1474,99 @@ pub fn phase1_robustness(t: &mut Runner) {
         "a 128 MiB getrandom takes the generator's lock once, not per chunk (F-0010)",
     );
     kprintln!("  generator draws while longcall ran: {draws}");
+}
+
+/// Runs `/test/<name>` with `args` and waits for it.
+fn run_test_program(path: &[u8], args: &[&[u8]]) -> Option<(i64, Option<sched::UserFault>)> {
+    let file = keel_linux_abi::fs::read_file(path).ok()?;
+    let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
+    let spawned = keel_linux_abi::process::spawn("limits", &loaded).ok()?;
+    join(spawned.thread);
+    sched::exit_status(spawned.thread)
+}
+
+/// F-0011 (audit 2, A1 and A2): a user program cannot make the kernel run
+/// out of memory. Mapping, creating files and calling into the kernel all
+/// end in ENOMEM or ENOSPC while the kernel keeps running.
+pub fn phase1_resource_limits(t: &mut Runner) {
+    // The audit's proof of concept: single PROT_NONE pages at spaced hints.
+    const MAPLIMIT: &[u8] = b"/test/maplimit";
+    let hint = run_test_program(MAPLIMIT, &[MAPLIMIT, b"hint"]);
+    t.check(
+        "limits.map_count",
+        hint == Some((0, None)),
+        "mapping single pages in a loop ends in ENOMEM at the 65530-mapping cap; the kernel keeps running (F-0011)",
+    );
+
+    // mmap(NULL) to the cap, with a kernel thread counting 5 ms sleeps
+    // meanwhile: placing each mapping must not stall the kernel (A2).
+    static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    STOP.store(false, Ordering::Relaxed);
+    let ticker = sched::spawn("ticker", || {
+        while !STOP.load(Ordering::Relaxed) {
+            sched::sleep_ms(5);
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let ticks_before = TICKS.load(Ordering::Relaxed);
+    let begin = time::monotonic_nanos();
+    let null = run_test_program(MAPLIMIT, &[MAPLIMIT, b"null"]);
+    let elapsed_ms = (time::monotonic_nanos() - begin) / 1_000_000;
+    let ticks = TICKS.load(Ordering::Relaxed) - ticks_before;
+    STOP.store(true, Ordering::Relaxed);
+    if let Ok(id) = ticker {
+        join(id);
+    }
+    t.check(
+        "limits.map_null_preemptible",
+        null == Some((0, None)) && ticks >= (elapsed_ms / 50).max(1),
+        "mmap(NULL) up to the cap ends in ENOMEM, and a kernel thread keeps running throughout (A2)",
+    );
+    kprintln!("  maplimit null: {elapsed_ms} ms, ticker ran {ticks} times, exit {null:?}");
+
+    // Creating files until the node cap. The cap is lowered to 200 more
+    // nodes than exist, so the run is short and later tests still have room.
+    let room = 200;
+    let old_limit = keel_linux_abi::fs::with(|fs| {
+        let nodes = fs.usage().1;
+        Ok(fs.set_node_limit(nodes + room))
+    });
+    let flood = run_test_program(b"/test/fileflood", &[b"/test/fileflood"]);
+    let nodes_after = keel_linux_abi::fs::usage().1;
+    if let Ok(old) = old_limit {
+        let _ = keel_linux_abi::fs::with(|fs| Ok(fs.set_node_limit(old)));
+    }
+    t.check(
+        "limits.tmpfs_nodes",
+        old_limit.is_ok() && flood == Some((0, None)),
+        "creating files in a loop ends in ENOSPC at the node cap; the kernel keeps running (F-0011)",
+    );
+    kprintln!("  fileflood: exit {flood:?}, {nodes_after} nodes");
+
+    // With only the kernel's reserve free, calls that would make the kernel
+    // allocate are refused with ENOMEM. The program is loaded first, then
+    // the reserve is raised while it loops.
+    const RESERVECALL: &[u8] = b"/test/reservecall";
+    let refused_before = keel_linux_abi::syscall::reserve_refusals();
+    let reserve = keel_linux_abi::fs::read_file(RESERVECALL)
+        .ok()
+        .and_then(|file| {
+            let loaded =
+                keel_linux_abi::exec::load(&file, RESERVECALL, &[RESERVECALL], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("reservecall", &loaded).ok()?;
+            sched::sleep_ms(20);
+            let old = memory::set_user_reserve(memory::free_frames() + 16);
+            join(spawned.thread);
+            memory::set_user_reserve(old);
+            sched::exit_status(spawned.thread)
+        });
+    let refused = keel_linux_abi::syscall::reserve_refusals() - refused_before;
+    t.check(
+        "limits.reserve_admission",
+        reserve == Some((0, None)) && refused > 0,
+        "with only the kernel's reserve free, system calls are refused with ENOMEM instead of taking it (F-0011)",
+    );
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200

@@ -140,7 +140,7 @@ Hardening notes for later Phase 1 work:
   `sr27.tamper.initramfs` and `sr27.tamper.config` (Limine refuses a
   one-byte change to each; the config's hash is enrolled in
   `BOOTX64.EFI`).
-- `cargo xtask test --phase 1`: 87 in-kernel tests pass and `KEEL P1 OK`
+- `cargo xtask test --phase 1`: 91 in-kernel tests pass and `KEEL P1 OK`
   is on serial; the six fault scenarios (`double_fault`,
   `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`,
   `fault_in_panic`) pass; the
@@ -149,8 +149,8 @@ Hardening notes for later Phase 1 work:
   fail when the marker is not printed.
 - `cargo xtask fuzz --minutes 60 --seed 20261122`: passes (see security
   acceptance item 6 above).
-- `cargo test`: 160 host unit tests pass (96 `keel-core`, 29 `keel-hal`,
-  5 `keel-linux-abi`, 30 `xtask`).
+- `cargo test`: 181 host tests pass (106 `keel-core`, 29 `keel-hal`,
+  5 `keel-linux-abi`, 37 `xtask`, and 4 `keel-hal` doctests).
 - `cargo xtask audit`: passes, including RustSec advisories.
 - `cargo xtask dist` + `cargo xtask boot-check`: the GPT/FAT32 image
   boots under OVMF.

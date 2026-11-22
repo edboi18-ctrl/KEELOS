@@ -24,6 +24,15 @@ pub const USER_START: u64 = 0x1_0000;
 /// the non-canonical boundary (SDM Vol. 1 section 3.3.7.1).
 pub const USER_END: u64 = 0x0000_7FFF_FFFF_F000;
 
+/// Most VMAs one address space may have. Each is kernel memory a program
+/// can make the kernel allocate, so without a cap a loop of `mmap` calls
+/// exhausts the kernel heap (F-0011). Linux's default, v6.12
+/// `include/linux/mm.h`: `DEFAULT_MAX_MAP_COUNT` = `USHRT_MAX` - 5;
+/// `Documentation/admin-guide/sysctl/vm.rst`: "The default value is
+/// 65530." Beyond it, mmap, munmap and mprotect fail with ENOMEM, as on
+/// Linux.
+pub const MAX_MAP_COUNT: usize = 65530;
+
 /// Access rights of a mapping.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Prot {
@@ -81,13 +90,32 @@ pub enum Placement {
 pub type Changed = Vec<(u64, u64)>;
 
 /// The VMAs of one address space, keyed by start address. VMAs never
-/// overlap and never have zero length.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// overlap and never have zero length; adjacent VMAs with the same rights
+/// are merged, so the count reflects real boundaries.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     vmas: BTreeMap<u64, Vma>,
     /// Where the top-down search for mmap(NULL, ...) starts (the mmap
     /// base); randomized per process (SR-16). 0 means USER_END.
     mmap_top: u64,
+    /// Where the last top-down placement ended: the next search starts
+    /// here, so filling the space downward does not walk every VMA each
+    /// time (audit 2, A2). 0 means "from the top". Only a starting point:
+    /// if nothing fits below it, the whole range is searched.
+    search_from: u64,
+    /// Cap on the number of VMAs (`MAX_MAP_COUNT`; lower in tests).
+    map_limit: usize,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Layout {
+            vmas: BTreeMap::new(),
+            mmap_top: 0,
+            search_from: 0,
+            map_limit: MAX_MAP_COUNT,
+        }
+    }
 }
 
 fn check_range(start: u64, length: u64) -> Result<u64, VmError> {
@@ -117,6 +145,68 @@ impl Layout {
         }
         self.mmap_top = top;
         Ok(())
+    }
+
+    /// Sets the cap on the number of VMAs (tests use a small one).
+    pub fn set_map_limit(&mut self, limit: usize) {
+        self.map_limit = limit;
+    }
+
+    /// Number of VMAs.
+    pub fn count(&self) -> usize {
+        self.vmas.len()
+    }
+
+    /// How many existing VMAs `[start, end)` would cut in two: one for each
+    /// end that falls strictly inside a VMA. Each cut adds a VMA.
+    fn cuts(&self, start: u64, end: u64) -> usize {
+        let inside = |at: u64| self.find(at).is_some_and(|v| v.start < at);
+        usize::from(inside(start)) + usize::from(inside(end))
+    }
+
+    /// Fails with ENOMEM unless `extra` more VMAs fit under the cap. Checked
+    /// before any change, so a refused call leaves the layout as it was.
+    fn ensure_room(&self, extra: usize) -> Result<(), VmError> {
+        if self.vmas.len().saturating_add(extra) > self.map_limit {
+            Err(VmError::NoMemory)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Merges runs of adjacent VMAs with equal rights, from the VMA at or
+    /// before `from` up to the one starting at `to`. Allocates nothing.
+    fn coalesce(&mut self, from: u64, to: u64) {
+        let Some(mut key) = self
+            .vmas
+            .range(..from)
+            .next_back()
+            .or_else(|| self.vmas.range(from..).next())
+            .map(|(&start, _)| start)
+        else {
+            return;
+        };
+        loop {
+            let current = self.vmas[&key];
+            let Some(next) = self.vmas.range(current.end..).next().map(|(_, v)| *v) else {
+                return;
+            };
+            if next.start > to {
+                return;
+            }
+            if next.start == current.end && next.prot == current.prot {
+                self.vmas.remove(&next.start);
+                self.vmas.insert(
+                    key,
+                    Vma {
+                        end: next.end,
+                        ..current
+                    },
+                );
+            } else {
+                key = next.start;
+            }
+        }
     }
 
     /// The VMA containing `address`.
@@ -172,6 +262,8 @@ impl Layout {
         let (start, replaced) = match placement {
             Placement::Fixed(start) => {
                 let end = check_range(start, length)?;
+                // The new VMA, plus any VMA the replacement cuts in two.
+                self.ensure_room(1 + self.cuts(start, end))?;
                 (start, self.unmap(start, end - start)?)
             }
             Placement::FixedNoReplace(start) => {
@@ -179,6 +271,7 @@ impl Layout {
                 if self.overlaps(start, end) {
                     return Err(VmError::Exists);
                 }
+                self.ensure_room(1)?;
                 (start, Vec::new())
             }
             Placement::Anywhere { hint } => {
@@ -190,13 +283,23 @@ impl Layout {
                 } else {
                     self.mmap_top
                 };
+                self.ensure_room(1)?;
                 let start = if hint_free {
                     hint
                 } else {
-                    // Below the mmap base first; anywhere if that is full.
-                    self.find_gap(length, top)
+                    // Below the last placement first (A2), then below the
+                    // mmap base, then anywhere.
+                    let from = match self.search_from {
+                        0 => top,
+                        cached => cached.min(top),
+                    };
+                    let start = self
+                        .find_gap(length, from)
+                        .or_else(|| self.find_gap(length, top))
                         .or_else(|| self.find_gap(length, USER_END))
-                        .ok_or(VmError::NoMemory)?
+                        .ok_or(VmError::NoMemory)?;
+                    self.search_from = start;
+                    start
                 };
                 (start, Vec::new())
             }
@@ -209,6 +312,7 @@ impl Layout {
                 prot,
             },
         );
+        self.coalesce(start, start + length);
         Ok((start, replaced))
     }
 
@@ -226,6 +330,15 @@ impl Layout {
     /// munmap). Returns the ranges that were mapped.
     pub fn unmap(&mut self, start: u64, length: u64) -> Result<Changed, VmError> {
         let end = check_range(start, length)?;
+        // Cutting a hole out of the middle of one VMA leaves two.
+        let middle = self
+            .find(start)
+            .is_some_and(|v| v.start < start && end < v.end);
+        self.ensure_room(usize::from(middle))?;
+        // Freed space above the cached search start is used again.
+        if self.search_from != 0 && end > self.search_from {
+            self.search_from = end;
+        }
         self.split_at(start);
         self.split_at(end);
         let starts: Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
@@ -252,6 +365,7 @@ impl Layout {
                 None => return Err(VmError::NoMemory),
             }
         }
+        self.ensure_room(self.cuts(start, end))?;
         self.split_at(start);
         self.split_at(end);
         let mut changed = Vec::new();
@@ -259,6 +373,7 @@ impl Layout {
             vma.prot = prot;
             changed.push((vma.start, vma.end));
         }
+        self.coalesce(start, end);
         Ok(changed)
     }
 }
@@ -348,7 +463,112 @@ mod tests {
             .map(Placement::Anywhere { hint: 0x40_0000 }, PAGE, RW)
             .unwrap();
         assert_eq!(c, 0x40_0000);
-        assert_eq!(l.vmas().count(), 3);
+        // `a` and `b` are adjacent with equal rights: one VMA.
+        assert_eq!(l.vmas().count(), 2);
+        assert_eq!(
+            l.find(b),
+            Some(Vma {
+                start: b,
+                end: a + 3 * PAGE,
+                prot: RW
+            })
+        );
+    }
+
+    #[test]
+    fn the_map_count_is_capped_and_a_refusal_changes_nothing() {
+        let mut l = Layout::new();
+        l.set_map_limit(4);
+        // Alternate rights so adjacent mappings do not merge.
+        for i in 0..4 {
+            let prot = if i % 2 == 0 { RW } else { RO };
+            l.map(Placement::Anywhere { hint: 0 }, PAGE, prot).unwrap();
+        }
+        assert_eq!(l.count(), 4);
+        let before = l.clone();
+        assert_eq!(
+            l.map(Placement::Anywhere { hint: 0 }, PAGE, RW),
+            Err(VmError::NoMemory)
+        );
+        assert_eq!(
+            l.map(Placement::FixedNoReplace(0x40_0000), PAGE, RW),
+            Err(VmError::NoMemory)
+        );
+        assert_eq!(l, before, "a refused call leaves the layout unchanged");
+    }
+
+    #[test]
+    fn splits_count_against_the_cap() {
+        let mut l = Layout::new();
+        l.set_map_limit(1);
+        let (start, _) = l.map(Placement::Fixed(0x40_0000), 4 * PAGE, RW).unwrap();
+        let before = l.clone();
+        // A hole in the middle, or new rights for the middle, would make
+        // more than one VMA.
+        assert_eq!(l.unmap(start + PAGE, PAGE), Err(VmError::NoMemory));
+        assert_eq!(l.protect(start + PAGE, PAGE, RO), Err(VmError::NoMemory));
+        assert_eq!(
+            l.map(Placement::Fixed(start + PAGE), PAGE, RO),
+            Err(VmError::NoMemory)
+        );
+        assert_eq!(l, before);
+        // Trimming an end does not add a VMA, and all of it can go.
+        assert!(l.unmap(start, PAGE).is_ok());
+        assert!(l.protect(start + PAGE, 3 * PAGE, RO).is_ok());
+        assert!(l.unmap(start, 4 * PAGE).is_ok());
+        assert_eq!(l.count(), 0);
+    }
+
+    #[test]
+    fn adjacent_mappings_with_equal_rights_merge() {
+        let mut l = Layout::new();
+        l.map(Placement::Fixed(0x40_0000), PAGE, RW).unwrap();
+        l.map(Placement::Fixed(0x40_2000), PAGE, RW).unwrap();
+        assert_eq!(l.count(), 2);
+        // Filling the gap joins all three.
+        l.map(Placement::Fixed(0x40_1000), PAGE, RW).unwrap();
+        assert_eq!(l.count(), 1);
+        // mprotect of the middle splits; restoring the rights merges again.
+        l.protect(0x40_1000, PAGE, RO).unwrap();
+        assert_eq!(l.count(), 3);
+        l.protect(0x40_1000, PAGE, RW).unwrap();
+        assert_eq!(l.count(), 1);
+        assert_eq!(
+            l.find(0x40_0000),
+            Some(Vma {
+                start: 0x40_0000,
+                end: 0x40_3000,
+                prot: RW
+            })
+        );
+    }
+
+    #[test]
+    fn mmap_null_continues_below_the_last_placement() {
+        let mut l = Layout::new();
+        let mut last = USER_END;
+        for i in 0..100 {
+            let prot = if i % 2 == 0 { RW } else { RO };
+            let (at, _) = l.map(Placement::Anywhere { hint: 0 }, PAGE, prot).unwrap();
+            assert_eq!(at, last - PAGE, "packed downward");
+            last = at;
+        }
+        assert_eq!(l.search_from, last);
+        // Space freed above the cached start is found again.
+        l.unmap(USER_END - PAGE, PAGE).unwrap();
+        let (again, _) = l.map(Placement::Anywhere { hint: 0 }, PAGE, RO).unwrap();
+        assert!(again < USER_END && again >= last - PAGE);
+        // When nothing fits below the cache, the whole range is searched.
+        let mut full = Layout::new();
+        full.map(
+            Placement::Fixed(USER_START),
+            USER_END - USER_START - PAGE,
+            RW,
+        )
+        .unwrap();
+        full.search_from = USER_START;
+        let (top, _) = full.map(Placement::Anywhere { hint: 0 }, PAGE, RO).unwrap();
+        assert_eq!(top, USER_END - PAGE);
     }
 
     #[test]

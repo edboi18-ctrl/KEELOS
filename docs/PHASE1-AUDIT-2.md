@@ -11,7 +11,20 @@ and A3 are the same kind and should go with it. A4 to A8 do not block.
 
 This file is a work list in the same form as `docs/PHASE1-AUDIT.md`.
 
-## Scope and limits
+## Status on the working branch
+
+| # | Status |
+| --- | --- |
+| A1 | Fixed (F-0011, ADR 0011): 65530-mapping cap with merging, 65536-node tmpfs cap, fallible file growth, user page tables from the user pool (a third path found while fixing), and an admission check that refuses calls with ENOMEM once only the kernel's reserve is free. Regression tests `limits.map_count` (the proof of concept below, now ENOMEM after 65526 mappings), `limits.tmpfs_nodes` and `limits.reserve_admission`, each failing with its protection removed. |
+| A2 | Fixed (same change): `mmap(NULL)` searches below its last placement first. `limits.map_null_preemptible` maps to the cap with a kernel thread on schedule; without the search cache it does not finish in 15 s. |
+| A3 | Open |
+| A4 | Open |
+| A5 | Open |
+| A6 | Open |
+| A7 | Item 3 fixed (`duplicate` releases the reference when the map fails). Items 1, 2, 4, 5 open. |
+| A8 | Owner |
+
+
 
 About 22,000 lines were added since the first audit. This pass did not
 read all of them.

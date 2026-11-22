@@ -28,6 +28,11 @@ Common rules for all calls:
 - A partial transfer that then faults returns the bytes done, or EFAULT
   if nothing was done, as on Linux.
 - `int` arguments use their low 32 bits, as on Linux.
+- When only the kernel's frame reserve is free (`memory::user_reserve`),
+  every call except `close`, `munmap`, `brk` and `exit`/`exit_group`
+  returns ENOMEM before doing anything, so no program can make the kernel
+  allocate its last frames (F-0011, ADR 0011). Page tables for user
+  mappings come out of the same user-limited pool as user pages.
 
 Tested by `user/tests/src/bin/syscalls.rs`, which runs under Linux
 (`host.syscalls`) and under Keel (`syscalls.conformance`) and must pass
@@ -46,9 +51,9 @@ addresses.
 | 3 | `close` | Complete | none (the handle is the caller's own) | |
 | 5 | `fstat` | Complete | STAT | x86-64 `struct stat`; uid/gid 0 and reported only (SR-6); times 0 until there is a real-time clock. |
 | 7 | `poll` | Complete for files and the four devices; waiting re-checks every 10 ms | none to look up the handle; readiness reported only for rights it has (READ for POLLIN, WRITE for POLLOUT) | Linux's rules (`fs/select.c`): more than 1024 entries (the handle limit, Linux's RLIMIT_NOFILE) EINVAL; a negative fd is skipped; a closed one gets POLLNVAL; POLLERR and POLLHUP always reported; `revents` written back for every entry (EFAULT if it cannot be). Files, directories, `/dev/null`, `/dev/zero`, `/dev/urandom` are always ready (DEFAULT_POLLMASK); the console is writable and readable once a line or end of file is ready. Differs from Linux on purpose: readiness is not reported for an operation the handle cannot perform (SR-1; ADR 0008). Until a readiness mechanism exists (P3-T10), a poll that must wait sleeps 10 ms between checks; a negative timeout waits without limit. No signal can interrupt it before P3-T6. |
-| 9 | `mmap` | Partial: anonymous private mappings | READ (and MAP_EXEC for PROT_EXEC) on the handle, for file mappings | Writable+executable is EACCES (SR-12). Unknown flags EINVAL (SR-10). MAP_SHARED: EINVAL until fork. File mappings: ENODEV until P3-T7, after the handle check. MAP_FIXED replaces only the caller's own mappings; MAP_FIXED_NOREPLACE supported. Reservations cost no memory (demand paging). |
-| 10 | `mprotect` | Complete for anonymous memory | none (own address space) | W+X refused (SR-12); unknown bits EINVAL. |
-| 11 | `munmap` | Complete | none (own address space) | |
+| 9 | `mmap` | Partial: anonymous private mappings | READ (and MAP_EXEC for PROT_EXEC) on the handle, for file mappings | Writable+executable is EACCES (SR-12). Unknown flags EINVAL (SR-10). MAP_SHARED: EINVAL until fork. File mappings: ENODEV until P3-T7, after the handle check. MAP_FIXED replaces only the caller's own mappings; MAP_FIXED_NOREPLACE supported. Reservations cost no memory (demand paging). At most 65530 mappings per process (Linux's `vm.max_map_count` default); beyond that ENOMEM (F-0011). Adjacent mappings with the same rights are merged, as on Linux. |
+| 10 | `mprotect` | Complete for anonymous memory | none (own address space) | W+X refused (SR-12); unknown bits EINVAL. ENOMEM if splitting a mapping would exceed the 65530-mapping cap, as on Linux. |
+| 11 | `munmap` | Complete | none (own address space) | ENOMEM if cutting a hole would exceed the 65530-mapping cap, as on Linux. |
 | 12 | `brk` | Complete | none (own address space) | Grows only into free space (never over another mapping) and never into the kernel half; a refused request returns the old break, as Linux. Not randomized until P1-S5. |
 | 13 | `rt_sigaction` | Partial: records dispositions; no delivery until P3-T6 | none (own process) | Linux's rules (`kernel/signal.c`): `sigsetsize` other than 8, a signal outside 1..64, and setting SIGKILL or SIGSTOP are EINVAL; flag bits outside UAPI_SA_FLAGS are cleared (as Linux, so SA_UNSUPPORTED reads back clear); SIGKILL and SIGSTOP are removed from the handler mask; the old action is written after the new one is set (EFAULT then, with the change kept). Faults still end the thread with 128 + signal whatever handler is set (ADR 0008). |
 | 14 | `rt_sigprocmask` | Partial: records the blocked mask; nothing is delivered yet | none (own thread) | `sigsetsize` other than 8 EINVAL; SIGKILL and SIGSTOP are never blocked; an unknown `how` is EINVAL only when a set is given, as Linux. |
@@ -60,7 +65,7 @@ addresses.
 | 218 | `set_tid_address` | Partial: stores the address, returns the TID | none | The clear-on-exit write needs futexes and threads (Phase 2 onward). |
 | 228 | `clock_gettime` | MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE, BOOTTIME, REALTIME, REALTIME_COARSE | none | No real-time clock yet: the REALTIME clocks count from boot as if boot were 1970-01-01. CPU-time and other clocks EINVAL. |
 | 231 | `exit_group` | Partial: same as `exit` until processes have several threads | none | |
-| 257 | `openat` | Files, directories and devices in the tmpfs | ENUMERATE on `dirfd` when it is not AT_FDCWD | Lookups never leave the process root (SR-4 groundwork). Flags outside the supported set (O_DSYNC, O_SYNC, O_DIRECT, O_NOATIME, O_PATH, O_TMPFILE and unknown bits) are EINVAL (SR-10; Linux ignores unknown bits). O_CREAT applies umask 022. No permission checks by mode or user ID (SR-6). Rights granted: READ/WRITE by access mode, plus STAT, SEEK, DUPLICATE; ENUMERATE for directories; MAP_EXEC with READ on regular files (Linux compatibility; compartment manifests can withhold it from Phase 3). |
+| 257 | `openat` | Files, directories and devices in the tmpfs | ENUMERATE on `dirfd` when it is not AT_FDCWD | Lookups never leave the process root (SR-4 groundwork). Flags outside the supported set (O_DSYNC, O_SYNC, O_DIRECT, O_NOATIME, O_PATH, O_TMPFILE and unknown bits) are EINVAL (SR-10; Linux ignores unknown bits). O_CREAT applies umask 022; ENOSPC once the tmpfs holds 65536 nodes (F-0011). No permission checks by mode or user ID (SR-6). Rights granted: READ/WRITE by access mode, plus STAT, SEEK, DUPLICATE; ENUMERATE for directories; MAP_EXEC with READ on regular files (Linux compatibility; compartment manifests can withhold it from Phase 3). |
 | 318 | `getrandom` | Complete | none | Unknown flags, and GRND_RANDOM with GRND_INSECURE, are EINVAL, as Linux. Bytes come from the kernel generator (`hal::random`: BLAKE2s pool, ChaCha20 with fast key erasure, seeded from RDSEED/RDRAND and timing, reseeded every 60 s). GRND_NONBLOCK never matters: the generator is seeded before the first process starts. |
 
 Numbers checked against Linux v6.12 `arch/x86/entry/syscalls/syscall_64.tbl`,

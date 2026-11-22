@@ -160,6 +160,29 @@ pub fn handle(call: &SyscallArgs) -> i64 {
     result
 }
 
+/// System calls refused with ENOMEM because only the kernel's reserve
+/// was free.
+static RESERVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// How many system calls have been refused to protect the kernel's
+/// reserve (for tests).
+pub fn reserve_refusals() -> u64 {
+    RESERVE_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Whether a call may run when only the kernel's frame reserve is free.
+/// Almost every call can make the kernel allocate on the caller's behalf
+/// (a mapping, a node, a buffer, a handle), and the kernel's own
+/// allocations cannot fail gracefully, so a call that could take the last
+/// frames is refused first with ENOMEM (F-0011; `memory::user_reserve`,
+/// which already does this for user page faults). Exempt: `close` and
+/// `munmap` free memory, so a program can recover; `brk` never returns an
+/// error (it reports the old break), and its mapping is checked by the
+/// same cap as any other.
+fn may_run_on_reserve(number: u64) -> bool {
+    matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK)
+}
+
 fn dispatch(call: &SyscallArgs) -> i64 {
     let a = call.args;
     let number = call.number;
@@ -176,6 +199,13 @@ fn dispatch(call: &SyscallArgs) -> i64 {
             // array_index_nospec in do_syscall_64).
             let index = keel_hal::arch::x86_64::cpu::index_nospec(number, TABLE_SIZE) as usize;
             match (TABLE[index], process::current()) {
+                (Some(_), Some(_))
+                    if !may_run_on_reserve(number)
+                        && keel_hal::memory::free_frames() <= keel_hal::memory::user_reserve() =>
+                {
+                    RESERVE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    Err(Errno::ENOMEM)
+                }
                 (Some(handler), Some(p)) => handler(&p, &a),
                 // Threads without a process (kernel self-test programs) get
                 // only exit; everything else is ENOSYS.

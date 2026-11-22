@@ -105,6 +105,13 @@ pub struct Stat {
     pub rdev: (u32, u32),
 }
 
+/// Most nodes one filesystem may hold. Each node is kernel memory (the
+/// node, its name of at most `NAME_MAX` bytes, its directory entry), so
+/// without a cap `openat(O_CREAT)` in a loop exhausts the kernel heap
+/// (F-0011). 65536 nodes with the longest names is a few tens of MiB.
+/// Per compartment from Phase 3 (SR-8).
+pub const NODE_LIMIT: usize = 65536;
+
 /// The filesystem.
 pub struct Fs {
     nodes: Vec<Option<Node>>,
@@ -112,6 +119,29 @@ pub struct Fs {
     /// compartment from Phase 3).
     bytes_used: usize,
     byte_limit: usize,
+    /// Cap on `nodes` (`NODE_LIMIT`; lower in tests).
+    node_limit: usize,
+}
+
+/// Makes `file` uniquely owned and at least `len` bytes long, failing
+/// instead of aborting if memory runs out: copying a file that a reader
+/// still holds (`Fs::contents`) and growing it are both allocations a
+/// program controls the size of (F-0011).
+fn grow_file(file: &mut Arc<Vec<u8>>, len: usize) -> Result<&mut Vec<u8>, Errno> {
+    if Arc::get_mut(file).is_none() {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(file.len().max(len))
+            .map_err(|_| Errno::ENOMEM)?;
+        copy.extend_from_slice(file);
+        *file = Arc::new(copy);
+    }
+    let data = Arc::get_mut(file).ok_or(Errno::ENOMEM)?;
+    if data.len() < len {
+        data.try_reserve(len - data.len())
+            .map_err(|_| Errno::ENOMEM)?;
+        data.resize(len, 0);
+    }
+    Ok(data)
 }
 
 /// Splits a path into components, checking the length limits.
@@ -143,7 +173,14 @@ impl Fs {
             })],
             bytes_used: 0,
             byte_limit,
+            node_limit: NODE_LIMIT,
         }
+    }
+
+    /// Sets the cap on the number of nodes (tests use a small one) and
+    /// returns the previous cap.
+    pub fn set_node_limit(&mut self, limit: usize) -> usize {
+        core::mem::replace(&mut self.node_limit, limit)
     }
 
     /// Bytes of file data held, and the number of nodes ever created.
@@ -257,6 +294,9 @@ impl Fs {
         if name == b"." || name == b".." {
             return Err(Errno::EEXIST);
         }
+        if self.nodes.len() >= self.node_limit {
+            return Err(Errno::ENOSPC);
+        }
         let ino = Ino::try_from(self.nodes.len()).map_err(|_| Errno::ENOSPC)?;
         let Contents::Directory(entries) = &mut self.node_mut(dir)?.contents else {
             return Err(Errno::ENOTDIR);
@@ -358,10 +398,7 @@ impl Fs {
         {
             return Err(Errno::ENOSPC);
         }
-        let file = Arc::make_mut(file);
-        if file.len() < end {
-            file.resize(end, 0);
-        }
+        let file = grow_file(file, end)?;
         file[start..end].copy_from_slice(data);
         self.bytes_used += growth;
         Ok(data.len())
@@ -378,7 +415,7 @@ impl Fs {
         if len > old && bytes_used + (len - old) > byte_limit {
             return Err(Errno::ENOSPC);
         }
-        Arc::make_mut(file).resize(len, 0);
+        grow_file(file, len)?.truncate(len);
         self.bytes_used = bytes_used - old + len;
         Ok(())
     }
@@ -582,6 +619,34 @@ mod tests {
         fs.write(f, 0, b"KEEL").unwrap();
         assert_eq!(&before[..], b"keel\n");
         assert_eq!(&fs.contents(f).unwrap()[..], b"KEEL\n");
+    }
+
+    #[test]
+    fn node_limit_is_enforced() {
+        let mut fs = Fs::new(1 << 20);
+        fs.set_node_limit(3); // the root and two more
+        assert!(fs.create_file(ROOT, b"a", 0o644).is_ok());
+        assert!(fs.create_dir(ROOT, b"d", 0o755).is_ok());
+        assert_eq!(fs.create_file(ROOT, b"b", 0o644), Err(Errno::ENOSPC));
+        assert_eq!(fs.create_dir(ROOT, b"e", 0o755), Err(Errno::ENOSPC));
+        assert_eq!(fs.usage().1, 3);
+    }
+
+    #[test]
+    fn writing_a_file_a_reader_holds_copies_it() {
+        let mut fs = Fs::new(1 << 20);
+        let ino = fs.create_file(ROOT, b"f", 0o644).unwrap();
+        fs.write(ino, 0, b"abc").unwrap();
+        let snapshot = fs.contents(ino).unwrap();
+        fs.write(ino, 1, b"XYZ").unwrap();
+        assert_eq!(
+            snapshot.as_slice(),
+            b"abc",
+            "the reader's copy is unchanged"
+        );
+        assert_eq!(fs.contents(ino).unwrap().as_slice(), b"aXYZ");
+        fs.set_len(ino, 2).unwrap();
+        assert_eq!(fs.contents(ino).unwrap().as_slice(), b"aX");
     }
 
     #[test]
