@@ -428,6 +428,13 @@ fn test_boot(
     }
     let esp = build::build(BootMode::Test(number, scenario))?;
     let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
+    // Keep every boot's full serial log, so a failure can be examined
+    // afterwards however the console output was filtered.
+    let log_dir = util::workspace_root().join("target").join("test-logs");
+    let log_name = format!("phase{number}-{}.log", scenario.unwrap_or("main"));
+    let mut text = capture.lines.join("\n");
+    text.push('\n');
+    util::write(&log_dir.join(&log_name), text.as_bytes())?;
     // Scenarios end in a deliberate fault, so only the main boot of a
     // complete phase prints the acceptance marker.
     let marker = (phase.complete && scenario.is_none()).then(|| format!("KEEL P{number} OK"));

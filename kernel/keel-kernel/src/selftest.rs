@@ -643,7 +643,7 @@ pub fn phase1_sched(t: &mut Runner) {
         ids.extend(sched::spawn("counter", counting_worker).ok());
     }
     for id in &ids {
-        sched::join(*id);
+        join(*id);
     }
     t.check(
         "sched.round_robin",
@@ -663,7 +663,7 @@ pub fn phase1_sched(t: &mut Runner) {
     sched::sleep_ms(30);
     STOP.store(true, Relaxed);
     if let Ok(id) = spinner {
-        sched::join(id);
+        join(id);
     }
     t.check(
         "sched.preemption",
@@ -687,7 +687,7 @@ pub fn phase1_sched(t: &mut Runner) {
     });
     WAKE.wait_until(|| READY.load(Ordering::Relaxed));
     if let Ok(id) = producer {
-        sched::join(id);
+        join(id);
     }
     t.check(
         "sched.wait_queue",
@@ -698,12 +698,21 @@ pub fn phase1_sched(t: &mut Runner) {
     let a = sched::spawn("xmm-a", || xmm_worker(0x1111_2222_3333_4444));
     let b = sched::spawn("xmm-b", || xmm_worker(0x5555_6666_7777_8888));
     for id in [a, b].into_iter().flatten() {
-        sched::join(id);
+        join(id);
     }
     t.check(
         "sched.fpu_isolation",
         XMM_OK.load(Relaxed) == 2,
         "two threads kept their own XMM0 across 200 switches each",
+    );
+
+    // The bounded wait the self-tests use: it gives up on a thread that
+    // is still running, and succeeds once it has finished.
+    let sleeper = sched::spawn("sleeper", || sched::sleep_ms(100));
+    t.check(
+        "sched.join_timeout",
+        sleeper.is_ok_and(|id| !sched::join_timeout(id, 10) && sched::join_timeout(id, 2_000)),
+        "a bounded join gives up on a running thread and returns once it exits",
     );
 
     // All those threads have exited; their stacks must be gone again.
@@ -965,7 +974,7 @@ pub fn phase1_exec(t: &mut Runner) {
     let run = |argv: &[&[u8]]| {
         let loaded = exec::load(file, PATH, argv, &[b"KEEL_TEST=1"]).ok()?;
         let spawned = keel_linux_abi::process::spawn("startup", &loaded).ok()?;
-        sched::join(spawned.thread);
+        join(spawned.thread);
         Some((sched::exit_status(spawned.thread)?, loaded))
     };
     let passed = run(&[PATH, b"alpha"]);
@@ -1009,7 +1018,7 @@ pub fn phase1_exec(t: &mut Runner) {
         .and_then(|file| {
             let loaded = exec::load(&file, b"/test/syscalls", &[b"/test/syscalls"], &[]).ok()?;
             let spawned = keel_linux_abi::process::spawn("syscalls", &loaded).ok()?;
-            sched::join(spawned.thread);
+            join(spawned.thread);
             sched::exit_status(spawned.thread)
         });
     t.check(
@@ -1038,7 +1047,7 @@ pub fn phase1_exec(t: &mut Runner) {
                 0x25, 0xa5, 0x12, 0x92, 0x12, 0x92, 0x26, 0xa6, 0x1c, 0x9c, 0x1d, 0x20, 0xa0, 0x9d,
             ];
             let typed = keel_linux_abi::tty::type_scancodes(&keys).is_ok();
-            sched::join(spawned.thread);
+            join(spawned.thread);
             Some((was_waiting, typed, sched::exit_status(spawned.thread)?))
         });
     t.check(
@@ -1262,7 +1271,7 @@ pub fn phase1_mitigations(t: &mut Runner) {
         let loaded =
             keel_linux_abi::exec::load(&file, path, &[path, b"alpha"], &[b"KEEL_TEST=1"]).ok()?;
         let spawned = keel_linux_abi::process::spawn("verw", &loaded).ok()?;
-        sched::join(spawned.thread);
+        join(spawned.thread);
         sched::exit_status(spawned.thread)
     });
     entry::set_mitigations(before.0, before.1, before.2, before.3);
@@ -1291,7 +1300,7 @@ pub fn phase1_mitigations(t: &mut Runner) {
                 let argv: &[&[u8]] = &[path, b"/syscalls-test-file-ibrs"];
                 let loaded = keel_linux_abi::exec::load(&file, path, argv, &[]).ok()?;
                 let spawned = keel_linux_abi::process::spawn("ibrs", &loaded).ok()?;
-                sched::join(spawned.thread);
+                join(spawned.thread);
                 sched::exit_status(spawned.thread)
             });
         entry::set_mitigations(before.0, before.1, before.2, before.3);
@@ -1307,6 +1316,19 @@ pub fn phase1_mitigations(t: &mut Runner) {
             "skipped: this CPU refuses IA32_SPEC_CTRL/IA32_PRED_CMD writes, so the paths cannot run here"
         },
     );
+}
+
+/// Waits for a test thread, at most 15 s. A thread that hangs is named on
+/// the console and the check waiting on it fails, instead of the whole
+/// run timing out with no clue where.
+fn join(id: sched::ThreadId) {
+    if !sched::join_timeout(id, 15_000) {
+        kprintln!(
+            "selftest: thread {} ({}) did not finish within 15 s",
+            id.0,
+            sched::thread_name(id).unwrap_or("?")
+        );
+    }
 }
 
 /// Loads a test program into a fresh address space and runs it as a user
@@ -1359,7 +1381,7 @@ fn run_user_program_with(
         )
         .ok()?;
     let id = sched::spawn_user("user-test", space.clone(), CODE, STACK_TOP, argument).ok()?;
-    sched::join(id);
+    join(id);
     let (status, fault) = sched::exit_status(id)?;
     Some((status, fault, space))
 }

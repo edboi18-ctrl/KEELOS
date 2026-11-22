@@ -420,6 +420,26 @@ pub fn join(id: ThreadId) {
     });
 }
 
+/// Waits until thread `id` has exited, for at most `ms` milliseconds.
+/// Returns whether it exited.
+pub fn join_timeout(id: ThreadId, ms: u64) -> bool {
+    let done = || {
+        SCHED.lock().as_ref().is_none_or(|s| {
+            s.threads
+                .get(&id.0)
+                .is_none_or(|t| t.state == State::Exited)
+        })
+    };
+    let deadline = crate::time::monotonic_nanos().saturating_add(ms * 1_000_000);
+    while !done() {
+        if crate::time::monotonic_nanos() >= deadline {
+            return false;
+        }
+        sleep_ms(1);
+    }
+    true
+}
+
 /// Moves the current thread to `next_state` and switches to the next
 /// runnable thread.
 fn schedule(next_state: State) {
