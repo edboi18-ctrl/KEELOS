@@ -174,6 +174,43 @@ halting.`:
   0x3F8. That shows the UART exists in the chipset or Super I/O; it does
   not show a serial connector is fitted on the back panel.
 
+## Second boot on the target machine (2026-11-22, release v0.1.0)
+
+The owner verified `keel-0.1.0-esp.zip` with `cargo xtask verify`
+(checksum, and an attestation from `release.yml` at `refs/tags/v0.1.0`),
+unzipped it onto a FAT32 USB stick, and booted the OptiPlex 3060 (Secure
+Boot off). Every line through `Keel: nothing more to run yet; halting.`
+appeared. Read from a photo of the screen:
+
+- Limine accepted the enrolled `limine.conf` (ADR 0010) and the hashed
+  kernel and initramfs. The kernel base and HHDM offset are hidden
+  (audit finding 8).
+- Memory: 39 regions, 7676 MiB usable; 1,964,018 frames free (7671 MiB).
+- Paging: NX, WP, SMEP and SMAP on; UMIP unsupported (CPUID does not
+  report it on this CPU).
+- CPU: Intel family 6, model 0x9E, stepping 0xA. `IA32_ARCH_CAPABILITIES`
+  is 0, and 6 CPUs are listed in the MADT (Keel uses one).
+- Time: HPET period 41,666,667 fs (24 MHz), APIC timer 1502 kHz, and TSC
+  3005 MHz, **invariant**. This is the first real-hardware run of the TSC
+  clock path (QEMU TCG has no invariant TSC).
+- Random: seeded from RDSEED, RDRAND and TSC jitter.
+- Keyboard: the i8042 controller answered its self-test. Whether the
+  firmware delivers USB keystrokes through it was not tested.
+- Mitigations in use: page-table isolation, legacy IBRS on every kernel
+  entry, IBPB between address spaces, RSB filling, SSBD, and L1TF-safe
+  page tables.
+- **Reported VULNERABLE: MDS, TAA, MMIO stale data, SRBDS and GDS.** In
+  every case the reason given is missing microcode support (no MD_CLEAR,
+  FB_CLEAR, SRBDS or GDS controls), not a missing Keel mitigation: Keel
+  already issues VERW. The firmware's microcode on this machine is older
+  than those fixes. The remedies are a newer firmware (BIOS) from the
+  vendor, or Keel loading microcode early (P6-S8), which the GDS line
+  names.
+- Known issue: the banner says `Keel 0.0.0 booting`. The kernel prints
+  its crate version (`CARGO_PKG_VERSION`), and `cargo xtask dist
+  --version` only names the files, so a release kernel does not know its
+  own version.
+
 ## `unsafe` budget
 
 From `cargo xtask audit` (our code only; includes test code):
