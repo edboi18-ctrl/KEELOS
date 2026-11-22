@@ -976,14 +976,14 @@ pub fn phase1_exec(t: &mut Runner) {
     );
     if let Some((_, loaded)) = &passed {
         // A CPU with a working RDRAND must not fall back to the weak mix.
-        let hardware = keel_hal::random::rdrand_usable();
+        let hardware = keel_hal::random::rdrand_usable() || keel_hal::random::has_rdseed();
         t.check(
             "exec.random_source",
             (loaded.random == keel_hal::random::Quality::Hardware) == hardware,
             if hardware {
-                "AT_RANDOM comes from RDRAND"
+                "AT_RANDOM comes from the generator seeded by RDSEED/RDRAND"
             } else {
-                "no usable RDRAND: AT_RANDOM uses the weak interim source (P1-S5)"
+                "no usable RDSEED/RDRAND: the generator is seeded from timing only"
             },
         );
         // SR-12, SR-14 for a real program: the only kernel pages are the
@@ -1052,6 +1052,30 @@ pub fn phase1_exec(t: &mut Runner) {
         keel_linux_abi::process::count() == 0,
         "every process is gone once its thread has exited",
     );
+
+    // P1-S5 (SR-16): two loads of the same program get different stack
+    // tops, mmap bases and program breaks, all inside Linux's ranges.
+    let a = exec::load(file, PATH, &[PATH], &[]).ok();
+    let b = exec::load(file, PATH, &[PATH], &[]).ok();
+    let aslr = a.as_ref().zip(b.as_ref()).is_some_and(|(a, b)| {
+        let in_range = |l: &exec::Loaded| {
+            l.stack_top <= exec::STACK_TOP
+                && exec::STACK_TOP - l.stack_top < exec::STACK_RANDOM_PAGES * 4096
+                && l.stack_top.is_multiple_of(4096)
+                && l.mmap_top < l.stack_top
+        };
+        in_range(a)
+            && in_range(b)
+            && a.stack_top != b.stack_top
+            && a.mmap_top != b.mmap_top
+            && a.brk_start != b.brk_start
+    });
+    t.check(
+        "aslr.layout_varies",
+        aslr,
+        "two loads of a program get different stack tops, mmap bases and program breaks (SR-16)",
+    );
+    drop((a, b));
 
     // Malformed files are refused before anything runs.
     let mut writable_code = file.to_vec();

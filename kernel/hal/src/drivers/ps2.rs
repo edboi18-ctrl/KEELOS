@@ -114,6 +114,7 @@ fn flush() {
 }
 
 fn on_interrupt() {
+    crate::random::add_interrupt_timing();
     let callback = CALLBACK.load(Ordering::Acquire);
     for _ in 0..DRAIN_MAX {
         let s = status();

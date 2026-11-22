@@ -24,6 +24,7 @@ pub mod interrupts;
 pub mod memory;
 #[cfg(target_os = "none")]
 pub mod mitigations;
+#[cfg(target_os = "none")]
 pub mod random;
 #[cfg(target_os = "none")]
 pub mod sched;

@@ -123,6 +123,25 @@ extern "C" fn kmain() -> ! {
         ),
         Err(error) => panic!("timer setup failed: {error:?}"),
     }
+    // Random numbers (P1-S5, SR-16): BLAKE2s pool, ChaCha20 output.
+    match keel_hal::random::init() {
+        keel_hal::random::Quality::Hardware => kprintln!(
+            "random: seeded from {}{}TSC jitter; ChaCha20 generator, reseeded every 60 s",
+            if keel_hal::random::has_rdseed() {
+                "RDSEED, "
+            } else {
+                ""
+            },
+            if keel_hal::random::rdrand_usable() {
+                "RDRAND, "
+            } else {
+                ""
+            },
+        ),
+        keel_hal::random::Quality::Weak => kprintln!(
+            "random: WARNING: no usable RDSEED/RDRAND; seeded from timing only (weak until interrupts add more)"
+        ),
+    }
     if let Err(error) = sched::init() {
         panic!("scheduler setup failed: {error:?}");
     }

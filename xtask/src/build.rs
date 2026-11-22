@@ -163,6 +163,11 @@ pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
     conf.push('\n');
     conf.push_str("/Keel OS\n");
     conf.push_str("    protocol: limine\n");
+    // KASLR (SR-16, P1-S5): the kernel is a relocatable (PIE) executable,
+    // so Limine loads it at a random address at or above
+    // 0xffffffff80000000, and also randomises the HHDM base (Limine
+    // CONFIG.md, "kaslr", "randomise_hhdm_base": on by default with KASLR).
+    conf.push_str("    kaslr: yes\n");
     conf.push_str(&format!(
         "    path: boot():/{KERNEL_PATH}#{}\n",
         util::blake2b_hex(kernel)

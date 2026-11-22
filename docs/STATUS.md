@@ -55,7 +55,8 @@ to `main` with PR #1.
 | P1-S3 | Page-table isolation with a trampoline entry path | Done. Each address space has a kernel view and a user view; the user view's kernel half is one top-level entry mapping only `.text.keel_entry` (RX), `.data.keel_entry` and `.bss.keel_entry` (RW+NX). Every entry switches to the kernel view; every exit to user mode switches back from the trampoline stack. Always on until P1-S4 reads RDCL_NO; no PCIDs yet. Tests: `pti.user_view` (walks the user view: only trampoline pages, no W+X), `pti.kernel_absent` (user reads of kernel text, rodata, data, direct map and heap find no page). Finding F-0001 fixed on the way (`user.ac_cleared_on_entry`). |
 | P1-S1 | Object table with a rights mask from its first version; every syscall handler names the right it requires | Done. `keel-core::handle`: rights from SR-1's list, checked on every lookup, lowest-free descriptor allocation, duplicate only removes rights, per-process limit 1024 (host tests). The process table is a `HandleTable`; there is no other descriptor table. Rights per call in `docs/syscalls.md`. |
 | P1-S4 | Boot-time vulnerability report and mitigation selection; one log line per item | Done (ADR 0007). `keel-core::cpuvuln` assesses 17 items from CPUID, IA32_ARCH_CAPABILITIES and IA32_MCU_OPT_CTRL (host tests for the target with and without current microcode, newer CPUs, hypervisors, unknown models); `hal::mitigations` applies the plan: legacy IBRS on entry/exit (or enhanced IBRS once), SSBD, BHI_DIS_S when needed, IBPB between address spaces, RSB fill on every context switch, VERW before every return to user mode, SRBDS/GDS microcode controls on. Spectre v1: branch-free index masking for syscall numbers and descriptors. L1TF: no not-present entry holds bits (checked in every page-table walk). The boot log has one `vuln:` line per item; `cargo xtask test` prints them. Found and fixed on the way: F-0002. Where the mitigations run: QEMU's emulator advertises none of the speculation-control features but accepts the MSR writes, so `vuln.ibrs_entry_path` forces the IBRS entry/exit and IBPB paths on there and runs the whole syscall conformance program through them; CI's KVM guest (an Ice Lake server CPU inside GitHub's own virtual machine) hides IBRS/IBPB/SSBD entirely but raises #GP for missing MSRs, which proves the fault path (`cpu.msr_safe`). The CPU's actual speculation behaviour under these mitigations can only be confirmed on the OptiPlex (P6-S6). Not implemented: software BHB clearing and ITS mitigations (neither applies to the target). |
-| P1-S5 to P1-S7 | | Not started |
+| P1-S5 | Kernel and user address-space randomization; entropy source | Done. Entropy: `keel-core::crypto` (ChaCha20, RFC 8439; BLAKE2s, RFC 7693; checked against the RFCs' vectors including the RFC 7693 self-test) and `keel-core::rng` (BLAKE2s pool, ChaCha20 fast key erasure, as Linux's random.c); `hal::random` seeds it at boot from RDSEED, RDRAND (after its self-test) and TSC jitter, adds timer and keyboard interrupt timing, reseeds every 60 s, never runs unseeded, and reports whether a hardware source contributed. AT_RANDOM, getrandom and /dev/urandom use it. KASLR: Limine `kaslr: yes` (the kernel is a PIE), which also randomises the HHDM base; `cargo xtask test` checks that the boots of a phase land at different addresses. User ASLR with Linux's ranges: stack top (22 bits of pages), mmap base and PIE load bias (28 bits), program break (1 GiB). Found on the way: F-0003. |
+| P1-S6, P1-S7 | | Not started |
 
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel
@@ -112,7 +113,7 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 127 | 381 | 39 | 16 |
+| `kernel/hal` | 128 | 390 | 39 | 16 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 | `user/keel-rt` | 18 | 86 | 5 | 1 |
 
@@ -138,7 +139,8 @@ two page-table views; then P1-T11: RDRAND in `hal::random`. then P1-T13: the
 FS/GS base MSR writes in `hal::sched`; then P1-T14: the i8042 port accesses
 and the keyboard callback conversion in `hal::drivers::ps2`; then P1-S4: rdmsr_safe and
 wrmsr_safe, the mitigation MSR writes, IBPB, the cmp/sbb index mask,
-and the mitigation block in the trampoline data (one `link_section`). `user/keel-rt` is
+and the mitigation block in the trampoline data (one `link_section`).
+Then P1-S5: RDSEED. `user/keel-rt` is
 the user-space runtime (ADR 0006), plus `syscall6`, the internal wrappers
 of the safe `sys` module, and one FS-relative read for the FS-base test: `_start`, the initial-stack reader and
 the `syscall` wrapper. The single kernel item outside `hal` is `#[unsafe(no_mangle)]` on the kernel

@@ -420,7 +420,7 @@ fn test_boot(
     scenario: Option<&'static str>,
     options: &RunOptions,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let number = phase.number;
     match scenario {
         None => println!("xtask: ---- phase {number} ----"),
@@ -450,7 +450,17 @@ fn test_boot(
             {
                 println!("  {line}");
             }
-            Ok(())
+            // Where this boot put the kernel and the direct map (KASLR).
+            let layout = capture
+                .lines
+                .iter()
+                .filter(|l| {
+                    l.starts_with("boot: kernel at virt") || l.starts_with("boot: HHDM offset")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            Ok(Some(layout))
         }
         Err(reason) => {
             print_tail(&capture.lines);
@@ -587,6 +597,30 @@ fn test_user_programs_on_host() -> Result<()> {
     Ok(())
 }
 
+/// SR-16 (P1-S5): across the boots of one phase, the kernel and the
+/// direct map must not sit at the same addresses every time.
+fn check_kaslr(layouts: &[Option<String>]) -> Result<()> {
+    let seen: Vec<&String> = layouts.iter().flatten().filter(|l| !l.is_empty()).collect();
+    let mut distinct = seen.clone();
+    distinct.sort();
+    distinct.dedup();
+    if seen.len() >= 3 && distinct.len() >= 2 {
+        println!(
+            "  TEST kaslr.layout_varies PASS {} boots, {} distinct kernel/HHDM layouts",
+            seen.len(),
+            distinct.len()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "kaslr.layout_varies: {} boots gave {} distinct layouts: {distinct:?}",
+            seen.len(),
+            distinct.len()
+        )
+        .into())
+    }
+}
+
 pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Result<()> {
     let selected: Vec<&Phase> = match phase {
         None => PHASES.iter().collect(),
@@ -604,9 +638,13 @@ pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Resu
         test_user_programs_on_host()?;
     }
     for phase in selected {
-        test_boot(phase, None, options, timeout)?;
+        let mut layouts = Vec::new();
+        layouts.push(test_boot(phase, None, options, timeout)?);
         for &scenario in phase.scenarios {
-            test_boot(phase, Some(scenario), options, timeout)?;
+            layouts.push(test_boot(phase, Some(scenario), options, timeout)?);
+        }
+        if phase.number >= 1 {
+            check_kaslr(&layouts)?;
         }
         if phase.number == 0 {
             test_tampered_boot(options, timeout)?;

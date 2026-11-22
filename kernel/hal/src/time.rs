@@ -80,6 +80,7 @@ pub fn ticks() -> u64 {
 }
 
 fn on_tick() {
+    crate::random::add_interrupt_timing();
     let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     crate::sched::on_tick(tick);
 }

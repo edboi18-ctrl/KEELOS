@@ -51,7 +51,7 @@ half and the last byte of the address space, returns EFAULT.
 | 228 | `clock_gettime` | MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE, BOOTTIME, REALTIME, REALTIME_COARSE | none | No real-time clock yet: the REALTIME clocks count from boot as if boot were 1970-01-01. CPU-time and other clocks EINVAL. |
 | 231 | `exit_group` | Partial: same as `exit` until processes have several threads | none | |
 | 257 | `openat` | Files, directories and devices in the tmpfs | ENUMERATE on `dirfd` when it is not AT_FDCWD | Lookups never leave the process root (SR-4 groundwork). Flags outside the supported set (O_DSYNC, O_SYNC, O_DIRECT, O_NOATIME, O_PATH, O_TMPFILE and unknown bits) are EINVAL (SR-10; Linux ignores unknown bits). O_CREAT applies umask 022. No permission checks by mode or user ID (SR-6). Rights granted: READ/WRITE by access mode, plus STAT, SEEK, DUPLICATE; ENUMERATE for directories; MAP_EXEC with READ on regular files (Linux compatibility; compartment manifests can withhold it from Phase 3). |
-| 318 | `getrandom` | Complete | none | Unknown flags, and GRND_RANDOM with GRND_INSECURE, are EINVAL, as Linux. Bytes come from the interim source until P1-S5 (RDRAND after a self-test, else a weak mix). |
+| 318 | `getrandom` | Complete | none | Unknown flags, and GRND_RANDOM with GRND_INSECURE, are EINVAL, as Linux. Bytes come from the kernel generator (`hal::random`: BLAKE2s pool, ChaCha20 with fast key erasure, seeded from RDSEED/RDRAND and timing, reseeded every 60 s). GRND_NONBLOCK never matters: the generator is seeded before the first process starts. |
 | 0x1000 | `keel_test_add_one` | Temporary, Phase 1 self-tests only: returns `rdi + 1` | none | Touches no memory. Removed before Phase 1 acceptance. |
 
 Numbers checked against Linux v6.12 `arch/x86/entry/syscalls/syscall_64.tbl`,
@@ -71,7 +71,7 @@ gets only the direction it is for.
 | `/dev/console` | 5:1 | Writes go to the kernel console, filtered to text (no control characters or escape sequences). Reads wait for a line from the keyboard (canonical mode, echo; Ctrl+D is end of file). Every process shares the one console until compartments (Phase 3) give each its own. | `fs.dev_nodes`, `fs.devices`, `console.keyboard_line` |
 | `/dev/null` | 1:3 | Reads return end of file; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
 | `/dev/zero` | 1:5 | Reads return zeros; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
-| `/dev/urandom` | 1:9 | Reads return random bytes (interim source until P1-S5); writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
+| `/dev/urandom` | 1:9 | Reads return bytes from the kernel generator (as getrandom); writes are discarded (they are not mixed in, so no process can influence the pool). No authority. | `fs.dev_nodes`, `fs.devices` |
 
 `/dev/mem`, `/dev/kmem` and `/dev/port` do not exist and cannot be
 created: device nodes come only from a fixed list in the kernel (SR-9;

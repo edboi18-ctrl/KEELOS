@@ -137,6 +137,12 @@ impl AddressSpace {
         self.root
     }
 
+    /// Sets where mmap(NULL, ...) starts its top-down search (the
+    /// randomized mmap base, SR-16).
+    pub fn set_mmap_top(&self, top: u64) -> Result<(), AsError> {
+        Ok(self.inner.lock().layout.set_mmap_top(top)?)
+    }
+
     /// Adds a mapping (mmap). No memory is used until pages are touched.
     pub fn map(&self, placement: Placement, length: u64, prot: Prot) -> Result<u64, AsError> {
         let mut inner = self.inner.lock();

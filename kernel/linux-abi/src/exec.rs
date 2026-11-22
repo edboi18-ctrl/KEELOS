@@ -11,15 +11,34 @@ use keel_core::vm::{PAGE, Placement, Prot, USER_END};
 use keel_hal::random::{self, Quality};
 use keel_hal::vm::{AddressSpace, AsError, copy_to_user, with_address_space};
 
-/// Load address of the lowest page of a position-independent (`ET_DYN`)
-/// image until ASLR (P1-S5). Linux's ELF_ET_DYN_BASE on x86-64 is
+/// Lowest load address of a position-independent (`ET_DYN`) image; the
+/// actual one adds a random number of pages (`MMAP_RANDOM_PAGES`). Linux's ELF_ET_DYN_BASE on x86-64 is
 /// `DEFAULT_MAP_WINDOW / 3 * 2` (`arch/x86/include/asm/elf.h`) with
 /// `DEFAULT_MAP_WINDOW = (1 << 47) - 4096` (`page_64_types.h`), which is
 /// 0x5555_5555_4AAA; this is that value rounded down to a page.
 pub const DYN_BASE: u64 = 0x5555_5555_4000;
-/// Top of the initial stack: the highest 16-byte boundary below the last
-/// user page, which stays unmapped.
+/// Highest possible top of the initial stack: below the last user page,
+/// which stays unmapped. The actual top is lower by a random number of
+/// pages (SR-16).
 pub const STACK_TOP: u64 = USER_END - PAGE;
+
+/// Address-space randomization (P1-S5, SR-16), with Linux's ranges:
+/// - stack top: up to STACK_RND_MASK = 0x3fffff pages lower (22 bits,
+///   16 GiB; `arch/x86/include/asm/elf.h`, `randomize_stack_top` in
+///   `mm/util.c`);
+/// - mmap base and position-independent load bias: 28 bits of pages
+///   (1 TiB; `ARCH_MMAP_RND_BITS_MIN` 28 for 64-bit in `arch/x86/Kconfig`,
+///   `arch_rnd` in `arch/x86/mm/mmap.c`, `load_bias += arch_mmap_rnd()` in
+///   `fs/binfmt_elf.c`);
+/// - program break: a random page within 1 GiB above the image
+///   (`arch_randomize_brk`, `arch/x86/kernel/process.c`).
+///
+/// The mmap base sits below the lowest possible stack, with Linux's
+/// minimum gap of 128 MiB (`mmap_base`, `arch/x86/mm/mmap.c`).
+pub const STACK_RANDOM_PAGES: u64 = 1 << 22;
+pub const MMAP_RANDOM_PAGES: u64 = 1 << 28;
+pub const BRK_RANDOM_BYTES: u64 = 1 << 30;
+const MMAP_GAP: u64 = 128 << 20;
 /// Size of the stack reservation (demand-paged; nothing is allocated until
 /// touched), as Linux's default 8 MiB RLIMIT_STACK.
 pub const STACK_SIZE: u64 = 8 << 20;
@@ -63,6 +82,9 @@ pub struct Loaded {
     pub random: Quality,
     /// First page after the image: where the program break starts (brk).
     pub brk_start: u64,
+    /// The randomized stack top and mmap base chosen for this program.
+    pub stack_top: u64,
+    pub mmap_top: u64,
 }
 
 /// Loads `file` into a new address space. On error nothing is left
@@ -71,7 +93,7 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
     let image = elf::parse(file)?;
     let bias = match image.kind {
         Kind::Fixed => 0,
-        Kind::Relocatable => DYN_BASE - image.span().0,
+        Kind::Relocatable => DYN_BASE + random::below(MMAP_RANDOM_PAGES) * PAGE - image.span().0,
     };
     image.check_bias(bias)?;
 
@@ -91,11 +113,15 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
         space.protect(start, length, segment.prot)?;
     }
 
+    let stack_top = STACK_TOP - random::below(STACK_RANDOM_PAGES) * PAGE;
     space.map(
-        Placement::Fixed(STACK_TOP - STACK_SIZE),
+        Placement::Fixed(stack_top - STACK_SIZE),
         STACK_SIZE,
         Prot::READ_WRITE,
     )?;
+    let lowest_stack = STACK_TOP - STACK_RANDOM_PAGES * PAGE - STACK_SIZE;
+    let mmap_top = lowest_stack - MMAP_GAP - random::below(MMAP_RANDOM_PAGES) * PAGE;
+    space.set_mmap_top(mmap_top)?;
     let mut random_bytes = [0u8; 16];
     let quality = random::fill(&mut random_bytes);
     let mut auxv: Vec<(u64, u64)> = Vec::new();
@@ -114,7 +140,7 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
         (stack::AT_SECURE, 0),
     ]);
     let initial =
-        stack::initial_stack(STACK_TOP, ARG_LIMIT, path, argv, envp, &random_bytes, &auxv)?;
+        stack::initial_stack(stack_top, ARG_LIMIT, path, argv, envp, &random_bytes, &auxv)?;
     with_address_space(&space, || copy_to_user(initial.rsp, &initial.bytes))
         .map_err(|_| LoadError::Copy)?;
 
@@ -123,6 +149,8 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
         entry: image.entry + bias,
         rsp: initial.rsp,
         random: quality,
-        brk_start: image.span().1 + bias,
+        brk_start: image.span().1 + bias + random::below(BRK_RANDOM_BYTES / PAGE) * PAGE,
+        stack_top,
+        mmap_top,
     })
 }

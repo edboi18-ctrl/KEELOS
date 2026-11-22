@@ -85,6 +85,9 @@ pub type Changed = Vec<(u64, u64)>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
     vmas: BTreeMap<u64, Vma>,
+    /// Where the top-down search for mmap(NULL, ...) starts (the mmap
+    /// base); randomized per process (SR-16). 0 means USER_END.
+    mmap_top: u64,
 }
 
 fn check_range(start: u64, length: u64) -> Result<u64, VmError> {
@@ -104,6 +107,16 @@ fn check_range(start: u64, length: u64) -> Result<u64, VmError> {
 impl Layout {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the mmap base: mappings without an address are placed below
+    /// it, top-down. Must be page-aligned and in the user range.
+    pub fn set_mmap_top(&mut self, top: u64) -> Result<(), VmError> {
+        if !top.is_multiple_of(PAGE) || !(USER_START..=USER_END).contains(&top) {
+            return Err(VmError::Invalid);
+        }
+        self.mmap_top = top;
+        Ok(())
     }
 
     /// The VMA containing `address`.
@@ -172,10 +185,18 @@ impl Layout {
                 let hint_free = hint.is_multiple_of(PAGE)
                     && check_range(hint, length).is_ok()
                     && !self.overlaps(hint, hint + length);
+                let top = if self.mmap_top == 0 {
+                    USER_END
+                } else {
+                    self.mmap_top
+                };
                 let start = if hint_free {
                     hint
                 } else {
-                    self.find_gap(length, USER_END).ok_or(VmError::NoMemory)?
+                    // Below the mmap base first; anywhere if that is full.
+                    self.find_gap(length, top)
+                        .or_else(|| self.find_gap(length, USER_END))
+                        .ok_or(VmError::NoMemory)?
                 };
                 (start, Vec::new())
             }
@@ -295,6 +316,24 @@ mod tests {
         write: false,
         exec: false,
     };
+
+    #[test]
+    fn mmap_base_is_respected() {
+        let mut l = Layout::new();
+        let rw = Prot::READ_WRITE;
+        l.set_mmap_top(0x5000_0000).unwrap();
+        let (a, _) = l.map(Placement::Anywhere { hint: 0 }, PAGE, rw).unwrap();
+        assert_eq!(a, 0x5000_0000 - PAGE);
+        let (b, _) = l.map(Placement::Anywhere { hint: 0 }, PAGE, rw).unwrap();
+        assert_eq!(b, 0x5000_0000 - 2 * PAGE);
+        // Too big to fit below the base: placed above it instead.
+        let (c, _) = l
+            .map(Placement::Anywhere { hint: 0 }, 0x6000_0000, rw)
+            .unwrap();
+        assert!(c >= 0x5000_0000);
+        assert_eq!(l.set_mmap_top(0x5000_0001), Err(VmError::Invalid));
+        assert_eq!(l.set_mmap_top(USER_END + PAGE), Err(VmError::Invalid));
+    }
 
     #[test]
     fn anywhere_mappings_go_top_down_without_overlap() {

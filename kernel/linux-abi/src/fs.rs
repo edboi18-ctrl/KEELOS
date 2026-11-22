@@ -110,8 +110,7 @@ pub fn device_read(device: Device, buf: &mut [u8]) -> usize {
             buf.len()
         }
         Device::Urandom => {
-            // Interim source (see hal::random); P1-S5 provides the real
-            // generator.
+            // The kernel generator (hal::random: BLAKE2s pool, ChaCha20).
             random::fill(buf);
             buf.len()
         }

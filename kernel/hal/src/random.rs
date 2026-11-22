@@ -1,13 +1,26 @@
-//! Random bytes for AT_RANDOM (P1-T11).
+//! The kernel's random numbers (P1-S5, SR-16): a `keel_core::rng::Rng`
+//! (BLAKE2s pool, ChaCha20 fast-key-erasure output) behind one lock.
 //!
-//! Interim source until the entropy work of P1-S5 (SR-16): RDRAND when the
-//! CPU has it, otherwise a TSC-based mix that is NOT cryptographically
-//! secure and is reported as such. Every caller learns which one it got.
+//! Seeded at boot from RDSEED (CPUID.07H.00H:EBX.RDSEED[18]) and RDRAND
+//! (after a Linux-style self-test), TSC jitter, and the timing of
+//! interrupts collected since boot; reseeded with fresh hardware output
+//! and interrupt timing every 60 seconds, as Linux does
+//! (`CRNG_RESEED_INTERVAL = 60 * HZ`, drivers/char/random.c v6.12).
+//! Never a fixed seed: an unseeded generator produces nothing, and the
+//! first request seeds it.
+//!
+//! Every caller learns the quality: `Hardware` if a CPU random-number
+//! instruction contributed, `Weak` if only timing did (then the output is
+//! unpredictable only as far as timing is, which on an emulator or VM may
+//! be not much). The boot log says which.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+use keel_core::rng::Rng;
 
 use crate::arch::x86_64::cpu;
+use crate::sync::IrqMutex;
 
 /// CPUID.01H:ECX.RDRAND[30] (SDM Vol. 1 section 7.3.17.1).
 const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
@@ -15,13 +28,15 @@ const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
 /// uses 10 (Vol. 1 section 7.3.17.1).
 const RDRAND_RETRIES: u32 = 10;
 
-/// Where random bytes came from.
+/// CPUID.07H.00H:EBX.RDSEED[18] (SDM Vol. 1 section 7.3.17.2).
+const CPUID_7_EBX_RDSEED: u32 = 1 << 18;
+
+/// What seeded the generator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
-    /// The CPU's DRBG (RDRAND).
+    /// RDSEED and/or RDRAND output, plus timing.
     Hardware,
-    /// TSC mixing only: unpredictable to a casual observer, not to an
-    /// attacker. Acceptable for tests until P1-S5.
+    /// Timing only (TSC jitter, interrupt arrival times).
     Weak,
 }
 
@@ -97,34 +112,159 @@ pub fn rdrand_usable() -> bool {
     passed
 }
 
-/// SplitMix64 finaliser (Steele, Lea, Flood, "Fast splittable
-/// pseudorandom number generators", OOPSLA 2014; constants as in Vigna's
-/// reference `splitmix64.c`, prng.di.unimi.it): spreads TSC bits.
-fn mix(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+/// Whether the CPU reports RDSEED.
+pub fn has_rdseed() -> bool {
+    let (max_leaf, ..) = cpu::cpuid(0, 0);
+    max_leaf >= 7 && cpu::cpuid(7, 0).1 & CPUID_7_EBX_RDSEED != 0
 }
 
-/// Fills `buf` and says how good the bytes are.
-pub fn fill(buf: &mut [u8]) -> Quality {
-    let hardware = rdrand_usable();
-    let mut quality = if hardware {
+/// One RDSEED result, retried up to the limit.
+fn rdseed() -> Option<u64> {
+    for _ in 0..RDRAND_RETRIES {
+        let value: u64;
+        let ok: u8;
+        // Assembly reasoning (spec section 1, rule 4)
+        // Entry state: CPUID reported RDSEED (checked by the caller).
+        // Instructions: `rdseed {v}` loads a 64-bit value from the
+        //   enhanced NRBG and sets CF = 1 if it is valid, else zeroes the
+        //   register and clears CF; OF, SF, ZF, AF, PF are cleared (SDM
+        //   Vol. 2B "RDSEED", Operation and Flags Affected). `setc {ok}`
+        //   copies CF. The SDM recommends retrying while CF = 0 (Vol. 1
+        //   section 7.3.17.2); like RDRAND, a bounded number of times.
+        // Exit state: {v} = value, {ok} = 1 if valid. No memory or stack
+        //   use; flags change.
+        // SAFETY: RDSEED is supported and only writes its outputs.
+        unsafe {
+            asm!(
+                "rdseed {v}",
+                "setc {ok}",
+                v = out(reg) value,
+                ok = out(reg_byte) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok == 1 {
+            return Some(value);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Interrupt arrival times since the last reseed, folded into 64 slots
+/// without locks (interrupt handlers call `add_interrupt_timing`).
+static TIMING: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static TIMING_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Records the arrival time of an interrupt. Cheap and lock-free; called
+/// from the timer and keyboard handlers.
+pub fn add_interrupt_timing() {
+    let tsc = cpu::read_tsc();
+    let slot = TIMING_NEXT.fetch_add(1, Ordering::Relaxed);
+    TIMING[slot % 64].fetch_xor(tsc.rotate_left((slot % 64) as u32), Ordering::Relaxed);
+}
+
+/// Reseed interval: 60 s, as Linux.
+const RESEED_INTERVAL_NS: u64 = 60_000_000_000;
+
+struct State {
+    rng: Rng,
+    quality: Quality,
+    last_reseed_ns: u64,
+}
+
+static STATE: IrqMutex<Option<State>> = IrqMutex::new(None);
+
+/// Mixes everything available into `rng`; returns whether a hardware
+/// source contributed.
+fn collect(rng: &mut Rng) -> bool {
+    let mut hardware = false;
+    if has_rdseed() {
+        for _ in 0..16 {
+            if let Some(v) = rdseed() {
+                rng.mix(&v.to_le_bytes());
+                hardware = true;
+            }
+        }
+    }
+    if rdrand_usable() {
+        for _ in 0..16 {
+            if let Some(v) = rdrand() {
+                rng.mix(&v.to_le_bytes());
+                hardware = true;
+            }
+        }
+    }
+    // TSC jitter: the low bits of the time between closely spaced reads.
+    let mut previous = cpu::read_tsc();
+    let mut jitter = [0u8; 256];
+    for byte in jitter.iter_mut() {
+        for _ in 0..8 {
+            core::hint::spin_loop();
+        }
+        let now = cpu::read_tsc();
+        *byte = now.wrapping_sub(previous) as u8;
+        previous = now;
+    }
+    rng.mix(&jitter);
+    for slot in &TIMING {
+        rng.mix(&slot.swap(0, Ordering::Relaxed).to_le_bytes());
+    }
+    rng.mix(&cpu::read_tsc().to_le_bytes());
+    hardware
+}
+
+/// Seeds the generator (call once at boot, after the clock is set up;
+/// a `fill` before that seeds it on first use). Returns the quality.
+pub fn init() -> Quality {
+    let mut guard = STATE.lock();
+    if let Some(state) = guard.as_ref() {
+        return state.quality;
+    }
+    let mut rng = Rng::new();
+    let hardware = collect(&mut rng);
+    rng.reseed();
+    let quality = if hardware {
         Quality::Hardware
     } else {
         Quality::Weak
     };
-    let mut state = cpu::read_tsc();
-    for chunk in buf.chunks_mut(8) {
-        let word = match hardware.then(rdrand).flatten() {
-            Some(word) => word,
-            None => {
-                quality = Quality::Weak;
-                state = mix(state ^ cpu::read_tsc());
-                state
-            }
-        };
-        chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
-    }
+    *guard = Some(State {
+        rng,
+        quality,
+        last_reseed_ns: crate::time::monotonic_nanos(),
+    });
     quality
+}
+
+/// Fills `buf` with random bytes and says how the generator was seeded.
+pub fn fill(buf: &mut [u8]) -> Quality {
+    if STATE.lock().is_none() {
+        init();
+    }
+    let mut guard = STATE.lock();
+    let state = guard.as_mut().expect("seeded by init");
+    let now = crate::time::monotonic_nanos();
+    if now.saturating_sub(state.last_reseed_ns) >= RESEED_INTERVAL_NS {
+        if collect(&mut state.rng) {
+            state.quality = Quality::Hardware;
+        }
+        state.rng.reseed();
+        state.last_reseed_ns = now;
+    }
+    let filled = state.rng.fill(buf);
+    debug_assert!(filled, "the generator is seeded before use");
+    state.quality
+}
+
+/// A uniformly distributed value below `bound`, for address randomization.
+pub fn below(bound: u64) -> u64 {
+    if STATE.lock().is_none() {
+        init();
+    }
+    STATE
+        .lock()
+        .as_mut()
+        .and_then(|s| s.rng.below(bound))
+        .unwrap_or(0)
 }
