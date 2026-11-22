@@ -12,9 +12,10 @@
 //! a dedicated non-executable region and leaves an unmapped page between
 //! large allocations, so running off the end of one faults (SR-17 spirit).
 //!
-//! Rules (docs/locking.md): never allocate from an interrupt handler, and
-//! never hold the heap lock while taking the page-table or frame lock in
-//! the other order.
+//! Rules (docs/locking.md): the heap lock is an `IrqMutex`, so allocating
+//! from an interrupt handler is safe (no interrupt arrives while it is
+//! held); never hold the heap lock while taking the page-table or frame
+//! lock in the other order.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};

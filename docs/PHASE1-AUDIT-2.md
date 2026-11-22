@@ -21,7 +21,7 @@ This file is a work list in the same form as `docs/PHASE1-AUDIT.md`.
 | A4 | Fixed. Each `AddressSpace` has an id that is never reused, and the scheduler issues the barrier when the id changes (`sched::note_user_space`), not when the table address does. Test `mitigations.ibpb_keyed_by_space_id`: the same space twice gets no barrier; a dropped and recreated one gets a new id and a barrier. In the test boot the new space does get the freed table frame, and with the old keying on the table address the test fails. |
 | A5 | Open |
 | A6 | Open |
-| A7 | Item 3 fixed (`duplicate` releases the reference when the map fails). Items 1, 2, 4, 5 open. |
+| A7 | All five fixed. (1) Vector 8 joins 2 and 18 as never a user fault, so a double fault stays fatal; no user program can produce one, so this is not testable directly. (2) `sched::EXITED` keeps the 1024 most recent statuses; `sched.exited_bounded` runs 1100 threads (1443 kept without the bound, and the test fails). (3) `duplicate` releases the reference when the map fails. (4) The rule now matches the code: interrupt handlers may allocate, since the heap lock is an `IrqMutex` and the reserve keeps such allocations from failing (`docs/locking.md`, `heap.rs`; the stale "handlers take no lock" note is corrected too). (5) `paging::init` clears CR4.PGE if set before switching tables, which flushes global entries (SDM Vol. 3 section 5.10.4.1, "MOV to CR4"); `paging.no_global_pages` checks it is clear. |
 | A8 | Owner |
 
 

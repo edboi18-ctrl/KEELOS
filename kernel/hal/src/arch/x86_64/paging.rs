@@ -297,6 +297,15 @@ pub fn init() -> Result<PagingReport, PagingError> {
         let efer = cpu::rdmsr(cpu::IA32_EFER);
         cpu::wrmsr(cpu::IA32_EFER, efer | cpu::EFER_NXE);
         cpu::write_cr0(cpu::read_cr0() | cpu::CR0_WP);
+        // Global translations survive a CR3 write. Limine leaves CR4.PGE
+        // clear, but that is checked rather than assumed: changing PGE
+        // invalidates every TLB entry, global ones included (SDM Vol. 3
+        // section 5.10.4.1, "MOV to CR4"), so none of the bootloader's can
+        // outlive the switch (audit 2, A7.5).
+        let cr4 = cpu::read_cr4();
+        if cr4 & cpu::CR4_PGE != 0 {
+            cpu::write_cr4(cr4 & !cpu::CR4_PGE);
+        }
         cpu::write_cr3(root.address());
         let mut cr4 = cpu::read_cr4();
         if features.smep {

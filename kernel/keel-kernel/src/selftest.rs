@@ -388,6 +388,7 @@ fn phase1(t: &mut Runner) {
     phase1_mitigations(t);
     phase1_robustness(t);
     phase1_resource_limits(t);
+    phase1_audit_small_items(t);
     phase1_fuzz_smoke(t);
 
     // Phase 1 acceptance marker, printed only when every test above
@@ -1622,6 +1623,32 @@ pub fn phase1_resource_limits(t: &mut Runner) {
     if let Some((_, _, _, reused)) = barrier {
         kprintln!("  new address space reused the old table frame: {reused}");
     }
+}
+
+/// Audit 2, A7: small robustness items that can be observed.
+pub fn phase1_audit_small_items(t: &mut Runner) {
+    // A7.2: exit statuses of finished threads are not kept for ever.
+    let mut last = None;
+    for _ in 0..1100 {
+        if let Ok(id) = sched::spawn("short", || {}) {
+            join(id);
+            last = Some(id);
+        }
+    }
+    let kept = sched::exited_count();
+    t.check(
+        "sched.exited_bounded",
+        last.is_some_and(|id| sched::exit_status(id).is_some()) && kept <= 1024,
+        "after 1100 threads exit, at most 1024 statuses are kept and the latest is still there (A7.2)",
+    );
+    kprintln!("  exit statuses kept: {kept}");
+
+    // A7.5: no global translations: CR4.PGE is clear.
+    t.check(
+        "paging.no_global_pages",
+        cpu::read_cr4() & cpu::CR4_PGE == 0,
+        "CR4.PGE is clear, so a CR3 write leaves no stale global translation (A7.5)",
+    );
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200
