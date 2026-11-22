@@ -19,4 +19,8 @@ A second build from the same recipe must give the same SHA-256. The
 committed `hello.sha256` and `packages.txt` record the reference build;
 compare yours against them before the binary is accepted.
 
-Status: recipe written; reference binary not built yet.
+Reference build: SHA-256
+`aa498cc9628951fd43f59f4bf8fdd77fd77a5d6ef2380d7ca4d2f2c73cd139db`
+(committed `hello`, `hello.sha256`). The first build's `packages.txt`
+lacks versions (the recipe used `apk info -v`, which in apk-tools 3 prints
+descriptions); the recipe now uses `apk list --installed`.

@@ -23,6 +23,9 @@ pub struct Phase {
     pub complete: bool,
     /// Extra boots, each testing one behaviour that ends the kernel.
     pub scenarios: &'static [&'static str],
+    /// Lines the main boot's serial log must contain (output of user
+    /// programs, which the kernel cannot see itself).
+    pub expect_lines: &'static [&'static str],
 }
 
 /// Every phase with tests. `cargo xtask test` runs them all, so work on an
@@ -32,6 +35,7 @@ pub const PHASES: &[Phase] = &[
         number: 0,
         complete: true,
         scenarios: &[],
+        expect_lines: &[],
     },
     Phase {
         number: 1,
@@ -43,6 +47,9 @@ pub const PHASES: &[Phase] = &[
             "stack_overflow",
             "smap",
         ],
+        // Phase 1 acceptance item 1: the musl fixture's output reaches
+        // serial (it runs as PID 1; the kernel checks PID and status).
+        expect_lines: &["Hello from musl on Keel"],
     },
 ];
 
@@ -479,11 +486,21 @@ fn test_boot(
     // Scenarios end in a deliberate fault, so only the main boot of a
     // complete phase prints the acceptance marker.
     let marker = (phase.complete && scenario.is_none()).then(|| format!("KEEL P{number} OK"));
-    let result = if capture.timed_out {
-        Err(format!("timed out after {} s", timeout.as_secs()))
-    } else {
-        verdict(marker.as_deref(), &capture.lines, capture.exit_code)
-    };
+    let result =
+        if capture.timed_out {
+            Err(format!("timed out after {} s", timeout.as_secs()))
+        } else {
+            verdict(marker.as_deref(), &capture.lines, capture.exit_code).and_then(|()| match phase
+                .expect_lines
+                .iter()
+                // Only the main boot runs user programs; scenarios end early.
+                .filter(|_| scenario.is_none())
+                .find(|want| !capture.lines.iter().any(|l| l.trim_end() == **want))
+            {
+                Some(missing) => Err(format!("expected line \"{missing}\" not on serial")),
+                None => Ok(()),
+            })
+        };
     match result {
         Ok(()) => {
             // The test results, and on the main boot of each phase the
@@ -638,6 +655,37 @@ fn test_user_programs_on_host() -> Result<()> {
                 "{name} failed under Linux ({}): {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+    }
+    let root = util::workspace_root();
+    for fixture in build::TEST_FIXTURES {
+        // Run a copy: the committed file may lack the executable bit (it
+        // was committed from Windows).
+        let data = build::load_fixture(&root, fixture)?;
+        let path = root.join("target").join("fixtures").join(fixture.path);
+        util::write(&path, &data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let output = Command::new(&path)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()?;
+        let name = format!(
+            "host.{}",
+            fixture.path.rsplit('/').next().unwrap_or(fixture.path)
+        );
+        if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+            println!("  TEST {name} PASS prints the expected line under Linux");
+        } else {
+            return Err(format!(
+                "{name} under Linux: {} printing {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
             )
             .into());
         }

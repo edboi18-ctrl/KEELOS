@@ -331,6 +331,7 @@ fn phase1(t: &mut Runner) {
     phase1_prot_none(t);
     phase1_user(t);
     phase1_fs(t);
+    phase1_musl(t);
     phase1_exec(t);
     phase1_mitigations(t);
 }
@@ -1005,6 +1006,31 @@ pub fn phase1_fs(t: &mut Runner) {
         written == Ok(true),
         "files can be created, written and read back",
     );
+}
+
+/// Phase 1 acceptance item 1: a C program statically linked against musl
+/// (fixtures/musl-hello, built by its pinned recipe) runs as PID 1 and
+/// exits 0. Its output, "Hello from musl on Keel", goes to the console;
+/// `cargo xtask test` checks it on serial. Runs before any other process
+/// is started, so it gets PID 1.
+pub fn phase1_musl(t: &mut Runner) {
+    const PATH: &[u8] = b"/test/musl-hello";
+    let result = keel_linux_abi::fs::read_file(PATH).ok().and_then(|file| {
+        let loaded = keel_linux_abi::exec::load(&file, PATH, &[PATH], &[]).ok()?;
+        let spawned = keel_linux_abi::process::spawn("musl-hello", &loaded).ok()?;
+        join(spawned.thread);
+        Some((spawned.pid, sched::exit_status(spawned.thread)?))
+    });
+    t.check(
+        "acceptance.musl_hello_pid1",
+        result == Some((1, (0, None))),
+        "a static musl C program runs as PID 1 and exits 0 (its line is checked on serial)",
+    );
+    if let Some((pid, status)) = result
+        && (pid != 1 || status != (0, None))
+    {
+        kprintln!("  musl-hello: pid {pid}, exit {status:?}");
+    }
 }
 
 /// P1-T11: the initramfs, the ELF loader and the initial process state,

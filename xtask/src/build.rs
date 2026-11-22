@@ -119,6 +119,45 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
     },
 ];
 
+/// A prebuilt test binary checked into the repository (built elsewhere by
+/// a pinned recipe), placed in the initramfs of test builds only.
+pub struct TestFixture {
+    /// Path inside the initramfs.
+    pub path: &'static str,
+    /// The binary and its recorded SHA-256 (`sha256sum` format), relative to
+    /// the workspace root.
+    pub file: &'static str,
+    pub hash_file: &'static str,
+    /// What it must print on standard output.
+    pub stdout: &'static str,
+}
+
+/// Phase 1 acceptance item 1: musl "hello world", built from
+/// fixtures/musl-hello by its Dockerfile.
+pub const TEST_FIXTURES: &[TestFixture] = &[TestFixture {
+    path: "test/musl-hello",
+    file: "fixtures/musl-hello/hello",
+    hash_file: "fixtures/musl-hello/hello.sha256",
+    stdout: "Hello from musl on Keel\n",
+}];
+
+/// Reads a fixture and checks it against its recorded SHA-256 (SR-29: every
+/// input is verified); a mismatch stops the build.
+pub fn load_fixture(root: &Path, fixture: &TestFixture) -> Result<Vec<u8>> {
+    let data = util::read(&root.join(fixture.file))?;
+    let recorded = String::from_utf8(util::read(&root.join(fixture.hash_file))?)?;
+    let expected = recorded.split_whitespace().next().unwrap_or("");
+    let actual = util::sha256_hex(&data);
+    if actual != expected {
+        return Err(format!(
+            "{}: SHA-256 {actual} does not match {} ({expected})",
+            fixture.file, fixture.hash_file
+        )
+        .into());
+    }
+    Ok(data)
+}
+
 /// Compiles the user test programs (static, non-PIE ELF executables for
 /// the Linux x86-64 ABI) and returns the path of each, in `TEST_PROGRAMS`
 /// order.
@@ -198,6 +237,9 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
         for (program, binary) in TEST_PROGRAMS.iter().zip(build_user_tests(&root)?) {
             archive.add_file(program.path, util::read(&binary)?);
         }
+        for fixture in TEST_FIXTURES {
+            archive.add_file(fixture.path, load_fixture(&root, fixture)?);
+        }
     }
     let initramfs = archive.to_bytes()?;
 
@@ -230,6 +272,30 @@ pub fn build(mode: BootMode) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixtures_are_checked_against_their_hash() {
+        let root = util::workspace_root();
+        // The committed fixture matches its recorded hash.
+        assert!(load_fixture(&root, &TEST_FIXTURES[0]).is_ok());
+        // A file that does not match is refused.
+        let dir = root.join("target").join("fixture-test");
+        util::write(&dir.join("bin"), b"not the binary").unwrap();
+        util::write(
+            &dir.join("bin.sha256"),
+            TEST_FIXTURES[0].hash_file.as_bytes(),
+        )
+        .unwrap();
+        let recorded = util::read(&root.join(TEST_FIXTURES[0].hash_file)).unwrap();
+        util::write(&dir.join("bin.sha256"), &recorded).unwrap();
+        let tampered = TestFixture {
+            path: "test/x",
+            file: "target/fixture-test/bin",
+            hash_file: "target/fixture-test/bin.sha256",
+            stdout: "",
+        };
+        assert!(load_fixture(&root, &tampered).is_err());
+    }
 
     #[test]
     fn conf_pins_both_files_and_only_tests_on_request() {
