@@ -610,8 +610,7 @@ pub fn phase1_heap(t: &mut Runner) {
         .is_some_and(|t| t.flags.writable && !t.flags.executable && !t.flags.user)
         && paging::translate(start + LARGE as u64 - 1).is_some()
         && paging::translate(start + LARGE as u64).is_none()
-        && (paging::KERNEL_HEAP_BASE..paging::KERNEL_HEAP_BASE + paging::KERNEL_HEAP_SIZE)
-            .contains(&start);
+        && paging::kernel_heap_region().contains(&start);
     let content_ok = block.iter().all(|&b| b == 0xAB);
     drop(block);
     let after_free = memory::free_frames();

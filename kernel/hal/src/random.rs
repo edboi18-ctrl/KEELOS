@@ -228,6 +228,32 @@ fn collect(rng: &mut Rng) -> bool {
     hardware
 }
 
+/// Three random words for the kernel's own layout (the region bases in
+/// `paging::init`), needed before the timer and `init`. Drawn from a
+/// separate generator seeded exactly as the main one is (`collect`:
+/// RDSEED, RDRAND after its self-test, TSC jitter), then dropped. Linux
+/// draws its memory-region offsets early in the same spirit
+/// (`kaslr_get_random_long`). Also says whether hardware contributed.
+pub fn early_words() -> ([u64; 3], Quality) {
+    let mut rng = Rng::new();
+    let hardware = collect(&mut rng);
+    rng.reseed();
+    let mut bytes = [0u8; 24];
+    let filled = rng.fill(&mut bytes);
+    debug_assert!(filled, "seeded just above");
+    let word = |i: usize| {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+        u64::from_le_bytes(w)
+    };
+    let quality = if hardware {
+        Quality::Hardware
+    } else {
+        Quality::Weak
+    };
+    ([word(0), word(1), word(2)], quality)
+}
+
 /// Seeds the generator (call once at boot, after the clock is set up;
 /// a `fill` before that seeds it on first use). Returns the quality.
 pub fn init() -> Quality {
