@@ -35,6 +35,16 @@ undocumented_unsafe_blocks = "deny"
 [profile.dev]
 panic = "abort"
 
+# The PE parser and its fuzz engine run optimized even in dev builds, so
+# `cargo xtask fuzz-pe` (xtask builds in the dev profile) tries millions of
+# inputs a minute. Overflow checks stay on: dev keeps them at any
+# opt-level, and they are what the fuzzer is looking for.
+[profile.dev.package.pe]
+opt-level = 3
+
+[profile.dev.package.pe-fuzz]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
 overflow-checks = true

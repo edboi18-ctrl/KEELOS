@@ -10,6 +10,12 @@ in user mode. No finding blocks. One low-severity item (D1) is new. The
 last section lists what Phase 3 has to settle early, because Phase 3 is
 where hostile code first runs.
 
+## Status on the working branch
+
+| # | Status |
+| --- | --- |
+| D1 | Fixed. A name is found with one section lookup (binary search, since `parse` checked the sections are in RVA order) and one scan of at most `MAX_NAME` bytes, instead of a full section-table scan per byte; and a total cap, `MAX_IMPORTS` (16,384), bounds the walk. Test `shared_import_tables_are_walked_quickly` builds the audit's file: the walk ends with `TooManyImports` after 16,384 imports in 7 ms (test build, parser optimized), 9 ms in a release build, against about 226 s before; without the total cap it walks 1,044,225 imports and fails. The file is in the corpus as `TooManyImports-shared-tables.exe`. `Image::section` now checks its index. The module comment is corrected. The parser and fuzz engine build optimized in the dev profile (overflow checks stay on), so `fuzz-pe` keeps its throughput with the slower template. |
+
 ## What was run (QEMU 8.2.2, TCG, no KVM, Ubuntu 24.04)
 
 - `cargo test --locked --offline`: passed.
