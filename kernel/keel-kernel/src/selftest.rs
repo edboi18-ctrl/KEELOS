@@ -328,6 +328,7 @@ fn phase1(t: &mut Runner) {
     phase1_interrupts(t);
     phase1_sched(t);
     phase1_vm(t);
+    phase1_prot_none(t);
     phase1_user(t);
     phase1_fs(t);
     phase1_exec(t);
@@ -1088,6 +1089,59 @@ pub fn phase1_exec(t: &mut Runner) {
     );
 }
 
+/// F-0002 and SR-15 (L1TF): PROT_NONE takes populated pages out of the
+/// page tables entirely; the data comes back when the protection is
+/// raised, survives fork, and every frame is returned at the end. No
+/// page table anywhere holds a not-present entry with bits set.
+pub fn phase1_prot_none(t: &mut Runner) {
+    use keel_core::vm::{Placement, Prot};
+    use keel_hal::vm::{AddressSpace, copy_from_user, copy_to_user, with_address_space};
+    const AT: u64 = 0x5000_0000;
+    const LEN: u64 = 4 * 4096;
+
+    let frames_at_start = memory::free_frames();
+    let ok = (|| {
+        let space = AddressSpace::new().ok()?;
+        space
+            .map(Placement::Fixed(AT), LEN, Prot::READ_WRITE)
+            .ok()?;
+        let pattern: alloc::vec::Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        with_address_space(&space, || copy_to_user(AT, &pattern)).ok()?;
+        space.protect(AT, LEN, Prot::NONE).ok()?;
+        let mut probe = [0u8; 8];
+        let hidden = space.page_flags(AT).is_none()
+            && with_address_space(&space, || copy_from_user(&mut probe, AT).is_err())
+            && space.resident_bytes() == LEN;
+        let clean = space.user_view_walk(|_, _| {}).nonpresent_nonzero == 0;
+        // fork while parked: both sides get the data back, independently.
+        let child = space.duplicate().ok()?;
+        space.protect(AT, LEN, Prot::READ_WRITE).ok()?;
+        child.protect(AT, LEN, Prot::READ_WRITE).ok()?;
+        let mut back = alloc::vec![0u8; LEN as usize];
+        let parent_ok =
+            with_address_space(&space, || copy_from_user(&mut back, AT)).is_ok() && back == pattern;
+        with_address_space(&space, || copy_to_user(AT, &[0xEE; 16])).ok()?;
+        let child_ok =
+            with_address_space(&child, || copy_from_user(&mut back, AT)).is_ok() && back == pattern;
+        Some(hidden && clean && parent_ok && child_ok)
+    })();
+    t.check(
+        "vm.prot_none_hides_pages",
+        ok == Some(true),
+        "PROT_NONE pages are unreadable, keep their data, and come back after mprotect and fork (F-0002)",
+    );
+    t.check(
+        "vm.prot_none_frames_returned",
+        memory::free_frames() + 8 >= frames_at_start,
+        "parked frames are freed with their address space",
+    );
+    t.check(
+        "l1tf.no_stale_entries",
+        paging::walk().is_some_and(|w| w.nonpresent_nonzero == 0),
+        "no not-present page-table entry in the kernel's tables holds any bits (L1TF)",
+    );
+}
+
 /// Loads a test program into a fresh address space and runs it as a user
 /// thread to completion. Returns its exit status and last user fault.
 fn run_user_program(
@@ -1280,7 +1334,7 @@ pub fn phase1_user(t: &mut Runner) {
                 only_trampoline &= in_trampoline && !tr.flags.user;
             }
         });
-        only_trampoline && summary.writable_and_executable == 0
+        only_trampoline && summary.writable_and_executable == 0 && summary.nonpresent_nonzero == 0
     });
     t.check(
         "pti.user_view",

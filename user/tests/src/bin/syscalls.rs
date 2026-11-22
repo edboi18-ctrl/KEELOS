@@ -184,6 +184,22 @@ fn main(_: &Startup) -> i32 {
                 "a read-only mapping refuses kernel writes (EFAULT)",
                 region.read_from(zero, 0, 16) == EFAULT,
             );
+            // F-0002: memory made PROT_NONE after it was touched must not
+            // stay readable. Written to fd 1, which really reads the bytes
+            // (Linux's /dev/null and /dev/zero discard writes unread).
+            c.check("mprotect PROT_NONE", region.protect(0) == 0);
+            c.check(
+                "a PROT_NONE mapping refuses kernel reads (EFAULT)",
+                region.write_to(1, 0, 16) == EFAULT,
+            );
+            c.check(
+                "mprotect back to read/write",
+                region.protect(sys::PROT_READ | sys::PROT_WRITE) == 0,
+            );
+            c.check(
+                "the mapping is usable again",
+                region.read_from(zero, 0, 16) == 16,
+            );
             let (unmapped, gone) = region.unmap();
             c.check("munmap", unmapped == 0);
             c.check(

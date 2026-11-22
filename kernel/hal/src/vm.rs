@@ -14,6 +14,7 @@
 //! `rep movsb`, and turn an unresolvable fault into EFAULT instead of a
 //! panic. No other kernel code dereferences user addresses.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,6 +43,12 @@ fn user_flags(prot: Prot, writable: bool) -> Flags {
 
 struct Inner {
     layout: Layout,
+    /// Frames of pages made PROT_NONE after they were populated. Their
+    /// page-table entries are cleared to zero rather than marked not
+    /// present, so no not-present entry ever holds a real frame address
+    /// (L1TF, SR-15), and the page cannot be read (F-0002). Raising the
+    /// protection maps the frame back.
+    parked: BTreeMap<u64, Frame>,
 }
 
 /// One user address space, as two top-level tables:
@@ -90,6 +97,7 @@ impl AddressSpace {
             user_root,
             inner: IrqMutex::new(Inner {
                 layout: Layout::new(),
+                parked: BTreeMap::new(),
             }),
         }))
     }
@@ -134,7 +142,7 @@ impl AddressSpace {
         let mut inner = self.inner.lock();
         let (start, replaced) = inner.layout.map(placement, length, prot)?;
         for (from, to) in replaced {
-            self.unmap_pages(from, to);
+            self.unmap_pages(&mut inner, from, to);
         }
         Ok(start)
     }
@@ -143,7 +151,7 @@ impl AddressSpace {
     pub fn unmap(&self, start: u64, length: u64) -> Result<(), AsError> {
         let mut inner = self.inner.lock();
         for (from, to) in inner.layout.unmap(start, length)? {
-            self.unmap_pages(from, to);
+            self.unmap_pages(&mut inner, from, to);
         }
         Ok(())
     }
@@ -152,10 +160,33 @@ impl AddressSpace {
     /// rights; copy-on-write pages stay read-only until written.
     pub fn protect(&self, start: u64, length: u64, prot: Prot) -> Result<(), AsError> {
         let mut inner = self.inner.lock();
+        let none = prot == Prot::NONE;
         for (from, to) in inner.layout.protect(start, length, prot)? {
             let mut page = from;
             while page < to {
-                if let Some(t) = paging::translate(&mut DirectMapTables, self.root, page) {
+                if none {
+                    // Take the frame out of the page tables entirely.
+                    if let Some(phys) = paging::unmap_small(&mut DirectMapTables, self.root, page) {
+                        cpu::invalidate_page(page);
+                        inner.parked.insert(page, Frame::containing(phys));
+                    }
+                } else if let Some(frame) = inner.parked.remove(&page) {
+                    let exclusive = memory::references(frame) == 1;
+                    let mapped = paging::map(
+                        &mut DirectMapTables,
+                        self.root,
+                        page,
+                        frame.address(),
+                        PageSize::Small,
+                        user_flags(prot, exclusive),
+                    );
+                    if mapped.is_err() {
+                        // Only possible when a page table cannot be
+                        // allocated: keep the data parked and report it.
+                        inner.parked.insert(page, frame);
+                        return Err(AsError::OutOfMemory);
+                    }
+                } else if let Some(t) = paging::translate(&mut DirectMapTables, self.root, page) {
                     let exclusive = memory::references(Frame::containing(t.phys)) == 1;
                     let _ = paging::replace_small(
                         &mut DirectMapTables,
@@ -169,15 +200,19 @@ impl AddressSpace {
                 page += PAGE;
             }
         }
+        self.sync_user_view();
         Ok(())
     }
 
-    fn unmap_pages(&self, from: u64, to: u64) {
+    fn unmap_pages(&self, inner: &mut Inner, from: u64, to: u64) {
         let mut page = from;
         while page < to {
             if let Some(phys) = paging::unmap_small(&mut DirectMapTables, self.root, page) {
                 cpu::invalidate_page(page);
                 let _ = memory::release(Frame::containing(phys));
+            }
+            if let Some(frame) = inner.parked.remove(&page) {
+                let _ = memory::release(frame);
             }
             page += PAGE;
         }
@@ -280,14 +315,23 @@ impl AddressSpace {
             let _ = paging::replace_small(&mut DirectMapTables, self.root, virt, phys, shared);
             cpu::invalidate_page(virt);
         }
+        // Parked (PROT_NONE) pages are shared the same way: the child
+        // parks the same frame, and whichever side raises the protection
+        // first sees a shared frame and gets it read-only (copy on write).
+        let mut child_inner = child.inner.lock();
+        for (&page, &frame) in &inner.parked {
+            memory::retain(frame).map_err(|_| AsError::OutOfMemory)?;
+            child_inner.parked.insert(page, frame);
+        }
+        drop(child_inner);
         child.sync_user_view();
         Ok(child)
     }
 
     /// Bytes of user memory currently backed by frames.
     pub fn resident_bytes(&self) -> u64 {
-        let _inner = self.inner.lock();
-        let mut bytes = 0;
+        let inner = self.inner.lock();
+        let mut bytes = inner.parked.len() as u64 * PAGE;
         paging::walk(&mut DirectMapTables, self.root, |virt, t| {
             if virt < vm::USER_END {
                 bytes += t.size.bytes();
@@ -305,6 +349,9 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        for (_, frame) in core::mem::take(&mut self.inner.lock().parked) {
+            let _ = memory::release(frame);
+        }
         let (tables, leaves) = paging::clear_user_half(&mut DirectMapTables, self.root);
         for phys in leaves {
             let _ = memory::release(Frame::containing(phys));

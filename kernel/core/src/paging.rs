@@ -403,6 +403,11 @@ pub struct WalkSummary {
     pub writable_and_executable: u64,
     /// Present 1 GiB leaves (Keel never creates them).
     pub giant_pages: u64,
+    /// Not-present entries, at any level, that are not entirely zero. Keel
+    /// keeps this at 0: a not-present entry with a frame address in it can
+    /// be used to read that frame speculatively on CPUs affected by L1TF
+    /// (Linux `Documentation/admin-guide/hw-vuln/l1tf.rst`).
+    pub nonpresent_nonzero: u64,
 }
 
 /// Visits every present leaf and counts what it finds. `visit` receives
@@ -436,6 +441,9 @@ fn walk_level<A: TableAccess>(
     for i in 0..512usize {
         let entry = access.table(table)[i];
         if entry & PRESENT == 0 {
+            if entry != 0 {
+                summary.nonpresent_nonzero += 1;
+            }
             continue;
         }
         let mut virt = base | (i as u64) << (39 - 9 * level);
@@ -573,6 +581,22 @@ mod tests {
     }
 
     const KERNEL: u64 = 0xffff_ffff_8000_0000;
+
+    #[test]
+    fn unmapping_leaves_no_stale_bits() {
+        let (mut t, root) = HeapTables::new();
+        let rw = Flags {
+            writable: true,
+            ..Flags::READ_ONLY
+        };
+        map(&mut t, root, KERNEL, 0x20_0000, PageSize::Small, rw).unwrap();
+        assert_eq!(unmap_small(&mut t, root, KERNEL), Some(0x20_0000));
+        assert_eq!(walk(&mut t, root, |_, _| {}).nonpresent_nonzero, 0);
+        // A hand-made not-present entry with an address is counted.
+        let table = Frame::containing(t.table(root)[index(KERNEL, 0)] & ADDRESS_MASK);
+        t.table(table)[3] = 0x1234_5000;
+        assert_eq!(walk(&mut t, root, |_, _| {}).nonpresent_nonzero, 1);
+    }
 
     #[test]
     fn leaf_entries_have_the_documented_bits() {
