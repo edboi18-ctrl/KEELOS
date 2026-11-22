@@ -15,8 +15,9 @@
  * (SR-16, enabled in Phase 1). Limine applies the R_X86_64_RELATIVE
  * relocations it finds through PT_DYNAMIC before entering the kernel.
  *
- * W^X (SR-12): three page-aligned PT_LOAD segments, none of which is both
- * writable and executable. Limine maps each with its segment permissions.
+ * W^X (SR-12): four page-aligned PT_LOAD segments, none of which is both
+ * writable and executable. Limine maps each with its segment permissions;
+ * the kernel then builds its own tables, in which RELRO is read-only.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -26,6 +27,7 @@ PHDRS
 {
     text    PT_LOAD    FLAGS(5);  /* PF_R | PF_X */
     rodata  PT_LOAD    FLAGS(4);  /* PF_R        */
+    relro   PT_LOAD    FLAGS(6);  /* PF_R | PF_W until relocated */
     data    PT_LOAD    FLAGS(6);  /* PF_R | PF_W */
     dynamic PT_DYNAMIC FLAGS(6);
 }
@@ -64,7 +66,20 @@ SECTIONS
     .dynstr   : { *(.dynstr) }   :rodata
     .rela.dyn : { *(.rela.dyn .rela.*) } :rodata
 
+    /*
+     * RELRO (P1-S6): data that only the bootloader's relocations write
+     * (vtables, pointer constants, the GOT). Its own page-aligned
+     * segment, writable in the file so Limine can relocate it, and mapped
+     * read-only, no-execute by the kernel's page tables, which treat
+     * everything from __rodata_start to __data_start as read-only.
+     */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __relro_start = .;
+    .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } :relro
+    .got         : { *(.got .got.*) }                 :relro
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __relro_end = .;
+
     __data_start = .;
 
     .data : {
@@ -80,10 +95,6 @@ SECTIONS
         KEEP(*(.limine_requests))
         KEEP(*(.limine_requests_end))
     } :data
-
-    /* Pointers the bootloader relocates; they stay writable for now. */
-    .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } :data
-    .got         : { *(.got .got.*) }                 :data
 
     .dynamic : { *(.dynamic) } :data :dynamic
 

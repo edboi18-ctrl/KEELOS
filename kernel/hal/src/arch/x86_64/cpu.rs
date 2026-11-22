@@ -512,3 +512,15 @@ pub fn read_efer() -> u64 {
     // side effects.
     unsafe { rdmsr(IA32_EFER) }
 }
+
+/// The current stack pointer (for tests that check which stack is in use).
+pub fn stack_pointer() -> u64 {
+    let rsp: u64;
+    // Assembly reasoning (spec section 1, rule 4)
+    // Instruction: `mov {r}, rsp` copies RSP; nothing else changes.
+    // SAFETY: reading a register has no side effects.
+    unsafe {
+        asm!("mov {r}, rsp", r = out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    rsp
+}

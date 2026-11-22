@@ -84,6 +84,7 @@ against copies downloaded from the vendors:
 | Intel SDM Vol. 1 section 7.3.17.2 (RDSEED, CPUID.07H.00H:EBX.RDSEED[18], retry while CF = 0) and Vol. 2B "RDSEED" | `kernel/hal/src/random.rs` |
 | Linux v6.12 `arch/x86/include/asm/elf.h` (STACK_RND_MASK 0x3fffff), `mm/util.c` (`randomize_stack_top`), `arch/x86/mm/mmap.c` (`arch_rnd`, `mmap_base`, 128 MiB minimum gap), `arch/x86/Kconfig` (ARCH_MMAP_RND_BITS_MIN 28 for 64-bit), `arch/x86/kernel/process.c` (`arch_randomize_brk`: 1 GiB), `fs/binfmt_elf.c` (`load_bias += arch_mmap_rnd()`) | ASLR ranges in `kernel/linux-abi/src/exec.rs`, `kernel/core/src/vm.rs` |
 | Limine v12.9.6 `CONFIG.md` (`kaslr`, `randomise_hhdm_base`) and the Limine protocol `PROTOCOL.md` (relocatable executables may be slid; kernel at or above 0xffffffff80000000), read 2026-11-22 | `xtask/src/build.rs` (`kaslr: yes`), `xtask/src/qemu.rs` (`kaslr.layout_varies`) |
+| rust-lang/rust 1.100.0 `compiler/rustc_target/src/spec/targets/x86_64_unknown_none.rs` (`stack_probes: StackProbeType::Inline`, static PIE), read 2026-11-22 | SR-17 stack probes; STATUS P1-S6 |
 | cpio(5), "New ASCII Format"; Linux `Documentation/driver-api/early-userspace/buffer-format.rst` | `kernel/core/src/cpio.rs` (reader), `xtask/src/cpio.rs` (writer) |
 | Linux `arch/x86/entry/syscalls/syscall_64.tbl`, `include/uapi/asm-generic/errno.h`, `arch/x86/include/uapi/asm/signal.h` at v6.12 (exit 60, exit_group 231, ENOSYS 38, SIGILL 4, SIGTRAP 5, SIGBUS 7, SIGFPE 8, SIGSEGV 11), read 2026-11-22 | `kernel/hal/src/syscall.rs`, `docs/syscalls.md` |
 

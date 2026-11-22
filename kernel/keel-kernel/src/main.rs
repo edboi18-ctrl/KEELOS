@@ -84,6 +84,13 @@ extern "C" fn kmain() -> ! {
         // guard pages; stop instead (SR-12).
         Err(error) => panic!("page table setup failed: {error:?}"),
     }
+    // Leave the bootloader's stack, which has no guard page, for one of
+    // the kernel's own (P1-S6, SR-17).
+    keel_hal::sched::continue_on_boot_stack(kmain_on_boot_stack)
+}
+
+/// The rest of boot, on the kernel's own guarded boot stack.
+extern "C" fn kmain_on_boot_stack() -> ! {
     // System calls and user-mode entry, with page-table isolation.
     keel_hal::arch::x86_64::entry::init(paging::kernel_root().map_or(0, |r| r.address()));
     report_mitigations(&keel_hal::mitigations::init());

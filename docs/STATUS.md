@@ -56,7 +56,8 @@ to `main` with PR #1.
 | P1-S1 | Object table with a rights mask from its first version; every syscall handler names the right it requires | Done. `keel-core::handle`: rights from SR-1's list, checked on every lookup, lowest-free descriptor allocation, duplicate only removes rights, per-process limit 1024 (host tests). The process table is a `HandleTable`; there is no other descriptor table. Rights per call in `docs/syscalls.md`. |
 | P1-S4 | Boot-time vulnerability report and mitigation selection; one log line per item | Done (ADR 0007). `keel-core::cpuvuln` assesses 17 items from CPUID, IA32_ARCH_CAPABILITIES and IA32_MCU_OPT_CTRL (host tests for the target with and without current microcode, newer CPUs, hypervisors, unknown models); `hal::mitigations` applies the plan: legacy IBRS on entry/exit (or enhanced IBRS once), SSBD, BHI_DIS_S when needed, IBPB between address spaces, RSB fill on every context switch, VERW before every return to user mode, SRBDS/GDS microcode controls on. Spectre v1: branch-free index masking for syscall numbers and descriptors. L1TF: no not-present entry holds bits (checked in every page-table walk). The boot log has one `vuln:` line per item; `cargo xtask test` prints them. Found and fixed on the way: F-0002. Where the mitigations run: QEMU's emulator advertises none of the speculation-control features but accepts the MSR writes, so `vuln.ibrs_entry_path` forces the IBRS entry/exit and IBPB paths on there and runs the whole syscall conformance program through them; CI's KVM guest (an Ice Lake server CPU inside GitHub's own virtual machine) hides IBRS/IBPB/SSBD entirely but raises #GP for missing MSRs, which proves the fault path (`cpu.msr_safe`). The CPU's actual speculation behaviour under these mitigations can only be confirmed on the OptiPlex (P6-S6). Not implemented: software BHB clearing and ITS mitigations (neither applies to the target). |
 | P1-S5 | Kernel and user address-space randomization; entropy source | Implemented; open until an intermittent phase-1 test timeout (seen once after these changes, not yet reproduced) is explained. Entropy: `keel-core::crypto` (ChaCha20, RFC 8439; BLAKE2s, RFC 7693; checked against the RFCs' vectors including the RFC 7693 self-test) and `keel-core::rng` (BLAKE2s pool, ChaCha20 fast key erasure, as Linux's random.c); `hal::random` seeds it at boot from RDSEED, RDRAND (after its self-test) and TSC jitter, adds timer and keyboard interrupt timing, reseeds every 60 s, never runs unseeded, and reports whether a hardware source contributed. AT_RANDOM, getrandom and /dev/urandom use it. KASLR: Limine `kaslr: yes` (the kernel is a PIE), which also randomises the HHDM base; `cargo xtask test` checks that the boots of a phase land at different addresses. User ASLR with Linux's ranges: stack top (22 bits of pages), mmap base and PIE load bias (28 bits), program break (1 GiB). Found on the way: F-0003. |
-| P1-S6, P1-S7 | | Not started |
+| P1-S6 | Kernel stack guard pages; zero-on-allocate for user frames; zeroed copy-out buffers; overflow checks in release | Done. Every kernel stack, now including the boot thread's (boot leaves Limine's unguarded stack for a 128 KiB kernel stack right after paging is up), has an unmapped guard page; an overflow becomes a double fault on IST1 and a clean panic (`stack_overflow` scenario). Stack probes: the pinned target (`x86_64-unknown-none`, Rust 1.100.0) sets `stack_probes: StackProbeType::Inline`, and the kernel binary contains the probe sequence. RELRO: `.data.rel.ro` and `.got` have their own segment, mapped read-only after Limine relocates them. Frames are zeroed on allocation (SR-18), structures copied to user space are built in zeroed buffers, and `overflow-checks = true` in release. Tests: `paging.boot_stack_guard`, `paging.relro`, `frames.zeroed`. |
+| P1-S7 | | Not started |
 
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel
@@ -72,11 +73,6 @@ Hardening notes for later Phase 1 work:
   own programs run; before the escape suite (P3-S8) runs hostile code, test
   results must travel on a channel user code cannot write (for example a
   second serial port, or the debug-exit code).
-- `.data.rel.ro` and `.got` stay writable after the bootloader relocates
-  them. Making them read-only after boot (RELRO) is a small follow-up.
-- The boot thread still runs on Limine's boot stack, which has no guard
-  page; every other kernel thread has a guarded stack (P1-T8). Moving the
-  boot thread onto a guarded stack is a small follow-up.
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
@@ -113,7 +109,7 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 128 | 390 | 39 | 16 |
+| `kernel/hal` | 130 | 404 | 39 | 16 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 | `user/keel-rt` | 18 | 86 | 5 | 1 |
 
@@ -140,7 +136,7 @@ FS/GS base MSR writes in `hal::sched`; then P1-T14: the i8042 port accesses
 and the keyboard callback conversion in `hal::drivers::ps2`; then P1-S4: rdmsr_safe and
 wrmsr_safe, the mitigation MSR writes, IBPB, the cmp/sbb index mask,
 and the mitigation block in the trampoline data (one `link_section`).
-Then P1-S5: RDSEED. `user/keel-rt` is
+Then P1-S5: RDSEED. Then P1-S6: the switch to the boot stack and reading RSP. `user/keel-rt` is
 the user-space runtime (ADR 0006), plus `syscall6`, the internal wrappers
 of the safe `sys` module, and one FS-relative read for the FS-base test: `_start`, the initial-stack reader and
 the `syscall` wrapper. The single kernel item outside `hal` is `#[unsafe(no_mangle)]` on the kernel

@@ -435,6 +435,39 @@ pub fn phase1_paging(t: &mut Runner) {
         "text is read+execute, rodata read-only, data read+write no-execute",
     );
 
+    // P1-S6: RELRO. Every page of .data.rel.ro and .got is read-only and
+    // no-execute, and the range really holds relocated pointers (a
+    // reference to a static is one).
+    static TARGET: u8 = 7;
+    static POINTER: &u8 = &TARGET;
+    let (relro_start, relro_end) = paging::relro_range();
+    let relro_pages_ok = (relro_start..relro_end).step_by(4096).all(|page| {
+        paging::translate(page).is_some_and(|t| !t.flags.writable && !t.flags.executable)
+    });
+    let pointer_at = core::ptr::addr_of!(POINTER) as u64;
+    t.check(
+        "paging.relro",
+        relro_end > relro_start
+            && relro_pages_ok
+            && relro_start <= pointer_at
+            && pointer_at < relro_end
+            && *core::hint::black_box(POINTER) == 7,
+        ".data.rel.ro and .got are read-only after relocation (P1-S6)",
+    );
+
+    // P1-S6: boot runs on its own kernel stack, with an unmapped guard
+    // page below it, not on the bootloader's unguarded one.
+    let rsp = cpu::stack_pointer();
+    t.check(
+        "paging.boot_stack_guard",
+        sched::boot_stack_bounds().is_some_and(|(guard, base, top)| {
+            (base..top).contains(&rsp)
+                && paging::translate(guard).is_none()
+                && paging::translate(base).is_some()
+        }),
+        "the boot thread runs on a kernel stack whose guard page is unmapped (SR-17)",
+    );
+
     let guards = gdt::ist_guard_pages();
     let guarded = guards.iter().all(|&g| paging::translate(g).is_none())
         && [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck]

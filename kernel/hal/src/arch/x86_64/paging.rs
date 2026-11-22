@@ -38,6 +38,8 @@ unsafe extern "C" {
     static __kernel_start: u8;
     static __rodata_start: u8;
     static __data_start: u8;
+    static __relro_start: u8;
+    static __relro_end: u8;
     static __kernel_end: u8;
     static __entry_text_start: u8;
     static __entry_text_end: u8;
@@ -569,6 +571,15 @@ fn unmap_locked(root: Frame, page: u64) {
 }
 
 /// The kernel image's virtual layout: start, rodata, data, end.
+/// The RELRO range `[start, end)`: relocated once by the bootloader, then
+/// read-only (inside the rodata..data range of `kernel_segments`).
+pub fn relro_range() -> (u64, u64) {
+    (
+        &raw const __relro_start as u64,
+        &raw const __relro_end as u64,
+    )
+}
+
 pub fn kernel_segments() -> [u64; 4] {
     kernel_layout()
 }

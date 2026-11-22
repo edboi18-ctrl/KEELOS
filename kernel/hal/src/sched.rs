@@ -117,7 +117,8 @@ pub fn init() -> Result<(), SchedError> {
         name: "boot",
         state: State::Running,
         rsp: 0,
-        stack: None,
+        // The guarded stack `continue_on_boot_stack` moved to, if any.
+        stack: BOOT_STACK.lock().take(),
         fpu: FpuState::new().ok_or(SchedError::OutOfMemory)?,
         space: None,
         user_entry: None,
@@ -135,6 +136,55 @@ pub fn init() -> Result<(), SchedError> {
     sched.threads.insert(1, idle);
     *guard = Some(sched);
     Ok(())
+}
+
+/// Pages of the boot thread's own stack (128 KiB).
+const BOOT_STACK_PAGES: u64 = 32;
+/// The boot stack until `init` hands it to the boot thread.
+static BOOT_STACK: IrqMutex<Option<KernelStack>> = IrqMutex::new(None);
+/// The boot stack's bounds, for tests: `(guard page, base, top)`.
+static BOOT_STACK_BOUNDS: IrqMutex<Option<(u64, u64, u64)>> = IrqMutex::new(None);
+
+/// Leaves the bootloader's stack, which has no guard page, for a kernel
+/// stack of its own with an unmapped guard page below it (SR-17, P1-S6),
+/// and continues at `next`. Call once, early in boot, after paging is
+/// set up and before `init`. Never returns: nothing on the old stack is
+/// used again.
+pub fn continue_on_boot_stack(next: extern "C" fn() -> !) -> ! {
+    let stack = paging::map_kernel_stack(BOOT_STACK_PAGES).expect("frames for the boot stack");
+    let top = stack.top;
+    *BOOT_STACK_BOUNDS.lock() = Some((stack.guard_page(), stack.base, stack.top));
+    *BOOT_STACK.lock() = Some(stack);
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: running on the bootloader's stack; {top} = top of the
+    //   new, mapped stack, 16-byte aligned (KernelStack::top).
+    // Instructions: `mov rsp, {top}` switches stacks; `xor ebp, ebp` ends
+    //   the frame-pointer chain (psABI 3.4.1 asks user code to do the same
+    //   for its deepest frame); `call {next}` pushes a return address, so
+    //   `next` starts with RSP = 8 mod 16 as the SysV ABI requires at
+    //   function entry (psABI 3.2.2). `next` never returns; `ud2` traps
+    //   if it did.
+    // Exit state: none (does not return). The old stack is abandoned.
+    // SAFETY: the new stack is mapped and unused; `next` is an extern "C"
+    // function taking no arguments and never returning, and it does not
+    // use anything that lived on the old stack.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "xor ebp, ebp",
+            "call {next}",
+            "ud2",
+            top = in(reg) top,
+            next = in(reg) next,
+            options(noreturn),
+        );
+    }
+}
+
+/// `(guard page, base, top)` of the boot thread's stack, if boot moved to
+/// one.
+pub fn boot_stack_bounds() -> Option<(u64, u64, u64)> {
+    *BOOT_STACK_BOUNDS.lock()
 }
 
 fn idle_loop() {
