@@ -35,7 +35,11 @@ RUN wget -q "https://dl.winehq.org/wine/source/11.0/wine-${WINE_VERSION}.tar.xz"
 # file (device and inode) already loaded and reuses it (lines 1170-1176);
 # musl expands $ORIGIN for libraries (lines 910-921). Wine's configure sets
 # no rpath on Linux (configure line 11105; macOS gets @loader_path, line
-# 11863), so it is appended to UNIXLDFLAGS in the generated Makefile.
+# 11863). makedep writes UNIXLDFLAGS into each link rule when the Makefile
+# is generated, but every Unix link rule ends with $(LDFLAGS), which make
+# expands when it runs and configure leaves empty; so the rpath goes there
+# ($$ is make's literal $, the quotes keep the shell from expanding it).
+# The loader and wineserver get it too, which changes nothing for them.
 WORKDIR /src/wine-${WINE_VERSION}
 RUN ./configure --prefix=/opt/wine \
       --enable-archs=x86_64 --disable-tests --disable-win16 \
@@ -47,8 +51,8 @@ RUN ./configure --prefix=/opt/wine \
       --without-opengl --without-oss --without-pcap --without-pcsclite \
       --without-pulse --without-sane --without-sdl --without-udev \
       --without-usb --without-v4l2 --without-vulkan \
- && sed -i "s|^UNIXLDFLAGS = .*|& -Wl,-rpath,'\$\$ORIGIN'|" Makefile \
- && grep '^UNIXLDFLAGS = .*ORIGIN' Makefile \
+ && sed -i "s|^LDFLAGS = \$|LDFLAGS = -Wl,-rpath,'\$\$ORIGIN'|" Makefile \
+ && grep -x "LDFLAGS = -Wl,-rpath,'\$\$ORIGIN'" Makefile \
  && make -j"$(nproc)" \
  && make install \
  && readelf -d /opt/wine/lib/wine/x86_64-unix/ws2_32.so | grep -F 'RUNPATH' | grep -F '$ORIGIN' \
