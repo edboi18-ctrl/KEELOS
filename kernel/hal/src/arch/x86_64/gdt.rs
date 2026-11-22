@@ -283,9 +283,13 @@ pub unsafe fn init() {
     //    descriptor busy (type 11). The TSS is used from now on for RSP0
     //    and the IST pointers.
     // Exit state: all segment registers refer to our GDT; RSP is
-    //   unchanged; RAX is clobbered (declared); flags are unchanged by
-    //   these instructions except as noted by none (LGDT, MOV Sreg, LTR
-    //   and RETF from CPL 0 to CPL 0 do not modify RFLAGS).
+    //   unchanged; RAX is clobbered (declared). The status flags are NOT
+    //   preserved: `xor eax, eax` clears OF and CF, sets SF, ZF and PF from
+    //   the result and leaves AF undefined (SDM Vol. 2D "XOR", Flags
+    //   Affected), so `preserves_flags` is not claimed (the Rust Reference,
+    //   "Inline assembly", asm.rules.preserved-registers: the status flags
+    //   must be restored on exit if it is). LGDT, MOV Sreg, LTR and a far
+    //   return from CPL 0 to CPL 0 do not modify RFLAGS.
     // References: Intel SDM Vol. 2A "LGDT/LIDT", Vol. 2B "RET" and "LTR",
     //   Vol. 2B "MOV" (segment register loads), Vol. 3A section 3.4.3.
     //
@@ -313,7 +317,6 @@ pub unsafe fn init() {
             ds = in(reg) u64::from(KERNEL_DS),
             tss = in(reg) u64::from(TSS_SELECTOR),
             out("rax") _,
-            options(preserves_flags),
         );
     }
 }

@@ -162,14 +162,19 @@ impl FpuState {
         //   `fxrstor64 [area]` (Vol. 2A "FXRSTOR") load the state saved by
         //   `save` or prepared by `new`. A malformed header or a reserved
         //   MXCSR bit would raise #GP; `new` writes valid values and only
-        //   `save` writes afterwards. Only FPU/SSE/AVX state changes.
+        //   `save` writes afterwards. Only FPU/SSE/AVX state changes, but
+        //   that state includes the x87 status word and MXCSR's exception
+        //   flags, which `preserves_flags` promises to leave unchanged (the
+        //   Rust Reference, "Inline assembly",
+        //   asm.rules.preserved-registers), so the option is not claimed.
+        //   RFLAGS itself is not touched.
         // SAFETY: as for `save`; the contents are always valid as argued.
         unsafe {
             if mask != 0 {
                 core::arch::asm!("xrstor64 [{}]", in(reg) area, in("eax") mask as u32,
-                    in("edx") (mask >> 32) as u32, options(nostack, preserves_flags, readonly));
+                    in("edx") (mask >> 32) as u32, options(nostack, readonly));
             } else {
-                core::arch::asm!("fxrstor64 [{}]", in(reg) area, options(nostack, preserves_flags, readonly));
+                core::arch::asm!("fxrstor64 [{}]", in(reg) area, options(nostack, readonly));
             }
         }
     }

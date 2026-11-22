@@ -8,6 +8,23 @@ matters, what to change, and how to tell the change is done. Findings are
 ordered by priority. Line numbers refer to commit `1502eb9`; re-locate the
 code by the quoted text if the file has moved on.
 
+## Status on the working branch
+
+The audit read `1502eb9`; the working branch was about 40 commits ahead
+when the fixes started (P1-T4 to P1-T14 and P1-S1 to P1-S7 done). Each
+finding was re-checked there before it was fixed.
+
+| # | Status |
+| --- | --- |
+| 1 | Open |
+| 2 | Open |
+| 3 | Open |
+| 4 | Open (settings: owner) |
+| 5 | Open |
+| 6 | Fixed. The same check over all 20 `asm!` blocks on the working branch that claim `preserves_flags` found two more: `xrstor64` and `fxrstor64` in `fpu.rs` load the x87 status word and MXCSR, which that option also covers (the Rust Reference, asm.rules.preserved-registers). All three no longer claim it. |
+| 7 | Guard pages: done in P1-T4. Recursion guard: open |
+| 8 | Open; now more important, since KASLR (P1-S5) is on and the kernel base is still printed |
+
 ## Scope and limits
 
 - Read in full: everything outside `vendor/` (kernel crates, `xtask`,
