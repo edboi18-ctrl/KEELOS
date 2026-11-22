@@ -318,22 +318,32 @@ pub fn ensure_top_level<A: TableAccess>(
     Ok(())
 }
 
-/// Removes everything below top-level entry 256 (the user half) and
-/// returns the page-table frames that held it plus every leaf's physical
-/// address, so the caller can release them. The caller must not have
-/// `root` active, or must flush the TLB.
+/// What `clear_user_half` hands back, one item at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cleared {
+    /// A leaf entry's physical address (a mapped page).
+    Leaf(u64),
+    /// A page-table frame. Reported only after every entry below it, so
+    /// the caller may free it at once: the walk never reads it again.
+    Table(Frame),
+}
+
+/// Removes everything below top-level entry 256 (the user half), passing
+/// each leaf and each page-table frame to `release` as the walk reaches
+/// it. Nothing is collected or allocated: a process's teardown can run
+/// when only the kernel's reserve is free, and lists in proportion to the
+/// process would come out of that reserve (third Phase 1 audit, C2). The
+/// caller must not have `root` active, or must flush the TLB.
 pub fn clear_user_half<A: TableAccess>(
     access: &mut A,
     root: Frame,
-) -> (alloc::vec::Vec<Frame>, alloc::vec::Vec<u64>) {
-    let mut tables = alloc::vec::Vec::new();
-    let mut leaves = alloc::vec::Vec::new();
+    mut release: impl FnMut(Cleared),
+) {
     fn visit<A: TableAccess>(
         access: &mut A,
         table: Frame,
         level: usize,
-        tables: &mut alloc::vec::Vec<Frame>,
-        leaves: &mut alloc::vec::Vec<u64>,
+        release: &mut impl FnMut(Cleared),
     ) {
         for i in 0..512 {
             let entry = access.table(table)[i];
@@ -342,11 +352,11 @@ pub fn clear_user_half<A: TableAccess>(
             }
             let is_leaf = level == 3 || (level >= 1 && entry & HUGE != 0);
             if is_leaf {
-                leaves.push(entry & ADDRESS_MASK);
+                release(Cleared::Leaf(entry & ADDRESS_MASK));
             } else {
                 let next = Frame::containing(entry & ADDRESS_MASK);
-                visit(access, next, level + 1, tables, leaves);
-                tables.push(next);
+                visit(access, next, level + 1, release);
+                release(Cleared::Table(next));
             }
         }
     }
@@ -356,11 +366,10 @@ pub fn clear_user_half<A: TableAccess>(
             continue;
         }
         let next = Frame::containing(entry & ADDRESS_MASK);
-        visit(access, next, 1, &mut tables, &mut leaves);
-        tables.push(next);
+        visit(access, next, 1, &mut release);
         access.table(root)[i] = 0;
+        release(Cleared::Table(next));
     }
-    (tables, leaves)
 }
 
 /// A resolved mapping with its effective rights.
@@ -979,9 +988,18 @@ mod tests {
         assert_eq!(translate(&mut t, root, 0x40_0000).unwrap().phys, 0x7000);
         assert!(translate(&mut t, root, 0x40_0000).unwrap().flags.writable);
         assert!(replace_small(&mut t, root, 0x40_1000, 0x7000, rw).is_err());
-        let (tables, leaves) = clear_user_half(&mut t, root);
-        assert_eq!(leaves, alloc::vec![0x7000]);
-        assert_eq!(tables.len(), 3); // PDPT, PD, PT
+        let mut cleared = alloc::vec::Vec::new();
+        clear_user_half(&mut t, root, |item| cleared.push(item));
+        // The leaf, then each table after everything below it.
+        assert!(matches!(
+            cleared.as_slice(),
+            [
+                Cleared::Leaf(0x7000),
+                Cleared::Table(_),
+                Cleared::Table(_),
+                Cleared::Table(_)
+            ]
+        ));
         assert_eq!(translate(&mut t, root, 0x40_0000), None);
         assert!(translate(&mut t, root, KERNEL).is_some());
         ensure_top_level(&mut t, root, 256..512).unwrap();

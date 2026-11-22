@@ -8,6 +8,7 @@ mod build;
 mod cpio;
 mod dist;
 mod fetch;
+mod fuzzpe;
 mod limine;
 mod qemu;
 mod util;
@@ -31,6 +32,9 @@ Commands:
                             Boot the in-guest system-call fuzzer for N
                             minutes (default 60); fails on a kernel panic
                             or a hung fuzz process
+  fuzz-pe [--minutes N] [--seed S]
+                            Fuzz the PE parser on the host for N minutes
+                            (default 30); fails on a parser panic
   dist  [--version V] [--allow-dirty]
                             Build release artifacts into target/dist
   boot-check <image> [--kvm] [--accel NAME]
@@ -148,6 +152,20 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
             qemu::fuzz(minutes, seed, &options)
+        }
+        "fuzz-pe" => {
+            let minutes = take_value(&mut args, "--minutes")?
+                .map(|v| v.parse::<u64>().map_err(|_| "--minutes needs a number"))
+                .transpose()?
+                .unwrap_or(30);
+            let seed = match take_value(&mut args, "--seed")? {
+                Some(v) => v.parse::<u64>().map_err(|_| "--seed needs a number")?,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            };
+            no_extra_args(&args)?;
+            fuzzpe::fuzz_pe(minutes, seed)
         }
         "dist" => {
             let version = take_value(&mut args, "--version")?;

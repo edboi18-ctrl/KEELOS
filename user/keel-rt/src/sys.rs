@@ -47,6 +47,8 @@ pub const PROT_EXEC: u64 = 4;
 pub const MAP_PRIVATE: u64 = 0x02;
 pub const MAP_ANONYMOUS: u64 = 0x20;
 pub const MAP_NORESERVE: u64 = 0x4000;
+/// arch_prctl codes (`arch/x86/include/uapi/asm/prctl.h`, v6.12).
+pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 
@@ -291,6 +293,14 @@ pub fn fs_base_round_trip(value: &u64) -> (i64, u64) {
     (0, read)
 }
 
+/// Sets the GS base (`arch_prctl(ARCH_SET_GS)`). Nothing in this runtime
+/// or in Rust code generated for this target reads through GS, so any
+/// value is harmless to the program's own objects; `peldr` points it at a
+/// fake Windows TEB.
+pub fn set_gs_base(address: u64) -> i64 {
+    call3(nr::ARCH_PRCTL, ARCH_SET_GS, address, 0)
+}
+
 pub fn arch_prctl_set_fs(address: Hostile) -> i64 {
     call3(nr::ARCH_PRCTL, ARCH_SET_FS, address.0, 0)
 }
@@ -377,8 +387,81 @@ impl Region {
         }
     }
 
+    /// mmap at `address` exactly, with MAP_FIXED_NOREPLACE: fails (EEXIST)
+    /// rather than replace anything already mapped, so it can never land
+    /// on this program's own memory.
+    pub fn map_at(address: u64, length: u64, prot: u64) -> Result<Region, i64> {
+        const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+        let result = call6(
+            nr::MMAP,
+            [
+                address,
+                length,
+                prot,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                u64::MAX,
+                0,
+            ],
+        );
+        if result < 0 {
+            Err(result)
+        } else if result as u64 != address {
+            // Kernels before Linux 4.17 treat the flag as a hint.
+            call3(nr::MUNMAP, result as u64, length, 0);
+            Err(-17)
+        } else {
+            Ok(Region { address, length })
+        }
+    }
+
     pub fn address(&self) -> u64 {
         self.address
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    fn range(&self, offset: u64, len: usize) -> Option<u64> {
+        let end = offset.checked_add(len as u64)?;
+        (end <= self.length).then_some(self.address + offset)
+    }
+
+    /// Copies `bytes` into the region at `offset`. Fails (`None`) if the
+    /// range does not fit. The region must be writable there; if it is not,
+    /// the write faults and the kernel ends the program (nothing in Rust's
+    /// memory model is affected: no Rust object lives in a region).
+    pub fn write(&self, offset: u64, bytes: &[u8]) -> Option<()> {
+        let at = self.range(offset, bytes.len())?;
+        // SAFETY: `[at, at + len)` lies inside this mapping (checked
+        // above), which this value owns and in which no Rust object or
+        // reference exists (module rule), so it cannot overlap `bytes`.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+        Some(())
+    }
+
+    /// The 8 bytes at `offset` as a little-endian u64 (any alignment).
+    pub fn read_u64(&self, offset: u64) -> Option<u64> {
+        let at = self.range(offset, 8)?;
+        // SAFETY: inside the mapping (checked); read_unaligned allows any
+        // alignment; any 8 bytes are a valid u64.
+        Some(unsafe { (at as *const u64).read_unaligned() })
+    }
+
+    /// Writes `value` at `offset` (any alignment).
+    pub fn write_u64(&self, offset: u64, value: u64) -> Option<()> {
+        self.write(offset, &value.to_le_bytes())
+    }
+
+    /// mprotect(2) on `[offset, offset + len)` of the region; both must be
+    /// page-aligned (else -EINVAL from the kernel) and inside it.
+    pub fn protect_range(&self, offset: u64, len: u64, prot: u64) -> i64 {
+        match offset.checked_add(len) {
+            Some(end) if end <= self.length => {
+                call3(nr::MPROTECT, self.address + offset, len, prot)
+            }
+            _ => -22,
+        }
     }
 
     /// read(2) from `fd` into the region at `offset`.
@@ -410,6 +493,73 @@ impl Region {
     pub fn unmap(self) -> (i64, Unmapped) {
         let result = call3(nr::MUNMAP, self.address, self.length, 0);
         (result, Unmapped(self.address))
+    }
+}
+
+/// A whole file read into memory and then made read-only, so it can be
+/// borrowed as `&[u8]`: after `map_file` returns nothing ever writes to it.
+pub struct MappedFile {
+    region: Region,
+    len: usize,
+}
+
+/// Largest file `map_file` reads.
+pub const MAP_FILE_LIMIT: u64 = 64 << 20;
+
+/// Opens `path` and reads all of it into a fresh read-only mapping.
+/// Errors are `-errno`; a file over `MAP_FILE_LIMIT` is -EFBIG.
+pub fn map_file(path: &CStr) -> Result<MappedFile, i64> {
+    let fd = openat(AT_FDCWD, path, O_RDONLY, 0);
+    if fd < 0 {
+        return Err(fd);
+    }
+    let fd = fd as i32;
+    let result = read_all(fd);
+    close(fd);
+    result
+}
+
+fn read_all(fd: i32) -> Result<MappedFile, i64> {
+    let mut stat = [0u8; 144];
+    let r = fstat(fd, &mut stat);
+    if r < 0 {
+        return Err(r);
+    }
+    // st_size: offset 48 of x86-64 `struct stat`
+    // (arch/x86/include/uapi/asm/stat.h, v6.12).
+    let size = u64::from_le_bytes(stat[48..56].try_into().unwrap_or([0; 8]));
+    if size > MAP_FILE_LIMIT {
+        return Err(-27); // EFBIG
+    }
+    let region = Region::map(size.max(1).next_multiple_of(4096), PROT_READ | PROT_WRITE)?;
+    let mut done = 0;
+    while done < size {
+        let n = region.read_from(fd, done, size - done);
+        if n < 0 {
+            return Err(n);
+        }
+        if n == 0 {
+            break; // shorter than fstat said: use what was read
+        }
+        done += n as u64;
+    }
+    let r = region.protect(PROT_READ);
+    if r < 0 {
+        return Err(r);
+    }
+    Ok(MappedFile {
+        region,
+        len: done as usize,
+    })
+}
+
+impl MappedFile {
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: `len` bytes from the start of the mapping were filled by
+        // read(2) and the whole mapping was then made PROT_READ; this value
+        // owns it and never unmaps or writes it, so the slice is valid,
+        // initialized and unchanging for as long as `self` is borrowed.
+        unsafe { core::slice::from_raw_parts(self.region.address as *const u8, self.len) }
     }
 }
 

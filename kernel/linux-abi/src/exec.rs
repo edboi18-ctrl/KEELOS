@@ -92,10 +92,15 @@ pub struct Loaded {
 pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<Loaded, LoadError> {
     let image = elf::parse(file)?;
     let bias = match image.kind {
-        Kind::Fixed => 0,
-        Kind::Relocatable => DYN_BASE + random::below(MMAP_RANDOM_PAGES) * PAGE - image.span().0,
+        Kind::Fixed => {
+            image.check_bias(0)?;
+            0
+        }
+        // Checked subtraction: an image above the base is refused (C1).
+        Kind::Relocatable => {
+            image.bias_for_base(DYN_BASE + random::below(MMAP_RANDOM_PAGES) * PAGE)?
+        }
     };
-    image.check_bias(bias)?;
 
     let space = AddressSpace::new()?;
     for segment in &image.segments {

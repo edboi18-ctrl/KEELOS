@@ -194,6 +194,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
     match (phase, scenario) {
         (0, Scenario::None) => phase0(&mut runner),
         (1, Scenario::None) => phase1(&mut runner),
+        (2, Scenario::None) => phase2(&mut runner),
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -406,10 +407,16 @@ pub fn phase1_frames(t: &mut Runner) {
     use alloc::vec::Vec;
     use keel_hal::memory::OwnedFrame;
     const COUNT: usize = 64;
+    // Every vector is allocated at full size before the baseline: a heap
+    // allocation in between could take a frame for the heap and throw the
+    // count off by one (it did, once the heap had no spare room).
+    let mut frames: Vec<OwnedFrame> = Vec::with_capacity(COUNT);
+    let mut addresses: Vec<u64> = Vec::with_capacity(COUNT);
+    let mut again: Vec<OwnedFrame> = Vec::with_capacity(COUNT);
     let baseline = memory::free_frames();
-    let mut frames: Vec<OwnedFrame> = (0..COUNT).filter_map(|_| OwnedFrame::allocate()).collect();
+    frames.extend((0..COUNT).filter_map(|_| OwnedFrame::allocate()));
     let all = frames.len() == COUNT;
-    let addresses: Vec<u64> = frames.iter().map(OwnedFrame::address).collect();
+    addresses.extend(frames.iter().map(OwnedFrame::address));
 
     let mut distinct = all;
     for (i, a) in addresses.iter().enumerate() {
@@ -434,8 +441,8 @@ pub fn phase1_frames(t: &mut Runner) {
     for frame in frames.iter_mut() {
         frame.bytes_mut().fill(0xA5);
     }
-    drop(frames);
-    let again: Vec<OwnedFrame> = (0..COUNT).filter_map(|_| OwnedFrame::allocate()).collect();
+    frames.clear();
+    again.extend((0..COUNT).filter_map(|_| OwnedFrame::allocate()));
     let reused_zeroed =
         again.len() == COUNT && again.iter().all(|f| f.bytes().iter().all(|&b| b == 0));
     let reused = again
@@ -448,7 +455,7 @@ pub fn phase1_frames(t: &mut Runner) {
         "new frames read as zero, including frames a previous owner filled (SR-18)",
     );
 
-    drop(again);
+    again.clear();
     // A freed frame can be neither freed again nor read: outside keel-hal
     // that is the type system (an `OwnedFrame` is consumed when freed and
     // cannot be copied or made from an address; audit finding 1); inside,
@@ -1480,7 +1487,7 @@ pub fn phase1_robustness(t: &mut Runner) {
 fn run_test_program(path: &[u8], args: &[&[u8]]) -> Option<(i64, Option<sched::UserFault>)> {
     let file = keel_linux_abi::fs::read_file(path).ok()?;
     let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
-    let spawned = keel_linux_abi::process::spawn("limits", &loaded).ok()?;
+    let spawned = keel_linux_abi::process::spawn("test", &loaded).ok()?;
     join(spawned.thread);
     sched::exit_status(spawned.thread)
 }
@@ -1656,12 +1663,125 @@ pub fn phase1_audit_small_items(t: &mut Runner) {
         kprintln!("  dirconfine: exit {confined:?}");
     }
 
+    // Audit 3, C2: tearing down a process allocates nothing, however
+    // large it is. 1024 pages, one every 2 MiB (so as many page tables),
+    // then the heap's allocation count across the drop.
+    {
+        use keel_core::vm::{Placement, Prot};
+        use keel_hal::vm::{AddressSpace, copy_to_user, with_address_space};
+        const BASE: u64 = 0x1000_0000_0000;
+        const PAGES: u64 = 1024;
+        const STRIDE: u64 = 2 << 20;
+        let result = AddressSpace::new().ok().and_then(|space| {
+            space
+                .map(Placement::Fixed(BASE), PAGES * STRIDE, Prot::READ_WRITE)
+                .ok()?;
+            let touched = with_address_space(&space, || {
+                (0..PAGES).all(|i| copy_to_user(BASE + i * STRIDE, &[1]).is_ok())
+            });
+            let alone = alloc::sync::Arc::strong_count(&space) == 1;
+            let frames_before = memory::free_frames();
+            let allocations_before = keel_hal::heap::allocations();
+            drop(space);
+            let allocated = keel_hal::heap::allocations() - allocations_before;
+            let freed = memory::free_frames() - frames_before;
+            Some((touched && alone, allocated, freed))
+        });
+        t.check(
+            "vm.teardown_allocates_nothing",
+            matches!(result, Some((true, 0, freed)) if freed >= 2 * PAGES as usize),
+            "dropping an address space with 1024 pages and 1024 page tables makes no heap allocation (audit 3, C2)",
+        );
+        if let Some((_, allocated, freed)) = result {
+            kprintln!("  teardown: {allocated} heap allocations, {freed} frames freed");
+        }
+    }
+
+    // Audit 3, C3: growing a file never takes the kernel's reserve. With
+    // only 64 frames free above the reserve, grow a file 4 KiB at a time:
+    // free memory must never fall below the reserve, and growth must end
+    // in ENOMEM.
+    {
+        use keel_core::errno::Errno;
+        use keel_core::vfs::ROOT;
+        let old = memory::set_user_reserve(memory::free_frames().saturating_sub(64));
+        let result = keel_linux_abi::fs::with(|fs| {
+            let ino = fs.create_file(ROOT, b"c3-growth", 0o644)?;
+            let chunk = [0u8; 4096];
+            let mut offset = 0u64;
+            let mut lowest = i64::MAX;
+            loop {
+                match fs.write(ino, offset, &chunk) {
+                    Ok(n) => offset += n as u64,
+                    Err(error) => return Ok((error, offset, lowest)),
+                }
+                let margin = memory::free_frames() as i64 - memory::user_reserve() as i64;
+                lowest = lowest.min(margin);
+                if offset > 64 << 20 {
+                    return Ok((Errno::EFBIG, offset, lowest));
+                }
+            }
+        });
+        memory::set_user_reserve(old);
+        t.check(
+            "fs.growth_keeps_reserve",
+            matches!(result, Ok((Errno::ENOMEM, _, lowest)) if lowest >= 0),
+            "growing a tmpfs file stops with ENOMEM before free memory reaches the kernel's reserve (audit 3, C3)",
+        );
+        if let Ok((error, offset, lowest)) = result {
+            kprintln!(
+                "  growth: {offset} bytes, then {error:?}; lowest margin over the reserve {lowest} frames"
+            );
+        }
+    }
+
     // A7.5: no global translations: CR4.PGE is clear.
     t.check(
         "paging.no_global_pages",
         cpu::read_cr4() & cpu::CR4_PGE == 0,
         "CR4.PGE is clear, so a CR3 write leaves no stale global translation (A7.5)",
     );
+}
+
+/// Phase 2: the toy PE loader runs a Windows executable (spec section 9).
+/// Acceptance P2: `peldr /winetest/hello.exe` writes the exact line, which
+/// `cargo xtask test --phase 2` finds on serial, and exits 0.
+fn phase2(t: &mut Runner) {
+    const PELDR: &[u8] = b"/test/peldr";
+    const HELLO: &[u8] = b"/winetest/hello.exe";
+    let status = run_test_program(PELDR, &[PELDR, HELLO]);
+    t.check(
+        "acceptance.peldr_hello",
+        status == Some((0, None)),
+        "peldr runs hello.exe, a Windows x64 executable, to exit status 0 (its line is checked on serial)",
+    );
+    if status != Some((0, None)) {
+        kprintln!("  peldr: exit {status:?}");
+    }
+    // Loaded away from its preferred base: the DIR64 relocations of its
+    // pointer table must have been applied for the same line to come out.
+    let relocated = run_test_program(PELDR, &[PELDR, b"--relocate", HELLO]);
+    t.check(
+        "peldr.relocated",
+        relocated == Some((0, None)),
+        "peldr runs hello.exe away from its preferred base (base relocations applied) to exit status 0",
+    );
+    if relocated != Some((0, None)) {
+        kprintln!("  peldr --relocate: exit {relocated:?}");
+    }
+    // A malformed file is refused with an error, and the kernel carries on.
+    const BAD: &[u8] = b"/test/startup";
+    let refused = run_test_program(PELDR, &[PELDR, BAD]);
+    t.check(
+        "peldr.refuses_non_pe",
+        refused == Some((1, None)),
+        "peldr refuses a file that is not a PE executable with exit status 1",
+    );
+
+    // Phase 2 acceptance marker, only when every test above passed.
+    if t.failed == 0 {
+        kprintln!("KEEL P2 OK");
+    }
 }
 
 /// A short fuzzing smoke test in every phase 1 boot: three runs of 200

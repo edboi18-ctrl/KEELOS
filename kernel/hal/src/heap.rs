@@ -164,12 +164,22 @@ impl<P: PageSource> LockedHeap<P> {
     }
 }
 
+/// Allocations made through the global allocator since boot, for tests
+/// that a path allocates nothing (audit 3, C2).
+static ALLOCATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many allocations the kernel heap has served since boot.
+pub fn allocations() -> u64 {
+    ALLOCATIONS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // SAFETY: `allocate` returns null or memory valid for `layout` that no
 // other allocation overlaps (blocks come off one free list at a time and
 // pages are fresh); `deallocate` only accepts what `allocate` returned
 // (GlobalAlloc's own contract on callers).
 unsafe impl<P: PageSource + Send> GlobalAlloc for LockedHeap<P> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.0.lock().allocate(layout)
     }
 

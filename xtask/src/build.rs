@@ -158,6 +158,16 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: false,
     },
+    // The toy PE loader (Phase 2). Not run on its own on the host: the PE
+    // fixtures are run through it there (`qemu::test_user_programs_on_host`).
+    TestProgram {
+        path: "test/peldr",
+        binary: "peldr",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     TestProgram {
         path: "test/dirconfine",
         binary: "dirconfine",
@@ -222,6 +232,15 @@ pub const TEST_FIXTURES: &[TestFixture] = &[TestFixture {
     stdout: "Hello from musl on Keel\n",
 }];
 
+/// Phase 2: Windows executables, run through `peldr` (not natively), with
+/// what they print. In the initramfs of test builds at `path`.
+pub const PE_FIXTURES: &[TestFixture] = &[TestFixture {
+    path: "winetest/hello.exe",
+    file: "winetest/hello-console/hello.exe",
+    hash_file: "winetest/hello-console/hello.sha256",
+    stdout: "Hello from a Windows executable on Keel\r\n",
+}];
+
 /// Reads a fixture and checks it against its recorded SHA-256 (SR-29: every
 /// input is verified); a mismatch stops the build.
 pub fn load_fixture(root: &Path, fixture: &TestFixture) -> Result<Vec<u8>> {
@@ -261,6 +280,8 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
                 "--locked",
                 "--package",
                 "keel-user-tests",
+                "--package",
+                "keel-peldr",
             ])
             .args(["--target", KERNEL_TARGET])
             .arg("--target-dir")
@@ -414,7 +435,7 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
         for (program, binary) in TEST_PROGRAMS.iter().zip(build_user_tests(&root)?) {
             archive.add_file(program.path, util::read(&binary)?);
         }
-        for fixture in TEST_FIXTURES {
+        for fixture in TEST_FIXTURES.iter().chain(PE_FIXTURES) {
             archive.add_file(fixture.path, load_fixture(&root, fixture)?);
         }
         for (program, binary) in STD_PROGRAMS.iter().zip(build_std_tests(&root)?) {

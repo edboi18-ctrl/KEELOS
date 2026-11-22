@@ -233,6 +233,15 @@ const ENTRY_POINT_FILE: &str = "kernel/keel-kernel/src/main.rs";
 /// harm only the program using it, never the kernel.
 const USER_RUNTIME_DIR: &str = "user/keel-rt/";
 
+/// Windows test programs (ADR 0013): they reach the OS only through DLL
+/// calls, which are FFI. Not part of Keel; Keel runs them as untrusted
+/// input.
+const WINDOWS_TESTS_DIR: &str = "winetest/";
+
+/// The one file of the toy PE loader that may use `unsafe` (ADR 0013):
+/// calling into the loaded image and writing through pointers it passes.
+const PELDR_FOREIGN_FILE: &str = "user/peldr/src/foreign.rs";
+
 fn check_unsafe(root: &Path) -> Result<()> {
     let mut files = Vec::new();
     rust_files(root, &mut files)?;
@@ -259,6 +268,8 @@ fn check_unsafe(root: &Path) -> Result<()> {
 
         let allowed = relative.starts_with("kernel/hal/")
             || relative.starts_with(USER_RUNTIME_DIR)
+            || relative.starts_with(WINDOWS_TESTS_DIR)
+            || relative == PELDR_FOREIGN_FILE
             || (relative == ENTRY_POINT_FILE
                 && count
                     == UnsafeCount {
@@ -287,7 +298,7 @@ fn check_unsafe(root: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(format!(
-            "`unsafe` outside kernel/hal and user/keel-rt (spec section 7, ADR 0006):\n  {}",
+            "`unsafe` outside kernel/hal, user/keel-rt, winetest/ and peldr's foreign.rs (spec section 7, ADRs 0006 and 0013):\n  {}",
             violations.join("\n  ")
         )
         .into())

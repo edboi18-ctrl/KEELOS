@@ -47,7 +47,21 @@ Four layers, each enough for its own kind of allocation:
    kernel spend one table frame per page from its own pool.
 4. **Fallible where a program sets the size.** Growing or copying a
    tmpfs file uses `try_reserve`, so a large write returns ENOMEM rather
-   than aborting.
+   than aborting. Every file buffer is also checked against the reserve
+   before it is allocated, at its full size (third Phase 1 audit, C3):
+   the admission check runs once per call, and before this one write
+   could grow a buffer by doubling well into the reserve. Growth doubles
+   when that leaves the reserve intact, takes exactly what is needed
+   when only that does, and otherwise fails with ENOMEM.
+5. **Teardown allocates nothing.** A process may exit when only the
+   reserve is free, so freeing its address space walks the page tables
+   and releases each frame as it is reached, without building lists in
+   proportion to the process (third Phase 1 audit, C2).
+
+What the reserve is, then: the floor below which no user page, user
+page table, system call or file buffer takes frames. The kernel's own
+allocations (scheduler, interrupt paths, small bookkeeping a call makes
+after admission) still draw on it; they are small and bounded.
 
 A2, the slow placement of `mmap(NULL)`: the search starts below the last
 mapping it placed (Linux's old `free_area_cache` idea), and falls back to
