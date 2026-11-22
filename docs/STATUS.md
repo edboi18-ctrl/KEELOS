@@ -26,7 +26,7 @@ resume from here.
 | P0-T6 | `cargo xtask test` harness | Done |
 | P0-T7 | `ci.yml` | Done: run 44011447886 on the working branch passed both jobs (audit and host tests; QEMU with KVM on a hosted runner). Not yet run on `main`. |
 | P0-T8 | `xtask dist`, `release.yml`, `xtask verify` | Written; artifacts build and the disk image boots in OVMF. The attestation path can only be exercised by a real tagged release. |
-| P0-T9 | Repository setup checklist | Written: `docs/REPOSITORY-SETUP.md`. Owner to carry out. |
+| P0-T9 | Repository setup checklist | Done: `docs/REPOSITORY-SETUP.md` written by the agent and carried out by the owner (checklist ticked, pull request #4). |
 | P0-S1 | Verified downloads; BLAKE2B hashes in `limine.conf` | Done, with a tamper test for kernel and initramfs. Since audit finding 2, the config's own BLAKE2B is enrolled in the shipped `BOOTX64.EFI` (ADR 0010), with a third tamper test. The boot chain detects corruption; it is not a verified boot until the executable is signed and Secure Boot is on (owner, SR-34). |
 | P0-S2 | `cargo xtask audit` | Done |
 
