@@ -394,26 +394,23 @@ fn phase1(t: &mut Runner) {
 /// memory and zero-filled, even after a previous owner dirtied them; and
 /// freeing returns the allocator to its starting count.
 pub fn phase1_frames(t: &mut Runner) {
+    use alloc::vec::Vec;
+    use keel_hal::memory::OwnedFrame;
     const COUNT: usize = 64;
     let baseline = memory::free_frames();
-    let mut frames = [None; COUNT];
-    for slot in frames.iter_mut() {
-        *slot = memory::allocate_zeroed();
-    }
-    let all = frames.iter().all(Option::is_some);
-    let frames = frames.map(|f| f.unwrap_or(keel_core::frame::Frame::containing(0)));
+    let mut frames: Vec<OwnedFrame> = (0..COUNT).filter_map(|_| OwnedFrame::allocate()).collect();
+    let all = frames.len() == COUNT;
+    let addresses: Vec<u64> = frames.iter().map(OwnedFrame::address).collect();
 
     let mut distinct = all;
-    for (i, a) in frames.iter().enumerate() {
-        distinct &= frames[i + 1..].iter().all(|b| a != b);
+    for (i, a) in addresses.iter().enumerate() {
+        distinct &= addresses[i + 1..].iter().all(|b| a != b);
     }
-    let in_usable = frames.iter().all(|f| {
-        f.address() != 0
-            && f.address() % 4096 == 0
+    let in_usable = addresses.iter().all(|&address| {
+        address != 0
+            && address % 4096 == 0
             && boot::memory_map().any(|r| {
-                r.kind == RegionKind::Usable
-                    && r.base <= f.address()
-                    && f.address() < r.base + r.length
+                r.kind == RegionKind::Usable && r.base <= address && address < r.base + r.length
             })
     });
     t.check(
@@ -422,28 +419,19 @@ pub fn phase1_frames(t: &mut Runner) {
         "64 frames are distinct, aligned, in usable RAM, and counted",
     );
 
-    let zeroed = frames
-        .iter()
-        .all(|&f| memory::with_frame_bytes(f, |bytes| bytes.iter().all(|&b| b == 0)) == Ok(true));
-    // Dirty every frame, free it, and allocate again: the allocator hands
-    // frames back out, and each must arrive zeroed (SR-18).
-    for &f in &frames {
-        let _ = memory::with_frame_bytes(f, |bytes| bytes.fill(0xA5));
-        let _ = memory::release(f);
+    let zeroed = frames.iter().all(|f| f.bytes().iter().all(|&b| b == 0));
+    // Dirty every frame, free it (by dropping it), and allocate again: the
+    // allocator hands frames back out, and each must arrive zeroed (SR-18).
+    for frame in frames.iter_mut() {
+        frame.bytes_mut().fill(0xA5);
     }
-    let mut reused_zeroed = true;
-    let mut again = [None; COUNT];
-    for slot in again.iter_mut() {
-        let frame = memory::allocate_zeroed();
-        reused_zeroed &= frame.is_some_and(|f| {
-            memory::with_frame_bytes(f, |bytes| bytes.iter().all(|&b| b == 0)) == Ok(true)
-        });
-        *slot = frame;
-    }
+    drop(frames);
+    let again: Vec<OwnedFrame> = (0..COUNT).filter_map(|_| OwnedFrame::allocate()).collect();
+    let reused_zeroed =
+        again.len() == COUNT && again.iter().all(|f| f.bytes().iter().all(|&b| b == 0));
     let reused = again
         .iter()
-        .flatten()
-        .filter(|f| frames.contains(f))
+        .filter(|f| addresses.contains(&f.address()))
         .count();
     t.check(
         "frames.zeroed",
@@ -451,15 +439,14 @@ pub fn phase1_frames(t: &mut Runner) {
         "new frames read as zero, including frames a previous owner filled (SR-18)",
     );
 
-    for frame in again.iter().flatten() {
-        let _ = memory::release(*frame);
-    }
-    let stale = frames[0];
+    drop(again);
+    // A freed frame can be neither freed again nor read: outside keel-hal
+    // that is the type system (an `OwnedFrame` is consumed when freed and
+    // cannot be copied or made from an address; audit finding 1); inside,
+    // the raw operations refuse a stale frame.
     t.check(
         "frames.release",
-        memory::free_frames() == baseline
-            && memory::release(stale).is_err()
-            && memory::with_frame_bytes(stale, |_| ()).is_err(),
+        memory::free_frames() == baseline && memory::stale_frame_refused(),
         "freeing restores the count; a freed frame can be neither freed again nor read",
     );
 }
@@ -1421,13 +1408,11 @@ pub fn phase1_robustness(t: &mut Runner) {
 
     // F-0007: user page faults never take the kernel's reserve.
     let old = memory::set_user_reserve(memory::free_frames() + 16);
-    let user = memory::allocate_zeroed_user();
-    let kernel = memory::allocate_zeroed();
+    let user = memory::OwnedFrame::allocate_user();
+    let kernel = memory::OwnedFrame::allocate();
     memory::set_user_reserve(old);
     let refused = user.is_none() && kernel.is_some();
-    for frame in [user, kernel].into_iter().flatten() {
-        let _ = memory::release(frame);
-    }
+    drop((user, kernel));
     t.check(
         "memory.user_reserve",
         refused,

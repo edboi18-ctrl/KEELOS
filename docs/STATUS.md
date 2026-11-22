@@ -178,9 +178,9 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 130 | 404 | 39 | 16 |
+| `kernel/hal` | 134 | 407 | 39 | 16 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
-| `user/keel-rt` | 18 | 86 | 5 | 1 |
+| `user/keel-rt` | 19 | 87 | 5 | 1 |
 
 The increase since Phase 0 (from 29 blocks) is the GDT/TSS/IDT setup,
 the CPU register reads, and the self-test triggers, each with its
@@ -210,6 +210,10 @@ the user-space runtime (ADR 0006), plus `syscall6`, the internal wrappers
 of the safe `sys` module, and one FS-relative read for the FS-base test: `_start`, the initial-stack reader and
 the `syscall` wrapper. The single kernel item outside `hal` is `#[unsafe(no_mangle)]` on the kernel
 entry point, which the audit allows by exact file and count.
+
+Audit finding 1 (ADR 0009) removed the closure-based frame accessor and
+added two blocks for `OwnedFrame::bytes` and `bytes_mut`, whose safety
+rests on ownership instead of a lock.
 
 ## Image hashes
 

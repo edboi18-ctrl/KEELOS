@@ -142,9 +142,108 @@ pub(crate) fn frame_pointer(frame: Frame) -> *mut u8 {
     (HHDM.load(Ordering::Acquire) + frame.address()) as *mut u8
 }
 
+/// A physical frame owned by code outside `keel-hal` (ADR 0009, audit
+/// finding 1). Only the allocator creates one, it is neither `Copy` nor
+/// `Clone`, and dropping it frees the frame, so safe code can reach and
+/// free only frames it was given, and only once. Its contents are reached
+/// through `&self`/`&mut self`, so the borrow checker rules out aliasing
+/// without holding the allocator's lock.
+///
+/// Inside `keel-hal`, frames are plain `keel_core::frame::Frame` values
+/// (an address, which grants nothing by itself): page tables and address
+/// spaces keep many references to one frame and manage the counts
+/// themselves. The raw operations on them are `pub(crate)`.
+///
+/// What safe code outside this crate can do (this compiles):
+///
+/// ```no_run
+/// use keel_hal::memory::OwnedFrame;
+/// if let Some(mut frame) = OwnedFrame::allocate() {
+///     frame.bytes_mut()[0] = 1;
+///     drop(frame); // frees it
+/// }
+/// ```
+///
+/// What it cannot do (stable rustdoc does not check the error codes; each
+/// was confirmed by hand: E0603 private item, E0382 use after move):
+/// free or read a frame from an address, ...
+///
+/// ```compile_fail,E0603
+/// let forged = keel_core::frame::Frame::containing(0x10_0000);
+/// let _ = keel_hal::memory::release(forged); // private function
+/// ```
+///
+/// ... copy a handle so it can be used after it is freed, ...
+///
+/// ```compile_fail,E0382
+/// use keel_hal::memory::OwnedFrame;
+/// let frame = OwnedFrame::allocate().unwrap();
+/// drop(frame);
+/// let _ = frame.bytes(); // use after move
+/// ```
+///
+/// ... or build one itself.
+///
+/// ```compile_fail,E0603
+/// let _ = keel_hal::memory::OwnedFrame(keel_core::frame::Frame::containing(0));
+/// ```
+#[derive(Debug)]
+pub struct OwnedFrame(Frame);
+
+impl OwnedFrame {
+    /// A zero-filled frame (SR-18), or `None` if memory is exhausted.
+    pub fn allocate() -> Option<OwnedFrame> {
+        allocate_zeroed().map(OwnedFrame)
+    }
+
+    /// As [`OwnedFrame::allocate`], subject to the kernel's reserve (see
+    /// [`user_reserve`]).
+    pub fn allocate_user() -> Option<OwnedFrame> {
+        allocate_zeroed_user().map(OwnedFrame)
+    }
+
+    /// Physical address of the first byte (information only).
+    pub fn address(&self) -> u64 {
+        self.0.address()
+    }
+
+    pub fn bytes(&self) -> &[u8; 4096] {
+        // SAFETY: this value owns the frame: it holds the only reference
+        // count, `keel-hal` never maps a frame it handed out as an
+        // `OwnedFrame` (the inner `Frame` is private and never given back),
+        // and the frame stays allocated until `drop`. The HHDM maps it
+        // read-write; `[u8; 4096]` has alignment 1. The borrow of `self`
+        // bounds the reference's lifetime and excludes `bytes_mut`.
+        unsafe { &*frame_pointer(self.0).cast::<[u8; 4096]>() }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8; 4096] {
+        // SAFETY: as in `bytes`; `&mut self` makes this the only reference.
+        unsafe { &mut *frame_pointer(self.0).cast::<[u8; 4096]>() }
+    }
+}
+
+impl Drop for OwnedFrame {
+    fn drop(&mut self) {
+        let freed = release(self.0);
+        debug_assert_eq!(freed, Ok(true), "an owned frame has exactly one reference");
+    }
+}
+
+/// Self-test helper: a frame that has been freed is refused by the raw
+/// operations (it cannot be freed again and has no references). Returns
+/// whether that held. Safe code cannot attempt either itself.
+pub fn stale_frame_refused() -> bool {
+    let Some(frame) = allocate_zeroed() else {
+        return false;
+    };
+    let freed = release(frame) == Ok(true);
+    freed && release(frame).is_err() && references(frame) == 0 && retain(frame).is_err()
+}
+
 /// Allocates a frame and fills it with zeros before returning it, so no
 /// earlier contents can ever reach whoever maps it next (SR-18).
-pub fn allocate_zeroed() -> Option<Frame> {
+pub(crate) fn allocate_zeroed() -> Option<Frame> {
     let frame = FRAMES.lock().as_mut()?.allocate()?;
     // SAFETY: the frame was just allocated, so nobody else owns it; it is
     // in a `Usable` region, which the HHDM maps read-write; the write
@@ -176,7 +275,7 @@ pub fn set_user_reserve(frames: usize) -> usize {
 
 /// As [`allocate_zeroed`], for a page of user memory: fails once only the
 /// kernel's reserve is left. The first refusal is logged.
-pub fn allocate_zeroed_user() -> Option<Frame> {
+pub(crate) fn allocate_zeroed_user() -> Option<Frame> {
     let reserve = user_reserve();
     let frame = {
         let mut frames = FRAMES.lock();
@@ -202,7 +301,7 @@ pub fn allocate_zeroed_user() -> Option<Frame> {
 }
 
 /// Adds a reference to an allocated frame.
-pub fn retain(frame: Frame) -> Result<(), FrameError> {
+pub(crate) fn retain(frame: Frame) -> Result<(), FrameError> {
     FRAMES
         .lock()
         .as_mut()
@@ -211,7 +310,7 @@ pub fn retain(frame: Frame) -> Result<(), FrameError> {
 }
 
 /// Drops a reference; the frame is freed when the last one goes.
-pub fn release(frame: Frame) -> Result<bool, FrameError> {
+pub(crate) fn release(frame: Frame) -> Result<bool, FrameError> {
     FRAMES
         .lock()
         .as_mut()
@@ -224,32 +323,16 @@ pub fn free_frames() -> usize {
     FRAMES.lock().as_ref().map_or(0, |a| a.free_frames())
 }
 
-/// Runs `f` on the contents of an allocated frame. Fails for a frame the
-/// allocator does not currently have allocated.
-pub fn with_frame_bytes<R>(
-    frame: Frame,
-    f: impl FnOnce(&mut [u8; 4096]) -> R,
-) -> Result<R, FrameError> {
-    let guard = FRAMES.lock();
-    let allocator = guard.as_ref().ok_or(FrameError::NotAllocated)?;
-    if allocator.references(frame) == 0 {
-        return Err(FrameError::NotAllocated);
-    }
-    // SAFETY: the frame is allocated (checked above, under the lock, so it
-    // cannot be freed meanwhile) and HHDM-mapped read-write. Frames are
-    // never mapped as Rust objects elsewhere, so this unique reference does
-    // not alias a live Rust reference. `[u8; 4096]` has alignment 1.
-    let bytes = unsafe { &mut *frame_pointer(frame).cast::<[u8; 4096]>() };
-    Ok(f(bytes))
-}
-
 /// Reference count of a frame (0 if not allocated).
-pub fn references(frame: Frame) -> u16 {
+pub(crate) fn references(frame: Frame) -> u16 {
     FRAMES.lock().as_ref().map_or(0, |a| a.references(frame))
 }
 
 /// Copies the contents of allocated frame `from` into allocated frame `to`.
-pub fn copy_frame(from: Frame, to: Frame) -> Result<(), FrameError> {
+// Only the page-fault path (copy-on-write) calls this, and it exists only
+// for the kernel target, so a host build sees no caller.
+#[cfg_attr(not(target_os = "none"), expect(dead_code))]
+pub(crate) fn copy_frame(from: Frame, to: Frame) -> Result<(), FrameError> {
     let guard = FRAMES.lock();
     let allocator = guard.as_ref().ok_or(FrameError::NotAllocated)?;
     if allocator.references(from) == 0 || allocator.references(to) == 0 || from == to {

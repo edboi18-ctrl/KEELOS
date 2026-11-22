@@ -16,7 +16,7 @@ finding was re-checked there before it was fixed.
 
 | # | Status |
 | --- | --- |
-| 1 | Open |
+| 1 | Fixed (ADR 0009). Raw frame operations in `keel_hal::memory` are `pub(crate)`; `with_frame_bytes` is gone. Outside `keel-hal`, frames are `OwnedFrame` values: created only by the allocator, not `Copy`/`Clone`, freed on drop, contents through `&self`/`&mut self` with no lock held. `compile_fail` doctests show safe code cannot free a frame made from an address, use a handle after freeing it, or build one; the error codes were confirmed by hand. `frames.*` self-tests use the new API; `stale_frame_refused` covers the raw side. Also: `selftest::read_user_directly` now refuses non-user addresses. |
 | 2 | Open |
 | 3 | Fixed. `cargo xtask verify` derives `refs/tags/v<version>` from the artifact name (`verify::release_ref`: only `keel-<version>.img`, `-esp.zip`, `-notices.zip`, with `N.N.N` or `N.N.N-suffix` versions, as `release.yml`'s tag filters) and passes it as `--source-ref`; other names are refused before anything else. Unit tests for accepted and rejected names. Checked against `gh attestation verify --help` (gh 2.89.0). Still depends on the tag ruleset (finding 4). |
 | 4 | Agent part done: `.github/CODEOWNERS` covers `/xtask/` (on the working branch for the owner to merge, SR-36). Owner part open: sections 2 to 4 of `docs/REPOSITORY-SETUP.md` (branch and tag rulesets). CODEOWNERS has no effect until the branch ruleset requires code-owner review. |

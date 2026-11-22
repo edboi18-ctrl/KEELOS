@@ -188,10 +188,17 @@ pub fn overflow_stack(depth: u64) -> u64 {
 /// CR4.SMAP = 1 and RFLAGS.AC = 0 this must raise #PF even though the
 /// page is present (SDM Vol. 3 section 5.6, supervisor-mode access
 /// prevention). Used by the `smap` scenario; on a CPU without SMAP the
-/// read succeeds and the scenario reports failure.
-pub fn read_user_directly(address: u64) -> u8 {
-    // SAFETY: the read is expected to fault; it targets a mapped page of
-    // the active address space, so if SMAP were off it would read a valid
-    // byte. Only the `smap` scenario calls this.
-    unsafe { (address as *const u8).read_volatile() }
+/// read succeeds and the scenario reports failure. Refuses (returns
+/// `None`, reading nothing) any address outside the user half, so safe
+/// code cannot use it to read kernel memory (audit finding 1).
+pub fn read_user_directly(address: u64) -> Option<u8> {
+    if !crate::vm::user_range_ok(address, 1) {
+        return None;
+    }
+    // SAFETY: `address` is in the user half, where the kernel keeps no
+    // Rust objects: only user pages, which are frames, not Rust values.
+    // With SMAP on the read faults (the expected outcome); with SMAP off
+    // it reads one byte of a user page, or faults if none is mapped there,
+    // which the page-fault handler deals with like any kernel fault.
+    Some(unsafe { (address as *const u8).read_volatile() })
 }
