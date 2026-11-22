@@ -142,11 +142,11 @@ Keel's.
 
 | ID | Task | Status |
 | --- | --- | --- |
-| P2-T1 | PE parser (`user/pe`, `#![forbid(unsafe_code)]`): headers, sections, base relocations, imports; every offset and size checked; host tests and a malformed-file corpus | Not started |
+| P2-T1 | PE parser (`user/pe`, `#![forbid(unsafe_code)]`): headers, sections, base relocations, imports; every offset and size checked; host tests and a malformed-file corpus | Done. `no_std`, no allocation; one checked reader for every field; tables walked lazily with caps (96 sections, 256 DLLs, 4096 imports per DLL, 255-byte names). Refuses W+X sections, overlapping or misaligned sections, an entry point outside executable code, an image that does not fit the user half, and any relocation type other than ABSOLUTE and DIR64. Host tests: the real `hello.exe`, a builder for imports (by name and ordinal) and DIR64 relocations, one test per error class, 20,000 random inputs; `fuzz/pe-corpus/` holds 24 malformed files, each named after the error it must give. Removing the W+X or image-bounds check fails both the targeted test and the random-input test. |
 | P2-T2 | `peldr` (`user/peldr`): maps the image, relocates, resolves imports to the four stubs, applies section protections, fake TEB through `gs`, calls the entry point | Not started |
 | P2-T3 | `winetest/hello-console`: no-CRT Windows x64 `.exe` importing `GetStdHandle`, `WriteFile`, `ExitProcess` (`raw-dylib`), checked in as a pinned fixture with its build command | Done. Built with the pinned toolchain's `rust-lld` (lld-link mode), no Windows SDK; 2560 bytes, SHA-256 `7c09194a...b943b912`, reproducible (a clean rebuild gave the same hash). ADR 0013 records where `unsafe` may appear for Phase 2. Still to do by the owner: run it on Windows. |
 | P2-T4 | `cargo xtask test --phase 2`: `peldr /winetest/hello.exe` under Linux and on Keel; the exact line on serial and exit status 0 | Not started |
-| P2-S1 | Host fuzz target for the PE parser; 30 minutes with no crash | Not started |
+| P2-S1 | Host fuzz target for the PE parser; 30 minutes with no crash | Target done: `cargo xtask fuzz-pe --minutes N --seed S` (about 5.6 million inputs a minute; a panic writes the input to `target/fuzz-pe-crash.exe`, checked by breaking the parser on purpose). The 30-minute acceptance run is next. |
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
