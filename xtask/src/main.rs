@@ -11,6 +11,7 @@ mod fetch;
 mod fuzzpe;
 mod limine;
 mod qemu;
+mod syscalls;
 mod util;
 mod verify;
 
@@ -42,6 +43,9 @@ Commands:
                             kernel finishes a normal boot
   verify <file>             Check a downloaded release artifact: SHA256SUMS
                             entry and GitHub build-provenance attestation
+  syscalls <trace> [--counts FILE] [--out FILE] [--source TEXT]
+                            Write the system-call inventory (default
+                            docs/syscalls.md) from an strace -f trace
   audit [--offline]         Format, lint, unsafe count, licenses, workflow
                             policy, dependency advisories
 
@@ -186,6 +190,23 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("verify needs exactly one file path".into());
             }
             verify::verify(std::path::Path::new(&args[0]))
+        }
+        "syscalls" => {
+            let counts = take_value(&mut args, "--counts")?;
+            let out = take_value(&mut args, "--out")?
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| util::workspace_root().join("docs/syscalls.md"));
+            let source = take_value(&mut args, "--source")?
+                .unwrap_or_else(|| "an strace -f trace".to_string());
+            if args.len() != 1 {
+                return Err("syscalls needs exactly one trace path".into());
+            }
+            syscalls::syscalls(
+                std::path::Path::new(&args[0]),
+                counts.as_deref().map(std::path::Path::new),
+                &out,
+                &source,
+            )
         }
         "audit" => {
             let offline = take_flag(&mut args, "--offline");
