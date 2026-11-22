@@ -22,7 +22,7 @@ finding was re-checked there before it was fixed.
 | 4 | Open (settings: owner) |
 | 5 | Open |
 | 6 | Fixed. The same check over all 20 `asm!` blocks on the working branch that claim `preserves_flags` found two more: `xrstor64` and `fxrstor64` in `fpu.rs` load the x87 status word and MXCSR, which that option also covers (the Rust Reference, asm.rules.preserved-registers). All three no longer claim it. |
-| 7 | Guard pages: done in P1-T4. Recursion guard: open |
+| 7 | Fixed. Guard pages were done in P1-T4. Recursion: `idt::fatal` and the panic handler each set a flag on first entry; a nested entry prints one fixed line to COM1 (no formatting, no framebuffer) and halts, or exits QEMU in test mode. Scenario `fault_in_panic` panics, then faults inside the panic handler; it hangs (180 s timeout) with the panic handler's guard disabled. |
 | 8 | Open; now more important, since KASLR (P1-S5) is on and the kernel base is still printed |
 
 ## Scope and limits

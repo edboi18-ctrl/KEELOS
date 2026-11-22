@@ -21,7 +21,7 @@
 use core::arch::{asm, global_asm};
 #[cfg(target_os = "none")]
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use super::gdt::DescriptorTablePointer;
@@ -306,6 +306,11 @@ static FATAL_VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
 static FATAL_FRAME: AtomicU64 = AtomicU64::new(0);
 static FATAL_ERROR_CODE: AtomicU64 = AtomicU64::new(0);
 static FATAL_CR2: AtomicU64 = AtomicU64::new(0);
+/// Set on the first entry to `fatal`. A fault while the dump is being
+/// printed (or later, in the panic handler) re-enters `fatal`; without
+/// this it would print again, fault again, and never halt (audit
+/// finding 7).
+static FATAL_ENTERED: AtomicBool = AtomicBool::new(false);
 
 /// The fatal exception that caused the current panic, if any.
 pub fn last_fatal_exception() -> Option<FatalException> {
@@ -364,6 +369,11 @@ fn dispatch_kernel(frame: &mut TrapFrame) {
 
 #[cfg(target_os = "none")]
 fn fatal(frame: &TrapFrame) -> ! {
+    if FATAL_ENTERED.swap(true, Ordering::AcqRel) {
+        // Nested: keep the first fault's record and print nothing that
+        // could fault again; the panic handler's own guard halts.
+        panic!("fault inside the fatal path");
+    }
     // CR2 matters for #PF and for a #DF caused by a page fault (such as a
     // stack running into its guard page).
     let cr2 = if matches!(frame.vector, 8 | 14) {

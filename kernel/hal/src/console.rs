@@ -123,6 +123,15 @@ pub fn emergency_print(args: fmt::Arguments) {
     }
 }
 
+/// Writes `text` to COM1 only, with no formatting and no framebuffer: the
+/// last-resort output of a nested panic. Port I/O cannot fault.
+pub fn emergency_serial(text: &str) {
+    // SAFETY: as in `emergency_print`.
+    let mut serial = unsafe { SerialPort::new(COM1_BASE) };
+    serial.init();
+    let _ = serial.write_str(text);
+}
+
 /// Prints to the kernel console without a trailing newline.
 #[macro_export]
 macro_rules! kprint {

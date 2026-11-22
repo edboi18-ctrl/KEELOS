@@ -19,6 +19,8 @@ use keel_hal::{console, interrupts, kprintln, memory, sched, time};
 /// Set once the command line asked for self-tests, so that a panic can
 /// report failure to the test harness instead of hanging until timeout.
 static TEST_MODE: AtomicBool = AtomicBool::new(false);
+/// Set on the first entry to the panic handler (audit finding 7).
+static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// Kernel entry point, named by `ENTRY(kmain)` in `linker.ld`.
 ///
@@ -261,10 +263,23 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
 /// stops. In self-test mode the failure is reported to QEMU first.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    if PANICKING.swap(true, Ordering::AcqRel) {
+        // A fault or panic while panicking. Formatting or the framebuffer
+        // may be what failed, so write one fixed line and stop.
+        if TEST_MODE.load(Ordering::Relaxed) {
+            selftest::judge_nested_panic();
+        }
+        console::emergency_serial("\n*** KEEL KERNEL PANIC while panicking; halted ***\n");
+        if TEST_MODE.load(Ordering::Relaxed) {
+            exit_qemu(ExitCode::Failure);
+        }
+        halt_forever();
+    }
     if TEST_MODE.load(Ordering::Relaxed) {
         // A scenario that ends in a deliberate fatal exception judges the
         // outcome here and exits QEMU itself.
         selftest::judge_expected_fault();
+        selftest::fault_in_panic_if_requested();
     }
     console::emergency_print(format_args!("\n*** KEEL KERNEL PANIC ***\n{info}\n"));
     if TEST_MODE.load(Ordering::Relaxed) {

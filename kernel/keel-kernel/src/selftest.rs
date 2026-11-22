@@ -55,6 +55,7 @@ pub enum Scenario {
     ExecuteData = 3,
     StackOverflow = 4,
     Smap = 5,
+    FaultInPanic = 6,
     Unknown = 255,
 }
 
@@ -70,6 +71,7 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
         Some("execute_data") => Scenario::ExecuteData,
         Some("stack_overflow") => Scenario::StackOverflow,
         Some("smap") => Scenario::Smap,
+        Some("fault_in_panic") => Scenario::FaultInPanic,
         Some(_) => Scenario::Unknown,
     }
 }
@@ -129,6 +131,31 @@ pub fn judge_expected_fault() {
         console::emergency_print(format_args!(
             "TEST {name} PASS {detail}\nTEST SUMMARY passed=1 failed=0\n"
         ));
+        exit_qemu(ExitCode::Success);
+    }
+}
+
+/// The `fault_in_panic` scenario's second step: called by the panic
+/// handler after its first message, it faults (a write to kernel text,
+/// #PF), so the fatal path and the panic handler are entered again.
+pub fn fault_in_panic_if_requested() {
+    if ACTIVE_SCENARIO.load(Ordering::Relaxed) == Scenario::FaultInPanic as u8 {
+        hw::write_to_kernel_text();
+    }
+}
+
+/// Judges `fault_in_panic` on the nested entry to the panic handler: it
+/// passes if that entry came from the deliberate #PF and was reached at
+/// all (without the guards the kernel faults and prints forever). Uses
+/// only fixed strings: formatting is not trusted here.
+pub fn judge_nested_panic() {
+    if ACTIVE_SCENARIO.load(Ordering::Relaxed) != Scenario::FaultInPanic as u8 {
+        return;
+    }
+    if idt::last_fatal_exception().is_some_and(|f| f.vector == 14) {
+        console::emergency_serial(
+            "TEST panic.nested_fault_halts PASS a fault inside the panic handler ends in one short message and a halt\nTEST SUMMARY passed=1 failed=0\n",
+        );
         exit_qemu(ExitCode::Success);
     }
 }
@@ -200,6 +227,11 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
                 false,
                 "the direct read of user memory did not fault",
             );
+        }
+        (1, Scenario::FaultInPanic) => {
+            ACTIVE_SCENARIO.store(Scenario::FaultInPanic as u8, Ordering::Relaxed);
+            kprintln!("selftest: panicking, then faulting inside the panic handler");
+            panic!("deliberate panic for the fault_in_panic scenario");
         }
         (1, Scenario::ExecuteData) => {
             ACTIVE_SCENARIO.store(Scenario::ExecuteData as u8, Ordering::Relaxed);

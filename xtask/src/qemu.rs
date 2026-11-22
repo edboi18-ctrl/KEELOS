@@ -50,6 +50,7 @@ pub const PHASES: &[Phase] = &[
             "execute_data",
             "stack_overflow",
             "smap",
+            "fault_in_panic",
         ],
         // Phase 1 acceptance item 1: the musl fixture's output reaches
         // serial (it runs as PID 1; the kernel checks PID and status).

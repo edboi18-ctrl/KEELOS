@@ -139,8 +139,9 @@ Hardening notes for later Phase 1 work:
   read back from the framebuffer, plus `sr27.tamper.kernel` and
   `sr27.tamper.initramfs` (Limine refuses a one-byte change).
 - `cargo xtask test --phase 1`: 87 in-kernel tests pass and `KEEL P1 OK`
-  is on serial; the five fault scenarios (`double_fault`,
-  `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`) pass; the
+  is on serial; the six fault scenarios (`double_fault`,
+  `write_kernel_text`, `execute_data`, `stack_overflow`, `smap`,
+  `fault_in_panic`) pass; the
   boots land at different kernel addresses (KASLR); and the user test
   programs, `musl-hello` and `heap64` pass under Linux too. Checked to
   fail when the marker is not printed.
