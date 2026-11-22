@@ -5,8 +5,6 @@
 
 extern crate alloc;
 
-mod exec;
-mod fs;
 mod selftest;
 
 use core::panic::PanicInfo;
@@ -129,7 +127,9 @@ extern "C" fn kmain() -> ! {
     }
     interrupts::enable();
 
-    match fs::init() {
+    // The Linux system calls and process teardown (P1-T13).
+    keel_linux_abi::syscall::init();
+    match keel_linux_abi::fs::init() {
         Ok(r) => kprintln!(
             "fs: initramfs {} bytes, {} members unpacked into tmpfs ({} unsupported skipped); /dev has console, null, zero, urandom",
             r.archive_bytes,

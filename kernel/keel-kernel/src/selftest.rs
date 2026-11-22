@@ -859,9 +859,9 @@ pub fn phase1_vm(t: &mut Runner) {
 /// P1-T12: the root filesystem built at boot from the initramfs, path
 /// lookup, and the device nodes.
 pub fn phase1_fs(t: &mut Runner) {
-    use crate::fs;
     use keel_core::errno::Errno;
     use keel_core::vfs::{Device, Kind, ROOT, S_IFCHR, S_IFMT};
+    use keel_linux_abi::fs;
 
     let release = fs::read_file(b"/etc/keel-release");
     t.check(
@@ -943,10 +943,10 @@ pub fn phase1_fs(t: &mut Runner) {
 /// checked from inside a real static executable (`user/tests`, built by
 /// xtask into the initramfs of test builds).
 pub fn phase1_exec(t: &mut Runner) {
-    use crate::exec::{self, LoadError};
     use keel_core::elf::{ElfError, PF_R, PF_W, PF_X, PT_LOAD};
+    use keel_linux_abi::exec::{self, LoadError};
 
-    let file = crate::fs::read_file(b"/test/startup");
+    let file = keel_linux_abi::fs::read_file(b"/test/startup");
     t.check(
         "fs.test_program",
         file.is_ok(),
@@ -960,10 +960,9 @@ pub fn phase1_exec(t: &mut Runner) {
     const PATH: &[u8] = b"/test/startup";
     let run = |argv: &[&[u8]]| {
         let loaded = exec::load(file, PATH, argv, &[b"KEEL_TEST=1"]).ok()?;
-        let id =
-            sched::spawn_user("startup", loaded.space.clone(), loaded.entry, loaded.rsp, 0).ok()?;
-        sched::join(id);
-        Some((sched::exit_status(id)?, loaded))
+        let spawned = keel_linux_abi::process::spawn("startup", &loaded).ok()?;
+        sched::join(spawned.thread);
+        Some((sched::exit_status(spawned.thread)?, loaded))
     };
     let passed = run(&[PATH, b"alpha"]);
     t.check(
@@ -996,6 +995,35 @@ pub fn phase1_exec(t: &mut Runner) {
         "exec.exit_status",
         run(&[PATH, b"beta"]).is_some_and(|((status, _), _)| status == 5),
         "a failed check inside the program comes back as its exit status",
+    );
+
+    // P1-T13, P1-S1 and security acceptance item 2: the first system
+    // calls, rights on handles, and the hostile-pointer sweep, checked by
+    // a program that passes the same checks under Linux (`host.syscalls`).
+    let syscalls = keel_linux_abi::fs::read_file(b"/test/syscalls")
+        .ok()
+        .and_then(|file| {
+            let loaded = exec::load(&file, b"/test/syscalls", &[b"/test/syscalls"], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("syscalls", &loaded).ok()?;
+            sched::join(spawned.thread);
+            sched::exit_status(spawned.thread)
+        });
+    t.check(
+        "syscalls.conformance",
+        syscalls == Some((0, None)),
+        "write, writev, read, openat, close, fstat, mmap, mprotect, munmap, brk, arch_prctl, set_tid_address, clock_gettime, getrandom, ioctl behave as on Linux, and every pointer argument refuses hostile addresses with EFAULT",
+    );
+    if let Some((status, fault)) = syscalls
+        && (status != 0 || fault.is_some())
+    {
+        kprintln!(
+            "  syscalls: exit status {status} (number of the first failed check), fault {fault:?}"
+        );
+    }
+    t.check(
+        "process.teardown",
+        keel_linux_abi::process::count() == 0,
+        "every process is gone once its thread has exited",
     );
 
     // Malformed files are refused before anything runs.

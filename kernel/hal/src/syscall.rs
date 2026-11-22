@@ -1,48 +1,49 @@
-//! System-call dispatch and user-fault handling (P1-T10).
+//! System-call dispatch and user-fault handling (P1-T10, P1-T13).
 //!
-//! Follows the Linux x86-64 convention (`man 2 syscall`): number in RAX,
-//! arguments in RDI, RSI, RDX, R10, R8, R9, result in RAX, RCX and R11
-//! clobbered. Errors are returned as -errno.
-//!
-//! P1-T10 provides only what is needed to test the user-mode path: exit,
-//! exit_group, and one Keel test call. The Linux system calls themselves
-//! arrive with P1-T13 in `keel-linux-abi`. Every other number fails with
-//! ENOSYS and is logged once (SR-10: fail closed).
-
-use alloc::collections::BTreeSet;
+//! The hardware layer only moves registers: the Linux x86-64 convention
+//! (`man 2 syscall`) puts the number in RAX and arguments in RDI, RSI,
+//! RDX, R10, R8, R9, and the result (or -errno) in RAX. What each call
+//! means is decided by the handler that `linux-abi` registers at boot, in
+//! safe Rust. Without a handler every call fails with ENOSYS (SR-10).
 
 use crate::arch::x86_64::idt::{TrapFrame, exception_name};
 use crate::sched;
 use crate::sync::IrqMutex;
 
-/// Linux x86-64 `exit` and `exit_group`
-/// (arch/x86/entry/syscalls/syscall_64.tbl: 60 and 231).
-pub const SYS_EXIT: u64 = 60;
-pub const SYS_EXIT_GROUP: u64 = 231;
-/// Keel test call, outside the Linux range: returns its first argument
-/// plus one. Removed when the real system-call table lands.
-pub const SYS_KEEL_TEST_ADD_ONE: u64 = 0x1000;
-
 /// Linux errno ENOSYS (include/uapi/asm-generic/errno.h: 38).
 const ENOSYS: i64 = 38;
 
-static LOGGED: IrqMutex<BTreeSet<u64>> = IrqMutex::new(BTreeSet::new());
+/// One system call as the handler sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct SyscallArgs {
+    pub number: u64,
+    pub args: [u64; 6],
+}
+
+/// The registered system-call handler: arguments in, RAX out.
+pub type Handler = fn(&SyscallArgs) -> i64;
+
+static HANDLER: IrqMutex<Option<Handler>> = IrqMutex::new(None);
+
+/// Registers the system-call handler. Call once at boot.
+pub fn set_handler(handler: Handler) {
+    *HANDLER.lock() = Some(handler);
+}
 
 /// Handles a SYSCALL; the result goes into the frame's RAX.
 pub(crate) fn dispatch(frame: &mut TrapFrame) {
-    let number = frame.rax;
-    let result: i64 = match number {
-        SYS_EXIT | SYS_EXIT_GROUP => sched::exit_with(frame.rdi as i32 as i64),
-        SYS_KEEL_TEST_ADD_ONE => frame.rdi.wrapping_add(1) as i64,
-        _ => {
-            if LOGGED.lock().insert(number) {
-                crate::console::emergency_print(format_args!(
-                    "syscall: unimplemented {} (args {:#x} {:#x} {:#x}) -> ENOSYS\n",
-                    number, frame.rdi, frame.rsi, frame.rdx
-                ));
-            }
-            -ENOSYS
-        }
+    let call = SyscallArgs {
+        number: frame.rax,
+        args: [
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ],
+    };
+    // Copy the handler out so the lock is not held during the call, which
+    // may block or switch threads.
+    let handler = *HANDLER.lock();
+    let result = match handler {
+        Some(handler) => handler(&call),
+        None => -ENOSYS,
     };
     frame.rax = result as u64;
 }

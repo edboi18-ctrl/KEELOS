@@ -93,12 +93,20 @@ pub struct TestProgram {
     pub env: &'static [(&'static str, &'static str)],
 }
 
-pub const TEST_PROGRAMS: &[TestProgram] = &[TestProgram {
-    path: "test/startup",
-    binary: "startup",
-    args: &["alpha"],
-    env: &[("KEEL_TEST", "1")],
-}];
+pub const TEST_PROGRAMS: &[TestProgram] = &[
+    TestProgram {
+        path: "test/startup",
+        binary: "startup",
+        args: &["alpha"],
+        env: &[("KEEL_TEST", "1")],
+    },
+    TestProgram {
+        path: "test/syscalls",
+        binary: "syscalls",
+        args: &[],
+        env: &[],
+    },
+];
 
 /// Compiles the user test programs (static, non-PIE ELF executables for
 /// the Linux x86-64 ABI) and returns the path of each, in `TEST_PROGRAMS`

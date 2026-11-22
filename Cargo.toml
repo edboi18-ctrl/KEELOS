@@ -4,6 +4,7 @@ members = [
     "xtask",
     "kernel/hal",
     "kernel/core",
+    "kernel/linux-abi",
     "kernel/keel-kernel",
     "user/keel-rt",
     "user/tests",
@@ -11,7 +12,7 @@ members = [
 # Plain `cargo build` / `cargo test` on the host only touch host-buildable
 # crates. The kernel and the user programs are built for x86_64-unknown-none
 # by `cargo xtask`.
-default-members = ["xtask", "kernel/hal", "kernel/core"]
+default-members = ["xtask", "kernel/hal", "kernel/core", "kernel/linux-abi"]
 
 [workspace.package]
 edition = "2024"

@@ -10,6 +10,11 @@ name = "startup"
 test = false
 bench = false
 
+[[bin]]
+name = "syscalls"
+test = false
+bench = false
+
 [dependencies]
 keel-rt = { path = "../keel-rt" }
 

@@ -288,6 +288,38 @@ pub unsafe fn syscall3(number: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     result as i64
 }
 
+/// A raw system call with up to six arguments.
+///
+/// # Safety
+/// As [`syscall3`].
+pub unsafe fn syscall6(number: u64, a: [u64; 6]) -> i64 {
+    let result: u64;
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: RAX = number; RDI, RSI, RDX, R10, R8, R9 = arguments
+    //   (`man 2 syscall`: the fourth argument goes in R10, not RCX, because
+    //   SYSCALL overwrites RCX).
+    // Instruction and exit state: as in `syscall3`.
+    // SAFETY: the caller's contract.
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number => result,
+            in("rdi") a[0],
+            in("rsi") a[1],
+            in("rdx") a[2],
+            in("r10") a[3],
+            in("r8") a[4],
+            in("r9") a[5],
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result as i64
+}
+
+pub mod sys;
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     write(2, b"keel-rt: panic\n");

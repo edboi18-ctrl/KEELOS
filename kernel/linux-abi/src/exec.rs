@@ -61,6 +61,8 @@ pub struct Loaded {
     pub rsp: u64,
     /// Quality of the AT_RANDOM bytes.
     pub random: Quality,
+    /// First page after the image: where the program break starts (brk).
+    pub brk_start: u64,
 }
 
 /// Loads `file` into a new address space. On error nothing is left
@@ -121,5 +123,6 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
         entry: image.entry + bias,
         rsp: initial.rsp,
         random: quality,
+        brk_start: image.span().1 + bias,
     })
 }

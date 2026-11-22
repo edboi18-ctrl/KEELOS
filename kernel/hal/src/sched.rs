@@ -56,6 +56,10 @@ struct Thread {
     space: Option<Arc<AddressSpace>>,
     /// First user-mode RIP, RSP and RDI, consumed by `user_thread_start`.
     user_entry: Option<(u64, u64, u64)>,
+    /// User FS and GS base addresses (arch_prctl), loaded into the MSRs
+    /// whenever this thread is switched in. The kernel never uses FS or GS
+    /// itself (ADR 0005), so these need no saving on kernel entry.
+    user_bases: [u64; 2],
 }
 
 /// How a user thread's last exception looked, for tests and diagnostics.
@@ -117,6 +121,7 @@ pub fn init() -> Result<(), SchedError> {
         fpu: FpuState::new().ok_or(SchedError::OutOfMemory)?,
         space: None,
         user_entry: None,
+        user_bases: [0; 2],
     });
     let mut sched = Scheduler {
         threads: BTreeMap::new(),
@@ -151,6 +156,7 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         fpu: FpuState::new().ok_or(SchedError::OutOfMemory)?,
         space: None,
         user_entry: None,
+        user_bases: [0; 2],
     }))
 }
 
@@ -278,6 +284,71 @@ pub fn sleep_ms(ms: u64) {
     schedule(State::Sleeping { until_ns });
 }
 
+/// Called with the thread's ID whenever a thread exits, before it stops
+/// running (process teardown in `linux-abi`).
+static EXIT_HOOK: IrqMutex<Option<fn(ThreadId)>> = IrqMutex::new(None);
+
+/// Registers the exit hook. Call once at boot.
+pub fn set_exit_hook(hook: fn(ThreadId)) {
+    *EXIT_HOOK.lock() = Some(hook);
+}
+
+/// Which user segment base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentBase {
+    Fs = 0,
+    Gs = 1,
+}
+
+/// Why a segment base was not set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseError {
+    /// The address is not in the user half.
+    NotUserAddress,
+    /// The running thread has no user address space.
+    NotUserThread,
+}
+
+/// Sets the running thread's user FS or GS base (arch_prctl). Refused
+/// unless `value` is in the user half, so the MSR write can never fault
+/// and no thread can point a segment at kernel memory.
+pub fn set_user_base(which: SegmentBase, value: u64) -> Result<(), BaseError> {
+    if value >= keel_core::vm::USER_END {
+        return Err(BaseError::NotUserAddress);
+    }
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else {
+        return Err(BaseError::NotUserThread);
+    };
+    let current = sched.current;
+    let thread = sched
+        .threads
+        .get_mut(&current)
+        .ok_or(BaseError::NotUserThread)?;
+    if thread.space.is_none() {
+        return Err(BaseError::NotUserThread);
+    }
+    thread.user_bases[which as usize] = value;
+    let msr = match which {
+        SegmentBase::Fs => cpu::IA32_FS_BASE,
+        SegmentBase::Gs => cpu::IA32_GS_BASE,
+    };
+    // SAFETY: `value` is below USER_END, so canonical (SDM Vol. 3 section
+    // 4.5.3); the base only affects FS/GS-relative accesses, which the
+    // kernel never makes.
+    unsafe { cpu::wrmsr(msr, value) };
+    Ok(())
+}
+
+/// The running thread's user FS or GS base.
+pub fn user_base(which: SegmentBase) -> u64 {
+    SCHED
+        .lock()
+        .as_ref()
+        .and_then(|s| s.threads.get(&s.current))
+        .map_or(0, |t| t.user_bases[which as usize])
+}
+
 /// Ends the running thread.
 pub fn exit() -> ! {
     exit_with(0)
@@ -286,6 +357,10 @@ pub fn exit() -> ! {
 /// Ends the running thread with an exit status.
 pub fn exit_with(status: i64) -> ! {
     let id = current().0;
+    let hook = *EXIT_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(ThreadId(id));
+    }
     let fault = FAULTS.lock().remove(&id);
     EXITED.lock().insert(id, (status, fault));
     schedule(State::Exited);
@@ -382,6 +457,15 @@ fn schedule(next_state: State) {
     let stack_top = next.stack.as_ref().map_or(0, |s| s.top);
     entry::set_current(kernel_cr3, user_cr3, stack_top);
     crate::vm::set_current(next.space.clone());
+    if next.space.is_some() {
+        // SAFETY: both values were checked to be user (hence canonical)
+        // addresses by `set_user_base`, or are 0, so WRMSR cannot fault
+        // (SDM Vol. 3 section 4.5.3).
+        unsafe {
+            cpu::wrmsr(cpu::IA32_FS_BASE, next.user_bases[0]);
+            cpu::wrmsr(cpu::IA32_GS_BASE, next.user_bases[1]);
+        }
+    }
     if cpu::read_cr3() & !0xFFF != kernel_cr3 {
         // SAFETY: every kernel view shares the kernel half, which maps all
         // kernel code, data and stacks, including both threads' stacks.

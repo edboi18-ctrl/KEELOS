@@ -166,6 +166,11 @@ pub const CR4_SMEP: u64 = 1 << 20;
 /// CR4.SMAP (bit 21): the kernel cannot access user pages unless
 /// RFLAGS.AC is set.
 pub const CR4_SMAP: u64 = 1 << 21;
+/// FS.Base and GS.Base MSRs (AMD APM Vol. 2, Table A-1: C000_0100h,
+/// C000_0101h; SDM Vol. 3 section 4.5.3: WRMSR to either raises #GP if the
+/// value is not canonical).
+pub const IA32_FS_BASE: u32 = 0xC000_0100;
+pub const IA32_GS_BASE: u32 = 0xC000_0101;
 /// IA32_EFER MSR address (AMD APM Vol. 2, Table A-1: C000_0080h).
 pub const IA32_EFER: u32 = 0xC000_0080;
 /// IA32_EFER.NXE (bit 11, SDM Vol. 3 Table 2-1 "IA32_EFER MSR

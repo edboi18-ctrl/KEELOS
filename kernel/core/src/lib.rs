@@ -13,6 +13,7 @@ pub mod errno;
 pub mod exec;
 
 pub mod frame;
+pub mod handle;
 pub mod paging;
 pub mod vfs;
 pub mod vm;

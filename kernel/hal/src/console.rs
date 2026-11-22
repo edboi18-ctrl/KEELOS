@@ -39,6 +39,15 @@ pub fn init_framebuffer() -> Option<(usize, usize)> {
     Some(size)
 }
 
+/// Text grid size of the framebuffer console as `(columns, rows)`, if it
+/// is running.
+pub fn framebuffer_size_chars() -> Option<(usize, usize)> {
+    FRAMEBUFFER
+        .lock()
+        .as_ref()
+        .map(|console| (console.cols(), console.rows()))
+}
+
 /// Cursor of the framebuffer console as `(column, row)`, if it is running.
 pub fn framebuffer_cursor() -> Option<(usize, usize)> {
     FRAMEBUFFER.lock().as_ref().map(TextConsole::cursor)

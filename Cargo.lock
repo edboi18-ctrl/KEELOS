@@ -134,6 +134,15 @@ version = "0.0.0"
 dependencies = [
  "keel-core",
  "keel-hal",
+ "keel-linux-abi",
+]
+
+[[package]]
+name = "keel-linux-abi"
+version = "0.0.0"
+dependencies = [
+ "keel-core",
+ "keel-hal",
 ]
 
 [[package]]
