@@ -10,9 +10,37 @@ None.
 
 ## Closed
 
-All four below were found on 2026-11-22 by the first sessions of the
-system-call fuzzer (`cargo xtask fuzz`, security acceptance P1 item 6),
-each a denial of service reachable from an unprivileged user program.
+F-0005 to F-0009 were found on 2026-11-22 by the system-call fuzzer
+(`cargo xtask fuzz`, security acceptance P1 item 6), each a denial of
+service reachable from an unprivileged user program.
+
+### F-0009: kernel address space for heap pages and stacks was never reused
+
+- Found: free frames after the first one-hour fuzz session were 120 below
+  their starting count. Per-run counters showed every address space freed
+  and the heap's pages flat; the missing frames were new kernel page
+  tables.
+- Problem: the kernel heap's page source and the kernel-stack allocator
+  were bump pointers that never reused address space (a known Phase 1
+  shortcut, listed under P1-T5). read(2) and write(2) allocate a 4 KiB
+  buffer per call, which used 8 KiB (with its guard page) of the 64 GiB
+  heap region for good: about 8.4 million calls, seconds of work on real
+  hardware, would exhaust it, after which every kernel allocation fails
+  (a kernel panic). Every thread likewise used 68 KiB of the stack region
+  for good (about a million threads). On the way, each new 2 MiB of
+  address space left a page-table frame behind.
+- Fix: `hal::va::VaRanges`: a bump pointer plus a fixed-size list of
+  freed ranges (1024; it may not allocate, as it runs under the heap
+  lock), best-fit reuse, merging of neighbours, and return of a top-most
+  range to the bump pointer. Every allocation keeps an unmapped guard page
+  after it; kernel stacks also keep one below (the region's first page is
+  never mapped). The heap and the kernel stacks each use one. Kernel page
+  tables are now bounded by the peak of live allocations.
+- Regression tests: `heap.va_reused` (100,000 page-sized allocations,
+  each freed: heap address space unchanged; 800,000 KiB with reuse
+  disabled), `sched.stack_va_reused` (300 threads: stack space unchanged;
+  20 MB with reuse disabled), host tests `va_ranges_reuse_freed_space` (a
+  million allocate/free cycles) and `va_ranges_merge_and_respect_the_end`.
 
 ### F-0008: system calls ran with interrupts disabled
 

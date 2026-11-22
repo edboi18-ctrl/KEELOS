@@ -146,6 +146,11 @@ impl Fs {
         }
     }
 
+    /// Bytes of file data held, and the number of nodes ever created.
+    pub fn usage(&self) -> (usize, usize) {
+        (self.bytes_used, self.nodes.len())
+    }
+
     fn node(&self, ino: Ino) -> Result<&Node, Errno> {
         self.nodes
             .get(ino as usize)

@@ -33,5 +33,6 @@ pub mod sync;
 pub mod syscall;
 #[cfg(target_os = "none")]
 pub mod time;
+pub mod va;
 #[cfg(target_os = "none")]
 pub mod vm;

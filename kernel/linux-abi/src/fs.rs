@@ -16,6 +16,11 @@ pub const TMPFS_LIMIT: usize = 256 << 20;
 
 static FS: IrqMutex<Option<Fs>> = IrqMutex::new(None);
 
+/// Bytes of file data in the tmpfs and its node count (reports).
+pub fn usage() -> (usize, usize) {
+    FS.lock().as_ref().map_or((0, 0), Fs::usage)
+}
+
 /// What `init` found.
 #[derive(Clone, Copy, Debug)]
 pub struct Report {

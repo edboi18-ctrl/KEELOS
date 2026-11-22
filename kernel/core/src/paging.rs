@@ -426,6 +426,22 @@ pub fn translate<A: TableAccess>(access: &mut A, root: Frame, virt: u64) -> Opti
     None
 }
 
+/// Number of page-table frames below `root` (not counting `root`).
+pub fn count_tables<A: TableAccess>(access: &mut A, root: Frame) -> u64 {
+    fn count<A: TableAccess>(access: &mut A, table: Frame, level: usize) -> u64 {
+        let mut n = 0;
+        for i in 0..512 {
+            let entry = access.table(table)[i];
+            let leaf = level == 3 || (level >= 1 && entry & HUGE != 0);
+            if entry & PRESENT != 0 && !leaf {
+                n += 1 + count(access, Frame::containing(entry & ADDRESS_MASK), level + 1);
+            }
+        }
+        n
+    }
+    count(access, root, 0)
+}
+
 /// Summary of a full walk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalkSummary {

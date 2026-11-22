@@ -486,7 +486,18 @@ fn map_fresh_pages(
 /// Start of the kernel-stack region.
 pub const KERNEL_STACKS_BASE: u64 = 0xffff_e000_0000_0000;
 const KERNEL_STACKS_SIZE: u64 = 64 << 30;
-static NEXT_STACK: AtomicU64 = AtomicU64::new(KERNEL_STACKS_BASE);
+/// Address space for kernel stacks, reused when a stack is freed (F-0009;
+/// before, every thread used 68 KiB of the region for good). Ranges
+/// start one page above the region base, which is never mapped: every
+/// range then has an unmapped page directly below it (the region base, or
+/// the guard page that follows the range below), which is the stack's
+/// guard. Lock order: taken before `TABLES`.
+static STACK_VA: crate::sync::IrqMutex<crate::va::VaRanges> = crate::sync::IrqMutex::new(
+    crate::va::VaRanges::new(KERNEL_STACKS_BASE + PAGE, KERNEL_STACKS_SIZE - PAGE),
+);
+/// Highest stack address handed out, for `is_kernel_stack_guard`, which
+/// runs on the fatal-fault path and so takes no lock.
+static STACK_HIGH: AtomicU64 = AtomicU64::new(KERNEL_STACKS_BASE);
 
 /// A kernel stack: mapped pages with an unmapped guard page directly
 /// below them (SR-17). Overflowing it faults on the guard page; the fault
@@ -507,18 +518,20 @@ impl KernelStack {
     }
 }
 
-/// Allocates a kernel stack of `pages` pages. Virtual space is not reused
-/// yet (64 GiB is far more than Phase 1 needs); frames are.
+/// Allocates a kernel stack of `pages` pages, with an unmapped guard
+/// page below it (and one above). Address space and frames are reused.
 pub fn map_kernel_stack(pages: u64) -> Option<KernelStack> {
-    let slot = pages.checked_add(1)?.checked_mul(PAGE)?;
-    let guard = NEXT_STACK.fetch_add(slot, Ordering::AcqRel);
-    let base = guard + PAGE;
+    let mut va = STACK_VA.lock();
+    let choice = va.choose(pages)?;
+    let base = choice.start;
     map_fresh_pages(
         base,
         pages,
         KERNEL_STACKS_BASE..KERNEL_STACKS_BASE + KERNEL_STACKS_SIZE,
     )
     .ok()?;
+    va.commit(choice);
+    STACK_HIGH.fetch_max(base + (pages + 1) * PAGE, Ordering::AcqRel);
     Some(KernelStack {
         base,
         top: base + pages * PAGE,
@@ -533,18 +546,38 @@ pub fn unmap_kernel_stack(stack: KernelStack) {
         return;
     }
     let root = Frame::containing(root);
-    let _guard = TABLES.lock();
-    let mut page = stack.base;
-    while page < stack.top {
-        unmap_locked(root, page);
-        page += PAGE;
+    let mut va = STACK_VA.lock();
+    {
+        let _guard = TABLES.lock();
+        let mut page = stack.base;
+        while page < stack.top {
+            unmap_locked(root, page);
+            page += PAGE;
+        }
     }
+    va.release(stack.base, (stack.top - stack.base) / PAGE);
+}
+
+/// Bytes of the kernel-stack region handed out so far (its high-water
+/// mark; F-0009's regression test).
+pub fn kernel_stack_space_used() -> u64 {
+    STACK_HIGH.load(Ordering::Acquire) - KERNEL_STACKS_BASE
 }
 
 /// Whether `address` is in the guard page of some kernel stack.
 pub fn is_kernel_stack_guard(address: u64) -> bool {
-    (KERNEL_STACKS_BASE..NEXT_STACK.load(Ordering::Acquire)).contains(&address)
+    (KERNEL_STACKS_BASE..STACK_HIGH.load(Ordering::Acquire)).contains(&address)
         && translate(address).is_none()
+}
+
+/// Page-table frames in the kernel's tables (leak checks).
+pub fn kernel_table_frames() -> u64 {
+    let root = ROOT.load(Ordering::Acquire);
+    if root == 0 {
+        return 0;
+    }
+    let _guard = TABLES.lock();
+    paging::count_tables(&mut DirectMapTables, Frame::containing(root))
 }
 
 /// Unmaps heap pages mapped by `map_heap_pages` and frees their frames.

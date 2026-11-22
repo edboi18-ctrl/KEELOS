@@ -92,6 +92,7 @@ impl AddressSpace {
             return Err(AsError::OutOfMemory);
         };
         tables.table(user_root)[511] = crate::arch::x86_64::paging::trampoline_pml4e();
+        LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(Arc::new(AddressSpace {
             root,
             user_root,
@@ -389,8 +390,16 @@ impl AddressSpace {
     }
 }
 
+/// Address spaces alive right now (leak checks).
+static LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn live_address_spaces() -> u64 {
+    LIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         for (_, frame) in core::mem::take(&mut self.inner.lock().parked) {
             let _ = memory::release(frame);
         }

@@ -178,42 +178,61 @@ unsafe impl<P: PageSource + Send> GlobalAlloc for LockedHeap<P> {
     }
 }
 
-/// The kernel's page source: a bump pointer through the kernel-heap
-/// region, one unmapped guard page after every mapping.
+/// The kernel's page source: [`crate::va::VaRanges`] over the kernel-heap region,
+/// one unmapped guard page after every mapping.
 #[cfg(target_os = "none")]
 pub struct KernelPages {
-    next: u64,
+    ranges: crate::va::VaRanges,
+    /// Pages mapped for the heap right now (frames it holds).
+    mapped: u64,
 }
 
 #[cfg(target_os = "none")]
 impl PageSource for KernelPages {
     fn map(&mut self, pages: usize) -> Option<NonNull<u8>> {
-        use crate::arch::x86_64::paging::{KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE, map_heap_pages};
-        let next = if self.next == 0 {
-            KERNEL_HEAP_BASE
-        } else {
-            self.next
-        };
-        let bytes = (pages as u64).checked_mul(PAGE as u64)?;
-        let after = next.checked_add(bytes)?.checked_add(PAGE as u64)?;
-        if after > KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE {
-            return None;
-        }
-        map_heap_pages(next, pages as u64).ok()?;
-        // Virtual space is not reused yet: 64 GiB is far more than Phase 1
-        // needs. Freed pages' frames do go back to the frame allocator.
-        self.next = after;
-        NonNull::new(next as *mut u8)
+        use crate::arch::x86_64::paging::map_heap_pages;
+        let choice = self.ranges.choose(pages as u64)?;
+        map_heap_pages(choice.start, pages as u64).ok()?;
+        self.ranges.commit(choice);
+        self.mapped += pages as u64;
+        NonNull::new(choice.start as *mut u8)
     }
 
     fn unmap(&mut self, first: NonNull<u8>, pages: usize) {
-        crate::arch::x86_64::paging::unmap_heap_pages(first.as_ptr() as u64, pages as u64);
+        let start = first.as_ptr() as u64;
+        crate::arch::x86_64::paging::unmap_heap_pages(start, pages as u64);
+        self.ranges.release(start, pages as u64);
+        self.mapped -= pages as u64;
     }
 }
 
 #[cfg(target_os = "none")]
 #[global_allocator]
-static KERNEL_HEAP: LockedHeap<KernelPages> = LockedHeap::new(KernelPages { next: 0 });
+static KERNEL_HEAP: LockedHeap<KernelPages> = LockedHeap::new(KernelPages {
+    ranges: crate::va::VaRanges::new(
+        crate::arch::x86_64::paging::KERNEL_HEAP_BASE,
+        crate::arch::x86_64::paging::KERNEL_HEAP_SIZE,
+    ),
+    mapped: 0,
+});
+
+/// Pages the heap holds mapped (and so frames it uses), small-class pages
+/// included (those are kept once taken).
+#[cfg(target_os = "none")]
+pub fn mapped_pages() -> u64 {
+    KERNEL_HEAP.0.lock().source.mapped
+}
+
+/// Bytes of heap address space used so far (its high-water mark) and
+/// pages of it that can no longer be reused (F-0009's regression test).
+#[cfg(target_os = "none")]
+pub fn address_space_usage() -> (u64, u64) {
+    let heap = KERNEL_HEAP.0.lock();
+    (
+        heap.source.ranges.used_bytes(),
+        heap.source.ranges.lost_pages(),
+    )
+}
 
 #[cfg(test)]
 mod tests {

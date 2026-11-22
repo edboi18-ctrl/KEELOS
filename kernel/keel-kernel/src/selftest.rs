@@ -1177,7 +1177,14 @@ fn fuzz_session(
         let seed_text = format!("{run_seed}");
         let args: [&[u8]; 3] = [PATH, seed_text.as_bytes(), calls.as_bytes()];
         if verbose {
-            kprintln!("fuzz: run {} seed {run_seed}", report.runs);
+            kprintln!(
+                "fuzz: run {} seed {run_seed}, {} free frames, heap {} pages, {} address spaces, {} kernel table frames",
+                report.runs,
+                memory::free_frames(),
+                keel_hal::heap::mapped_pages(),
+                keel_hal::vm::live_address_spaces(),
+                paging::kernel_table_frames()
+            );
         }
         let spawned = keel_linux_abi::exec::load(&file, PATH, &args, &[])
             .ok()
@@ -1244,6 +1251,7 @@ pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
     kprintln!("fuzz: {minutes} min from seed {seed}, {FUZZ_CALLS} calls per run");
     keel_linux_abi::syscall::set_slow_log(true);
     let frames_before = memory::free_frames();
+    let tmpfs_before = keel_linux_abi::fs::usage();
     let start = time::monotonic_nanos();
     let deadline = start.saturating_add(minutes.saturating_mul(60_000_000_000));
     let report = fuzz_session(seed, deadline, u64::MAX, FUZZ_CALLS, true);
@@ -1257,6 +1265,16 @@ pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
         report.worst_wake_ms,
         frames_before,
         memory::free_frames()
+    );
+    // Frames still in use afterwards should be what the fuzzer left in
+    // the tmpfs (file data and nodes live on the kernel heap).
+    let tmpfs_after = keel_linux_abi::fs::usage();
+    let (heap_used, heap_lost) = keel_hal::heap::address_space_usage();
+    kprintln!(
+        "fuzz: tmpfs grew by {} bytes of file data and {} nodes; heap address space {} KiB, {heap_lost} pages not reusable",
+        tmpfs_after.0 - tmpfs_before.0,
+        tmpfs_after.1 - tmpfs_before.1,
+        heap_used / 1024
     );
     runner.check(
         "fuzz.syscalls",
@@ -1314,6 +1332,53 @@ pub fn phase1_robustness(t: &mut Runner) {
     if let Some(ms) = huge {
         kprintln!("  64 TiB mprotect/mprotect/munmap: {ms} ms");
     }
+
+    // F-0009: freed large heap allocations give their address space back.
+    // 100,000 page-sized buffers allocated and freed one after another (as
+    // read(2) does per call) must not move the heap's high-water mark; the
+    // old bump pointer used 8 KiB per buffer, 800 MB here.
+    let (used_before, _) = keel_hal::heap::address_space_usage();
+    for i in 0..100_000u32 {
+        let buffer = alloc::vec![0u8; 4096];
+        core::hint::black_box(&buffer);
+        let _ = i;
+    }
+    let (used_after, lost) = keel_hal::heap::address_space_usage();
+    t.check(
+        "heap.va_reused",
+        used_after <= used_before + 64 * 1024,
+        "100,000 page-sized allocations, each freed, do not grow the heap's address space (F-0009)",
+    );
+    kprintln!(
+        "  heap address space: {} KiB before, {} KiB after, {lost} pages not reusable",
+        used_before / 1024,
+        used_after / 1024
+    );
+
+    // F-0009 also applied to kernel stacks: 300 threads started and
+    // finished one after another reuse the same stack address space (the
+    // old bump pointer used 68 KiB per thread, 20 MB here).
+    let stacks_before = paging::kernel_stack_space_used();
+    let mut started = 0;
+    for _ in 0..300 {
+        if let Ok(id) = sched::spawn("stack-reuse", || {}) {
+            join(id);
+            started += 1;
+        }
+    }
+    // Exited threads are reclaimed shortly after; let that happen.
+    sched::sleep_ms(50);
+    let stacks_after = paging::kernel_stack_space_used();
+    t.check(
+        "sched.stack_va_reused",
+        started == 300 && stacks_after - stacks_before <= 1 << 20,
+        "300 threads, one after another, reuse kernel stack address space (F-0009)",
+    );
+    kprintln!(
+        "  kernel stack space: {} KiB before, {} KiB after 300 threads",
+        stacks_before / 1024,
+        stacks_after / 1024
+    );
 
     // F-0007: user page faults never take the kernel's reserve.
     let old = memory::set_user_reserve(memory::free_frames() + 16);
