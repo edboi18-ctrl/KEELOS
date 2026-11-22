@@ -86,6 +86,7 @@ extern "C" fn kmain() -> ! {
     }
     // System calls and user-mode entry, with page-table isolation.
     keel_hal::arch::x86_64::entry::init(paging::kernel_root().map_or(0, |r| r.address()));
+    report_mitigations(&keel_hal::mitigations::init());
 
     let fpu = fpu::init();
     match fpu.xcr0 {
@@ -235,4 +236,42 @@ fn panic(info: &PanicInfo) -> ! {
         exit_qemu(ExitCode::Failure);
     }
     halt_forever();
+}
+
+/// The boot-time vulnerability report (P1-S4, SR-15): one line per item.
+fn report_mitigations(report: &keel_hal::mitigations::Report) {
+    use keel_core::cpuvuln::Status;
+    let c = &report.cpu;
+    kprintln!(
+        "cpu: {} family {:#x} model {:#x} stepping {:#x}{}; IA32_ARCH_CAPABILITIES {:#x}",
+        if c.intel { "Intel" } else { "non-Intel" },
+        c.family,
+        c.model,
+        c.stepping,
+        if c.hypervisor { " (virtualized)" } else { "" },
+        c.arch_capabilities
+    );
+    for item in &report.items {
+        let (kind, detail) = match item.status {
+            Status::NotAffected(d) => ("Not affected", d),
+            Status::Mitigated(d) => ("Mitigation", d),
+            Status::Vulnerable(d) => ("VULNERABLE", d),
+        };
+        kprintln!("vuln: {}: {kind}: {detail}", item.name);
+    }
+    if !report.spec_ctrl_written || !report.mcu_opt_written {
+        kprintln!(
+            "vuln: WARNING: the CPU rejected a mitigation MSR write (SPEC_CTRL {}, MCU_OPT_CTRL {}); IBRS and IBPB are off",
+            if report.spec_ctrl_written {
+                "ok"
+            } else {
+                "rejected"
+            },
+            if report.mcu_opt_written {
+                "ok"
+            } else {
+                "rejected"
+            }
+        );
+    }
 }

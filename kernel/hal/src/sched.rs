@@ -284,6 +284,17 @@ pub fn sleep_ms(ms: u64) {
     schedule(State::Sleeping { until_ns });
 }
 
+const IA32_PRED_CMD: u32 = 0x49;
+const PRED_CMD_IBPB: u64 = 1;
+static IBPB_ON_SWITCH: AtomicBool = AtomicBool::new(false);
+static LAST_USER_CR3: AtomicU64 = AtomicU64::new(0);
+
+/// Issues IBPB when switching between user address spaces (P1-S4). Only
+/// call with `true` if the CPU reports IBRS/IBPB (CPUID.(7,0):EDX[26]).
+pub fn set_ibpb_on_switch(enabled: bool) {
+    IBPB_ON_SWITCH.store(enabled, Ordering::Relaxed);
+}
+
 /// Called with the thread's ID whenever a thread exits, before it stops
 /// running (process teardown in `linux-abi`).
 static EXIT_HOOK: IrqMutex<Option<fn(ThreadId)>> = IrqMutex::new(None);
@@ -457,6 +468,17 @@ fn schedule(next_state: State) {
     let stack_top = next.stack.as_ref().map_or(0, |s| s.top);
     entry::set_current(kernel_cr3, user_cr3, stack_top);
     crate::vm::set_current(next.space.clone());
+    if next.space.is_some() && IBPB_ON_SWITCH.load(Ordering::Relaxed) {
+        // Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
+        // different user address space is about to run, so branch
+        // predictions trained by one process cannot steer another.
+        if LAST_USER_CR3.swap(user_cr3, Ordering::Relaxed) != user_cr3 {
+            // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
+            // enabled only after `set_ibpb_on_switch` checked CPUID for it.
+            // Writing it has no effect on memory.
+            unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
+        }
+    }
     if next.space.is_some() {
         // SAFETY: both values were checked to be user (hence canonical)
         // addresses by `set_user_base`, or are 0, so WRMSR cannot fault

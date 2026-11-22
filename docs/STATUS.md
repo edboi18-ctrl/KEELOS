@@ -54,7 +54,8 @@ to `main` with PR #1.
 | P1-S2 | NX, WP, SMEP, SMAP, UMIP; one checked user-copy API | Done. `hal::vm::copy_to_user`/`copy_from_user` are the only code that touches user memory: they check the range against the user half with checked arithmetic, lift SMAP (STAC/CLAC) only around one `rep movsb`, resolve demand-paging faults, and turn anything else into EFAULT through a fixup. Tests: bad-pointer sweep (kernel, null, unmapped, straddling, wrapping) and a `smap` scenario proving a direct kernel read of a present user page faults. Both the SMAP and no-SMAP routines are exercised. |
 | P1-S3 | Page-table isolation with a trampoline entry path | Done. Each address space has a kernel view and a user view; the user view's kernel half is one top-level entry mapping only `.text.keel_entry` (RX), `.data.keel_entry` and `.bss.keel_entry` (RW+NX). Every entry switches to the kernel view; every exit to user mode switches back from the trampoline stack. Always on until P1-S4 reads RDCL_NO; no PCIDs yet. Tests: `pti.user_view` (walks the user view: only trampoline pages, no W+X), `pti.kernel_absent` (user reads of kernel text, rodata, data, direct map and heap find no page). Finding F-0001 fixed on the way (`user.ac_cleared_on_entry`). |
 | P1-S1 | Object table with a rights mask from its first version; every syscall handler names the right it requires | Done. `keel-core::handle`: rights from SR-1's list, checked on every lookup, lowest-free descriptor allocation, duplicate only removes rights, per-process limit 1024 (host tests). The process table is a `HandleTable`; there is no other descriptor table. Rights per call in `docs/syscalls.md`. |
-| P1-S4 to P1-S7 | | Not started |
+| P1-S4 | Boot-time vulnerability report and mitigation selection; one log line per item | Done (ADR 0007). `keel-core::cpuvuln` assesses 17 items from CPUID, IA32_ARCH_CAPABILITIES and IA32_MCU_OPT_CTRL (host tests for the target with and without current microcode, newer CPUs, hypervisors, unknown models); `hal::mitigations` applies the plan: legacy IBRS on entry/exit (or enhanced IBRS once), SSBD, BHI_DIS_S when needed, IBPB between address spaces, RSB fill on every context switch, VERW before every return to user mode, SRBDS/GDS microcode controls on. Spectre v1: branch-free index masking for syscall numbers and descriptors. L1TF: no not-present entry holds bits (checked in every page-table walk). The boot log has one `vuln:` line per item; `cargo xtask test` prints them. Found and fixed on the way: F-0002. QEMU's emulator lacks the speculation-control features, so IBRS, IBPB and the MSR-fault path run only under KVM (CI) and on hardware. Not implemented: software BHB clearing and ITS mitigations (neither applies to the target). |
+| P1-S5 to P1-S7 | | Not started |
 
 Phase 1 security acceptance progress: item 2 (hostile-pointer sweep over
 every implemented syscall) is covered by `user/tests/syscalls`, on Keel
@@ -111,7 +112,7 @@ From `cargo xtask audit` (our code only; includes test code):
 
 | Crate | Blocks | Block lines | Declarations | Attributes |
 | --- | --- | --- | --- | --- |
-| `kernel/hal` | 120 | 365 | 37 | 15 |
+| `kernel/hal` | 127 | 381 | 39 | 16 |
 | `kernel/keel-kernel` | 0 | 0 | 0 | 1 |
 | `user/keel-rt` | 18 | 86 | 5 | 1 |
 
@@ -135,7 +136,9 @@ SYSCALL MSR setup, the entry/exit trampoline (`global_asm!`, one
 reasoning block), the user test programs, and loading CR3 for the
 two page-table views; then P1-T11: RDRAND in `hal::random`. then P1-T13: the
 FS/GS base MSR writes in `hal::sched`; then P1-T14: the i8042 port accesses
-and the keyboard callback conversion in `hal::drivers::ps2`. `user/keel-rt` is
+and the keyboard callback conversion in `hal::drivers::ps2`; then P1-S4: rdmsr_safe and
+wrmsr_safe, the mitigation MSR writes, IBPB, the cmp/sbb index mask,
+and the mitigation block in the trampoline data (one `link_section`). `user/keel-rt` is
 the user-space runtime (ADR 0006), plus `syscall6`, the internal wrappers
 of the safe `sys` module, and one FS-relative read for the FS-base test: `_start`, the initial-stack reader and
 the `syscall` wrapper. The single kernel item outside `hal` is `#[unsafe(no_mangle)]` on the kernel

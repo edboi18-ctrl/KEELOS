@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod cpio;
+pub mod cpuvuln;
 pub mod elf;
 pub mod errno;
 pub mod exec;

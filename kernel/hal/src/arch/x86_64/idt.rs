@@ -353,6 +353,11 @@ fn dispatch_kernel(frame: &mut TrapFrame) {
             // returning resumes execution (SDM section 7.15, Interrupt 3).
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
         }
+        // #GP from rdmsr_safe/wrmsr_safe: resume at their error return.
+        13 => match super::cpu::msr_fixup(frame.rip) {
+            Some(resume) => frame.rip = resume,
+            None => fatal(frame),
+        },
         _ => fatal(frame),
     }
 }

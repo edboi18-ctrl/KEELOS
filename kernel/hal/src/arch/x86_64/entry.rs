@@ -26,7 +26,7 @@
 
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::cpu;
 use super::gdt::{KERNEL_CS, USER_CS, USER_DS, USER_STAR_BASE};
@@ -59,6 +59,63 @@ static ENTRY_CPU: EntryCpu = EntryCpu {
     kernel_stack_top: AtomicU64::new(0),
     user_rsp: AtomicU64::new(0),
 };
+
+/// Speculation mitigations applied by the entry code (P1-S4, SR-15),
+/// chosen at boot by `keel_core::cpuvuln`. In the trampoline data, so the
+/// exit path can still read it after switching to the user view.
+#[repr(C)]
+pub struct EntryMitigations {
+    /// Non-zero: VERW before every return to user mode (offset 0).
+    verw: AtomicU8,
+    /// Non-zero: legacy IBRS, write IA32_SPEC_CTRL on entry and exit (1).
+    ibrs: AtomicU8,
+    /// Selector VERW checks: the kernel data segment, as Linux's
+    /// `mds_verw_sel` holds `__KERNEL_DS` (offset 2).
+    verw_selector: u16,
+    /// IA32_SPEC_CTRL while in the kernel and in user mode (low 32 bits;
+    /// every bit Keel uses is below bit 11) (offsets 4 and 8).
+    spec_ctrl_kernel: AtomicU32,
+    spec_ctrl_user: AtomicU32,
+}
+
+const _: () = assert!(core::mem::offset_of!(EntryMitigations, verw) == 0);
+const _: () = assert!(core::mem::offset_of!(EntryMitigations, ibrs) == 1);
+const _: () = assert!(core::mem::offset_of!(EntryMitigations, verw_selector) == 2);
+const _: () = assert!(core::mem::offset_of!(EntryMitigations, spec_ctrl_kernel) == 4);
+const _: () = assert!(core::mem::offset_of!(EntryMitigations, spec_ctrl_user) == 8);
+
+#[unsafe(link_section = ".data.keel_entry")]
+static MITIGATIONS: EntryMitigations = EntryMitigations {
+    verw: AtomicU8::new(0),
+    ibrs: AtomicU8::new(0),
+    verw_selector: super::gdt::KERNEL_DS,
+    spec_ctrl_kernel: AtomicU32::new(0),
+    spec_ctrl_user: AtomicU32::new(0),
+};
+
+/// Switches the entry-path mitigations on or off. Call with interrupts
+/// disabled or before user mode starts. `ibrs` must only be set when
+/// IA32_SPEC_CTRL exists (the entry code writes it unconditionally then).
+pub fn set_mitigations(verw: bool, ibrs: bool, spec_ctrl_kernel: u64, spec_ctrl_user: u64) {
+    MITIGATIONS
+        .spec_ctrl_kernel
+        .store(spec_ctrl_kernel as u32, Ordering::Relaxed);
+    MITIGATIONS
+        .spec_ctrl_user
+        .store(spec_ctrl_user as u32, Ordering::Relaxed);
+    MITIGATIONS.verw.store(u8::from(verw), Ordering::Relaxed);
+    MITIGATIONS.ibrs.store(u8::from(ibrs), Ordering::Release);
+}
+
+/// What `set_mitigations` stored: `(verw, ibrs, kernel, user)`.
+pub fn mitigations() -> (bool, bool, u64, u64) {
+    (
+        MITIGATIONS.verw.load(Ordering::Relaxed) != 0,
+        MITIGATIONS.ibrs.load(Ordering::Acquire) != 0,
+        u64::from(MITIGATIONS.spec_ctrl_kernel.load(Ordering::Relaxed)),
+        u64::from(MITIGATIONS.spec_ctrl_user.load(Ordering::Relaxed)),
+    )
+}
 
 const TRAMPOLINE_STACK_SIZE: usize = 4096;
 
@@ -117,16 +174,35 @@ pub const SYSCALL_VECTOR: u64 = 0x100;
 //      could set AC and have every kernel handler run with SMAP lifted
 //      (SDM Vol. 3 section 5.6: SMAP applies only while AC = 0). POPF is
 //      used rather than CLAC because CLAC raises #UD without SMAP.
-//      IF was already 0 (all gates are interrupt gates). Then call the
-//      Rust dispatcher with RDI = frame.
-//   keel_restore (RSP = frame): drop pad, pop the 14 registers.
+//      IF was already 0 (all gates are interrupt gates).
+//      Legacy IBRS (P1-S4, when MITIGATIONS.ibrs is set): write the
+//      kernel IA32_SPEC_CTRL value (MSR 48h; WRMSR takes ECX = MSR,
+//      EDX:EAX = value, SDM Vol. 2B "WRMSR"). RAX, RCX and RDX are already
+//      saved in the frame, and no RET has executed since entry, so
+//      indirect predictions trained in user mode cannot steer the kernel
+//      before IBRS is set (Linux does the same in IBRS_ENTER,
+//      arch/x86/entry/calling.h). Then call the Rust dispatcher with
+//      RDI = frame.
+//   keel_restore (RSP = frame): if returning to user mode with legacy
+//      IBRS, write the user IA32_SPEC_CTRL value first (CS is at frame
+//      offset 160). This is after the dispatcher's last RET, as Linux's
+//      IBRS_EXIT requires; RAX, RCX and RDX are restored below. Then drop
+//      pad, pop the 14 registers.
 //   5a. Return to kernel mode: reload the saved CR3 if it is not the
 //      kernel view (an NMI that interrupted entry or exit code), restore
 //      rax, drop 4 words, IRETQ.
 //   5b. Return to user mode: copy the 9 words to the top of the trampoline
 //      stack, switch RSP there, load the saved CR3 (the user view, which
-//      the dispatcher has set), restore rax, drop 4 words, IRETQ. After
-//      the CR3 load only trampoline pages are touched.
+//      the dispatcher has set), restore rax, drop 4 words. If
+//      MITIGATIONS.verw is set, VERW on the kernel data selector: on CPUs
+//      with the MD_CLEAR microcode this overwrites the buffers MDS, TAA
+//      and MMIO stale data leak from (Linux Documentation/arch/x86/
+//      mds.rst; CLEAR_CPU_BUFFERS in nospec-branch.h); otherwise it only
+//      sets ZF (SDM Vol. 2C "VERR/VERW"). Last, as Linux places it: after
+//      every register is restored. RFLAGS comes from the frame, so the
+//      flag changes do not matter. Then IRETQ. After the CR3 load only
+//      trampoline pages are touched (the selector is in MITIGATIONS, in
+//      `.data.keel_entry`).
 //
 // keel_syscall_entry: the SYSCALL target (IA32_LSTAR).
 //   Entry state: CPL 0 with user RSP, user CR3 (user view), interrupts off
@@ -207,11 +283,27 @@ global_asm!(
         push 0
         push 2
         popfq
+        cmp byte ptr [rip + {mit} + 1], 0
+        je 5f
+        mov ecx, 0x48
+        mov eax, dword ptr [rip + {mit} + 4]
+        xor edx, edx
+        wrmsr
+    5:
         mov rdi, rsp
         call {dispatch}
 
     .global keel_restore
     keel_restore:
+        test byte ptr [rsp + 160], 3
+        jz 6f
+        cmp byte ptr [rip + {mit} + 1], 0
+        je 6f
+        mov ecx, 0x48
+        mov eax, dword ptr [rip + {mit} + 8]
+        xor edx, edx
+        wrmsr
+    6:
         add rsp, 8
         pop r15
         pop r14
@@ -263,6 +355,10 @@ global_asm!(
         mov cr3, rax
         mov rax, qword ptr [rsp + 8]
         add rsp, 32
+        cmp byte ptr [rip + {mit}], 0
+        je 7f
+        verw word ptr [rip + {mit} + 2]
+    7:
         iretq
 
     .global keel_syscall_entry
@@ -290,6 +386,7 @@ global_asm!(
     .popsection
     "#,
     cpu = sym ENTRY_CPU,
+    mit = sym MITIGATIONS,
     tramp = sym TRAMPOLINE_STACK,
     tramp_size = const TRAMPOLINE_STACK_SIZE,
     dispatch = sym super::idt::exception_dispatch,

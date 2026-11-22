@@ -332,6 +332,7 @@ fn phase1(t: &mut Runner) {
     phase1_user(t);
     phase1_fs(t);
     phase1_exec(t);
+    phase1_mitigations(t);
 }
 
 /// P1-T3 and SR-18: frames come out distinct, page-aligned, inside usable
@@ -1139,6 +1140,91 @@ pub fn phase1_prot_none(t: &mut Runner) {
         "l1tf.no_stale_entries",
         paging::walk().is_some_and(|w| w.nonpresent_nonzero == 0),
         "no not-present page-table entry in the kernel's tables holds any bits (L1TF)",
+    );
+}
+
+/// P1-S4: the vulnerability report covers every item, the chosen plan is
+/// what the entry code uses, and the exit path with VERW still returns to
+/// user mode correctly. (IBRS and IBPB need a CPU that has them: QEMU's
+/// emulator does not, so CI checks them under KVM.)
+pub fn phase1_mitigations(t: &mut Runner) {
+    use keel_hal::arch::x86_64::entry;
+    let info = keel_hal::mitigations::cpu_info();
+    let (plan, items) = keel_core::cpuvuln::assess(&info);
+    let names = [
+        "Meltdown",
+        "Spectre v1",
+        "Spectre v2",
+        "Retbleed",
+        "Spectre v2 between processes",
+        "SpectreRSB",
+        "BHI",
+        "Speculative Store Bypass",
+        "L1TF",
+        "MDS",
+        "TAA",
+        "MMIO stale data",
+        "SRBDS",
+        "GDS",
+        "ITS",
+        "RFDS",
+        "SMT",
+    ];
+    t.check(
+        "vuln.report_complete",
+        names.iter().all(|n| items.iter().any(|i| i.name == *n)),
+        "the boot report has a line for every item SR-15 and Linux's hw-vuln list name",
+    );
+    let (verw, ibrs, kernel, _) = entry::mitigations();
+    let spec_ctrl_ok =
+        !plan.spec_ctrl || keel_hal::mitigations::spec_ctrl_now() == Some(plan.spec_ctrl_kernel);
+    t.check(
+        "vuln.plan_applied",
+        verw == plan.verw_on_exit
+            && ibrs == plan.ibrs_on_entry
+            && kernel == plan.spec_ctrl_kernel
+            && spec_ctrl_ok,
+        "the entry code uses the chosen mitigations, and IA32_SPEC_CTRL holds the kernel value",
+    );
+    // The #GP fixup behind rdmsr_safe/wrmsr_safe: an MSR index in an
+    // unassigned range (0xC000_2000; Intel and AMD define nothing there)
+    // must fault and come back as an error, not as a kernel crash.
+    // rdmsr_safe reads what the plain RDMSR reads, and survives an MSR
+    // that does not exist. 0xC000_2000 is in a range Intel and AMD leave
+    // unassigned: real CPUs and KVM raise #GP there (the fixup turns it
+    // into None); QEMU's emulator (TCG) returns 0 for any unknown MSR
+    // without faulting (target/i386/tcg/sysemu/misc_helper.c, "XXX:
+    // exception?"), which only a virtualized CPU may show.
+    use keel_hal::arch::x86_64::cpu as hw_cpu;
+    let efer_ok = hw_cpu::rdmsr_safe(hw_cpu::IA32_EFER) == Some(hw_cpu::read_efer());
+    let missing = hw_cpu::rdmsr_safe(0xC000_2000);
+    t.check(
+        "cpu.msr_safe",
+        efer_ok && (missing.is_none() || (info.hypervisor && missing == Some(0))),
+        if missing.is_none() {
+            "rdmsr_safe matches RDMSR; a missing MSR faulted and was caught"
+        } else {
+            "rdmsr_safe matches RDMSR; this emulator reads missing MSRs as 0 (fault path checked under KVM)"
+        },
+    );
+    // Force VERW on for one user program, whatever the CPU, so the exit
+    // path with VERW is exercised on every test run.
+    let before = entry::mitigations();
+    entry::set_mitigations(true, before.1, before.2, before.3);
+    let file = keel_linux_abi::fs::read_file(b"/test/startup").ok();
+    let status = file.and_then(|file| {
+        let path: &[u8] = b"/test/startup";
+        let loaded =
+            keel_linux_abi::exec::load(&file, path, &[path, b"alpha"], &[b"KEEL_TEST=1"]).ok()?;
+        let spawned = keel_linux_abi::process::spawn("verw", &loaded).ok()?;
+        sched::join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    });
+    entry::set_mitigations(before.0, before.1, before.2, before.3);
+    t.check(
+        "vuln.verw_exit_path",
+        status == Some((0, None)),
+        "with VERW on, a user program enters and leaves the kernel normally",
     );
 }
 

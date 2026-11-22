@@ -438,7 +438,16 @@ fn test_boot(
     };
     match result {
         Ok(()) => {
-            for line in capture.lines.iter().filter(|l| l.starts_with("TEST ")) {
+            // The test results, and on the main boot of each phase the
+            // CPU vulnerability report (P1-S4), so CI logs show it.
+            let report = |l: &&String| {
+                scenario.is_none() && (l.starts_with("cpu: ") || l.starts_with("vuln: "))
+            };
+            for line in capture
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("TEST ") || report(l))
+            {
                 println!("  {line}");
             }
             Ok(())

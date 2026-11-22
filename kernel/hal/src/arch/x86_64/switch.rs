@@ -15,6 +15,18 @@ use core::arch::global_asm;
 //   3. `mov rsp, rsi` adopts the incoming thread's stack, which holds the
 //      same six registers and a return address, either from its own
 //      earlier call to this function or as prepared by `prepare_stack`.
+//   3a. Fill the return stack buffer (SpectreRSB, SR-15; P1-S4): 16
+//      rounds of two CALLs whose return addresses are never used (each
+//      falls through to the next call; a speculative return into one of
+//      them lands on INT3), then RSP += 16 per round to drop the pushed
+//      return addresses, and an LFENCE against a mispredicted final JNZ.
+//      After 32 calls the RSB holds only harmless entries, so a RET that
+//      underflows or was trained by the previous thread cannot steer the
+//      new one. This is Linux's 64-bit __FILL_RETURN_BUFFER
+//      (arch/x86/include/asm/nospec-branch.h, RSB_CLEAR_LOOPS 32), which
+//      Linux runs on every context switch (bugs.c, X86_FEATURE_RSB_CTXSW).
+//      Uses EAX (caller-saved) and 16 bytes below the new stack pointer,
+//      which the incoming thread does not use.
 //   4. Pop the six registers in reverse order and `ret` into that thread.
 //   Exit state: the incoming thread continues as if its call to
 //     keel_context_switch had just returned, with its callee-saved
@@ -42,6 +54,18 @@ global_asm!(
         push r15
         mov [rdi], rsp
         mov rsp, rsi
+        mov eax, 16
+    1:
+        call 2f
+        int3
+    2:
+        call 3f
+        int3
+    3:
+        add rsp, 16
+        dec eax
+        jnz 1b
+        lfence
         pop r15
         pop r14
         pop r13

@@ -22,6 +22,8 @@ pub mod heap;
 #[cfg(target_os = "none")]
 pub mod interrupts;
 pub mod memory;
+#[cfg(target_os = "none")]
+pub mod mitigations;
 pub mod random;
 #[cfg(target_os = "none")]
 pub mod sched;

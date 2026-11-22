@@ -64,37 +64,56 @@ pub fn init() {
 
 static LOGGED: IrqMutex<BTreeSet<u64>> = IrqMutex::new(BTreeSet::new());
 
+type ProcessRef = Arc<IrqMutex<Process>>;
+/// A table entry: the process and the six raw arguments.
+type Handler = fn(&ProcessRef, &[u64; 6]) -> SysResult;
+
+/// Size of the system-call table: every Linux x86-64 number below the
+/// x32 range (512).
+const TABLE_SIZE: u64 = 512;
+
+/// The system calls, indexed by number, as Linux's `sys_call_table`.
+/// `int` arguments use their low 32 bits, as on Linux.
+static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
+    let mut t: [Option<Handler>; TABLE_SIZE as usize] = [None; TABLE_SIZE as usize];
+    t[nr::READ as usize] = Some(|p, a| read(p, a[0] as u32 as i32, a[1], a[2]));
+    t[nr::WRITE as usize] = Some(|p, a| write(p, a[0] as u32 as i32, a[1], a[2]));
+    t[nr::WRITEV as usize] = Some(|p, a| writev(p, a[0] as u32 as i32, a[1], a[2]));
+    t[nr::CLOSE as usize] = Some(|p, a| close(p, a[0] as u32 as i32));
+    t[nr::FSTAT as usize] = Some(|p, a| fstat(p, a[0] as u32 as i32, a[1]));
+    t[nr::OPENAT as usize] = Some(|p, a| openat(p, a[0] as u32 as i32, a[1], a[2], a[3]));
+    t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
+    t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
+    t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
+    t[nr::BRK as usize] = Some(|p, a| Ok(brk(p, a[0])));
+    t[nr::IOCTL as usize] = Some(|p, a| ioctl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
+    t[nr::ARCH_PRCTL as usize] = Some(|_, a| arch_prctl(a[0], a[1]));
+    t[nr::SET_TID_ADDRESS as usize] = Some(|p, a| Ok(set_tid_address(p, a[0])));
+    t[nr::CLOCK_GETTIME as usize] = Some(|_, a| clock_gettime(a[0] as u32 as u64, a[1]));
+    t[nr::GETRANDOM as usize] = Some(|_, a| getrandom(a[0], a[1], a[2] as u32 as u64));
+    t
+};
+
 /// The system-call entry point.
 pub fn handle(call: &SyscallArgs) -> i64 {
     let a = call.args;
-    // `int` arguments use the low 32 bits only, as on Linux.
-    let fd = a[0] as u32 as i32;
-    let result: SysResult = match call.number {
+    let number = call.number;
+    let result: SysResult = match number {
         nr::EXIT | nr::EXIT_GROUP => sched::exit_with((a[0] & 0xff) as i64),
         nr::KEEL_TEST_ADD_ONE => Ok(a[0].wrapping_add(1)),
-        _ => match process::current() {
-            Some(p) => match call.number {
-                nr::READ => read(&p, fd, a[1], a[2]),
-                nr::WRITE => write(&p, fd, a[1], a[2]),
-                nr::WRITEV => writev(&p, fd, a[1], a[2]),
-                nr::CLOSE => close(&p, fd),
-                nr::FSTAT => fstat(&p, fd, a[1]),
-                nr::OPENAT => openat(&p, fd, a[1], a[2], a[3]),
-                nr::MMAP => mmap(&p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]),
-                nr::MUNMAP => munmap(&p, a[0], a[1]),
-                nr::MPROTECT => mprotect(&p, a[0], a[1], a[2]),
-                nr::BRK => Ok(brk(&p, a[0])),
-                nr::IOCTL => ioctl(&p, fd, a[1] as u32, a[2]),
-                nr::ARCH_PRCTL => arch_prctl(a[0], a[1]),
-                nr::SET_TID_ADDRESS => Ok(set_tid_address(&p, a[0])),
-                nr::CLOCK_GETTIME => clock_gettime(a[0] as u32 as u64, a[1]),
-                nr::GETRANDOM => getrandom(a[0], a[1], a[2] as u32 as u64),
-                number => unimplemented(number, &a),
-            },
-            // Threads without a process (kernel self-test programs) get
-            // only exit and the test call.
-            None => unimplemented(call.number, &a),
-        },
+        _ if number < TABLE_SIZE => {
+            // Spectre v1: the number is user-controlled; clamp it without
+            // a branch before indexing (Linux does the same with
+            // array_index_nospec in do_syscall_64).
+            let index = keel_hal::arch::x86_64::cpu::index_nospec(number, TABLE_SIZE) as usize;
+            match (TABLE[index], process::current()) {
+                (Some(handler), Some(p)) => handler(&p, &a),
+                // Threads without a process (kernel self-test programs) get
+                // only exit and the test call.
+                _ => unimplemented(number, &a),
+            }
+        }
+        _ => unimplemented(number, &a),
     };
     match result {
         Ok(value) => value as i64,

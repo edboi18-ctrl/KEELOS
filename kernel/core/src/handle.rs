@@ -10,6 +10,18 @@ use alloc::vec::Vec;
 
 use crate::errno::Errno;
 
+/// `index` if `index < size`, else 0, without a branch: Linux's generic
+/// `array_index_mask_nospec` (`include/linux/nospec.h`), with `black_box`
+/// in the role of `OPTIMIZER_HIDE_VAR` so the compiler cannot use what it
+/// knows about `index` to drop the mask. (This crate has no assembly; the
+/// kernel's own uses go through `keel_hal::arch::x86_64::cpu::index_nospec`,
+/// the `cmp`/`sbb` form.) Valid for `index` and `size` below 2^63.
+pub fn index_nospec(index: usize, size: usize) -> usize {
+    let index = core::hint::black_box(index);
+    let mask = !((index | size.wrapping_sub(1).wrapping_sub(index)) as isize >> (isize::BITS - 1));
+    index & mask as usize
+}
+
 /// A set of rights (SR-1's list).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rights(u32);
@@ -95,10 +107,14 @@ impl<T: Clone> HandleTable<T> {
     }
 
     fn slot(&self, fd: i32) -> Option<&Handle<T>> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|i| self.slots.get(i))
-            .and_then(Option::as_ref)
+        let index = usize::try_from(fd).ok()?;
+        if index >= self.slots.len() {
+            return None;
+        }
+        // Spectre v1: the descriptor is user-controlled, so clamp it
+        // without a branch before using it as an index (SR-15).
+        let index = index_nospec(index, self.slots.len());
+        self.slots[index].as_ref()
     }
 
     /// The object behind `fd`, if the handle has every right in
@@ -161,6 +177,16 @@ mod tests {
             rights,
             close_on_exec: false,
         }
+    }
+
+    #[test]
+    fn index_masking() {
+        assert_eq!(index_nospec(0, 4), 0);
+        assert_eq!(index_nospec(3, 4), 3);
+        assert_eq!(index_nospec(4, 4), 0);
+        assert_eq!(index_nospec(1 << 40, 4), 0);
+        assert_eq!(index_nospec(5, 0), 0);
+        assert_eq!(index_nospec(1023, 1024), 1023);
     }
 
     #[test]

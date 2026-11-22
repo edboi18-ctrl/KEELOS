@@ -1,6 +1,8 @@
 //! CPU control primitives.
 
 use core::arch::asm;
+#[cfg(target_os = "none")]
+use core::arch::global_asm;
 
 /// Stops this CPU for good: interrupts off, then halt, in a loop.
 ///
@@ -380,4 +382,133 @@ pub fn read_tsc() -> u64 {
 pub fn invariant_tsc() -> bool {
     let (max_extended, ..) = cpuid(0x8000_0000, 0);
     max_extended >= 0x8000_0007 && cpuid(0x8000_0007, 0).3 & (1 << 8) != 0
+}
+
+// Assembly reasoning (spec section 1, rule 4)
+//
+// keel_rdmsr_safe(msr = edi, out = rsi) -> eax (0 = read, 1 = #GP) and
+// keel_wrmsr_safe(msr = edi, value = rsi) -> eax (0 = written, 1 = #GP):
+// MSR access that survives an MSR the CPU (or emulator) does not have.
+//   RDMSR reads MSR[ECX] into EDX:EAX; WRMSR writes EDX:EAX to MSR[ECX];
+//   both raise #GP(0) for a reserved or unimplemented MSR or a reserved
+//   bit (SDM Vol. 2B "RDMSR", "WRMSR"). In 64-bit mode the upper halves of
+//   RAX and RDX are cleared by RDMSR, and ignored by WRMSR.
+//   The #GP handler (`idt::dispatch_kernel`) recognizes a fault at exactly
+//   `keel_rdmsr_safe_insn` or `keel_wrmsr_safe_insn` and resumes at the
+//   matching `_fault` label, which returns 1. This is the same idea as
+//   Linux's exception-table entries for rdmsr_safe/wrmsr_safe.
+//   Clobbers RAX, RCX, RDX (caller-saved in the SysV ABI). No stack use
+//   besides the return address.
+#[cfg(target_os = "none")]
+global_asm!(
+    r#"
+    .pushsection .text.keel_msr_safe, "ax", @progbits
+    .global keel_rdmsr_safe, keel_rdmsr_safe_insn, keel_rdmsr_safe_fault
+    keel_rdmsr_safe:
+        mov ecx, edi
+    keel_rdmsr_safe_insn:
+        rdmsr
+        shl rdx, 32
+        or rax, rdx
+        mov qword ptr [rsi], rax
+        xor eax, eax
+        ret
+    keel_rdmsr_safe_fault:
+        mov eax, 1
+        ret
+
+    .global keel_wrmsr_safe, keel_wrmsr_safe_insn, keel_wrmsr_safe_fault
+    keel_wrmsr_safe:
+        mov ecx, edi
+        mov eax, esi
+        mov rdx, rsi
+        shr rdx, 32
+    keel_wrmsr_safe_insn:
+        wrmsr
+        xor eax, eax
+        ret
+    keel_wrmsr_safe_fault:
+        mov eax, 1
+        ret
+    .popsection
+    "#
+);
+
+#[cfg(target_os = "none")]
+unsafe extern "C" {
+    fn keel_rdmsr_safe(msr: u32, out: *mut u64) -> u32;
+    fn keel_wrmsr_safe(msr: u32, value: u64) -> u32;
+    static keel_rdmsr_safe_insn: u8;
+    static keel_rdmsr_safe_fault: u8;
+    static keel_wrmsr_safe_insn: u8;
+    static keel_wrmsr_safe_fault: u8;
+}
+
+#[cfg(target_os = "none")]
+/// Reads an MSR that may not exist; `None` if the read raised #GP.
+pub fn rdmsr_safe(msr: u32) -> Option<u64> {
+    let mut value = 0u64;
+    // SAFETY: the routine writes only `value` and turns a #GP into a
+    // return value; reading an MSR has no memory side effects.
+    let failed = unsafe { keel_rdmsr_safe(msr, &raw mut value) };
+    (failed == 0).then_some(value)
+}
+
+#[cfg(target_os = "none")]
+/// Writes an MSR that may not exist; false if the write raised #GP.
+///
+/// # Safety
+/// As [`wrmsr`]: the value must be safe for the machine (callers here only
+/// write speculation-control MSRs).
+pub unsafe fn wrmsr_safe(msr: u32, value: u64) -> bool {
+    // SAFETY: the caller's contract; a #GP is turned into `false`.
+    unsafe { keel_wrmsr_safe(msr, value) == 0 }
+}
+
+#[cfg(target_os = "none")]
+/// Where to resume after a #GP at `rip`, if `rip` is one of the safe MSR
+/// instructions.
+pub(crate) fn msr_fixup(rip: u64) -> Option<u64> {
+    if rip == &raw const keel_rdmsr_safe_insn as u64 {
+        Some(&raw const keel_rdmsr_safe_fault as u64)
+    } else if rip == &raw const keel_wrmsr_safe_insn as u64 {
+        Some(&raw const keel_wrmsr_safe_fault as u64)
+    } else {
+        None
+    }
+}
+
+/// `index` if `index < size`, else 0, computed without a branch so that a
+/// mispredicted bounds check cannot use an out-of-range index
+/// speculatively (Spectre v1, SR-15). This is Linux's x86
+/// `array_index_mask_nospec` (`arch/x86/include/asm/barrier.h`): `cmp`
+/// then `sbb` turns the carry flag into an all-ones or all-zero mask.
+pub fn index_nospec(index: u64, size: u64) -> u64 {
+    let mask: u64;
+    // Assembly reasoning (spec section 1, rule 4)
+    // Entry state: {i} = index, {s} = size.
+    // Instructions: `cmp {i}, {s}` computes index - size and sets CF if
+    //   index < size (unsigned borrow); `sbb {m}, {m}` computes m - m - CF
+    //   = -CF: all ones when index < size, zero otherwise (SDM Vol. 2A
+    //   "CMP", Vol. 2B "SBB"). The old value of {m} cancels out.
+    // Exit state: {m} = mask; flags changed (not preserved). No memory.
+    // SAFETY: arithmetic on registers only.
+    unsafe {
+        asm!(
+            "cmp {i}, {s}",
+            "sbb {m}, {m}",
+            i = in(reg) index,
+            s = in(reg) size,
+            m = out(reg) mask,
+            options(pure, nomem, nostack),
+        );
+    }
+    index & mask
+}
+
+/// IA32_EFER, read with the plain RDMSR (EFER exists on every x86-64 CPU).
+pub fn read_efer() -> u64 {
+    // SAFETY: IA32_EFER is architectural in long mode; reading it has no
+    // side effects.
+    unsafe { rdmsr(IA32_EFER) }
 }
