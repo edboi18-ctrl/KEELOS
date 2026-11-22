@@ -30,5 +30,9 @@ Notes:
   lock above can be re-entered by an interrupt. Any future handler that
   needs a lock must use one that is only ever taken with interrupts
   disabled.
+- System calls run with interrupts enabled (F-0008): a thread can be
+  preempted anywhere in a system call except inside an `IrqMutex`. So
+  every lock a system call takes must be an `IrqMutex` (all of them are),
+  and code in a system call must not assume it runs uninterrupted.
 - The panic path takes no lock unconditionally: it writes to COM1 through
   a fresh handle and uses `FRAMEBUFFER.try_lock()`.

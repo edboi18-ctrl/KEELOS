@@ -10,6 +10,65 @@ None.
 
 ## Closed
 
+All four below were found on 2026-11-22 by the first sessions of the
+system-call fuzzer (`cargo xtask fuzz`, security acceptance P1 item 6),
+each a denial of service reachable from an unprivileged user program.
+
+### F-0008: system calls ran with interrupts disabled
+
+- Problem: `exception_dispatch` is entered with interrupts off and called
+  the system-call handler directly, so every call ran to completion with
+  no timer tick. One 2 GiB `getrandom` (the MAX_RW_COUNT cap, as on
+  Linux) took 70 s under QEMU's emulator with every other thread stopped,
+  and any long call stalled the whole machine. Present since P1-T10.
+- Fix: `hal::syscall::dispatch` enables interrupts for the handler and
+  disables them before the exit path, as Linux does. Safe because every
+  kernel lock is an `IrqMutex` (interrupts off while held), so nothing is
+  preempted holding a lock (docs/locking.md).
+- Regression test: `sched.syscall_preemptible`: a kernel thread counting
+  5 ms sleeps keeps running while `user/tests/longcall` is inside one
+  128 MiB getrandom (724 ticks in 4 s; 2 ticks with the fix removed).
+
+### F-0007: one program could take every free frame
+
+- Problem: demand-zero and copy-on-write faults allocated from the same
+  pool as the kernel, with no floor. A program writing into a huge
+  mapping drove free frames to 0, leaving the kernel without memory for
+  page tables, its heap or stacks.
+- Fix: user page allocations (`memory::allocate_zeroed_user`) fail once
+  only the kernel reserve is free (1/16 of memory, 16 MiB to 256 MiB); the
+  access then gets EFAULT or ends the program with SIGSEGV status. The
+  first refusal is logged. Interim floor until per-compartment memory
+  limits (SR-8, P3-S4).
+- Regression test: `memory.user_reserve` (raises the reserve above the
+  free count: a user frame is refused, a kernel frame is not); fails with
+  the check removed. Fuzz sessions now end with free frames back at their
+  starting count.
+
+### F-0006: munmap and mprotect took time in proportion to the range
+
+- Problem: `AddressSpace::unmap_pages` and `protect` visited every page
+  of the affected range. A reservation can be terabytes, so one munmap or
+  mprotect over it kept the kernel busy for hours (the first fuzz session
+  stopped in `unmap_pages`).
+- Fix: `keel_core::paging::next_present_small` finds the next present
+  page, skipping the whole span of an absent table entry; both loops visit
+  only present pages and the parked PROT_NONE frames in the range.
+- Regression tests: `vm.huge_range_fast` (mprotect twice and munmap an
+  empty 64 TiB reservation: 0 ms; the old loop needs 2^34 steps) and the
+  host test `next_present_small_skips_empty_spans`.
+
+### F-0005: the unknown-syscall log grew without limit
+
+- Problem: the first call of each unimplemented number was logged and
+  the number kept in a `BTreeSet`. With 64-bit numbers a program could add
+  an entry, and a serial line, per call: unbounded kernel memory and a
+  flooded serial line.
+- Fix: a fixed 512-bit bitmap for numbers in the table; numbers outside
+  it are logged once in all.
+- Regression test: `syscall.log_bounded` (1000 distinct out-of-range
+  numbers add at most one line); fails with the old behaviour restored.
+
 ### F-0004: a user write to the console could freeze the kernel
 
 - Found: 2026-11-22, the intermittent phase-1 test timeout (2 in about

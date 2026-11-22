@@ -101,7 +101,16 @@ write-only one, and the kernel's count of rights refusals
 rise by exactly 2, while its write to a closed descriptor does not count;
 checked to fail with the rights check disabled. Item 5 (boot log lists each
 vulnerability and mitigation) is `vuln.report_complete` and
-`vuln.plan_applied`. Item 6 (one hour of random-syscall fuzzing) remains.
+`vuln.plan_applied`. Item 6 (one hour of random-syscall fuzzing):
+`cargo xtask fuzz --minutes N [--seed S]` boots the in-guest fuzzer
+(`keel_rt::fuzz`, `user/tests/fuzz`: seeded random system calls with
+structure-aware arguments; Keel only, it refuses to run without
+`/etc/keel-release` and is never run on the host). The kernel harness
+starts runs back to back, logs each seed, and fails on a kernel panic, a
+run that does not end within 10 minutes, or a harness wake-up more than
+5 s late (kernel not preempting). Every phase 1 boot also runs a short
+smoke (`fuzz.smoke`). The first sessions found F-0005 to F-0008, all
+fixed with regression tests. The one-hour session is in progress.
 
 Hardening notes for later Phase 1 work:
 - User programs share the serial line with the kernel's `TEST` report lines,

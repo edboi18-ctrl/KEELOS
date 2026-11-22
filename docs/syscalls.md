@@ -5,7 +5,10 @@ it exercises and which right is checked (spec section 1, rule 5).
 Numbers follow the Linux x86-64 ABI: number in `rax`, arguments in
 `rdi, rsi, rdx, r10, r8, r9`, result in `rax`, `rcx` and `r11`
 clobbered. Unknown numbers return `-ENOSYS` (38); the first call of each
-is logged to serial with its Linux name and arguments.
+number below 512 is logged to serial with its Linux name and arguments,
+and only the first number at or above 512 (the log is a fixed bitmap, so
+no program can make it grow: F-0005). System calls run with interrupts
+enabled and can be preempted (F-0008).
 
 Implementation: `kernel/linux-abi/src/syscall.rs`. Every file descriptor
 is a handle with a rights mask (P1-S1, SR-1); the "Right" column is what

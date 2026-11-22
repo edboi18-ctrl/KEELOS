@@ -28,7 +28,7 @@ impl Rng {
         Self(seed)
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -37,7 +37,7 @@ impl Rng {
     }
 
     fn pick<T: Copy>(&mut self, items: &[T]) -> T {
-        items[(self.next() % items.len() as u64) as usize]
+        items[(self.next_u64() % items.len() as u64) as usize]
     }
 }
 
@@ -121,45 +121,42 @@ struct State {
 }
 
 impl State {
+    /// One argument. About 80% are small or structured values that reach
+    /// the kernel's checks; the rest are huge (random, negative, an earlier
+    /// result). Huge sizes are kept rare because a call that is allowed to
+    /// move 2 GiB (MAX_RW_COUNT) takes over a minute without hardware
+    /// acceleration, which would leave little time for anything else.
     fn argument(&mut self) -> u64 {
-        let r = self.rng.next();
-        match r % 10 {
-            0 => (r >> 8) & 7,
-            1 => self
+        let r = self.rng.next_u64();
+        match r % 20 {
+            0..=3 => (r >> 8) & 7,
+            4..=6 => self
                 .rng
                 .pick(&[0, 1, 2, 3, 4, 5, 6, 7, 900, u64::MAX, AT_FDCWD as u64]),
-            2 => self.rng.pick(&[
-                0,
-                1,
-                8,
-                24,
-                32,
-                144,
-                4095,
-                4096,
-                4097,
-                SCRATCH,
-                1 << 20,
-                64 << 30,
-                u64::MAX,
-                r >> 51,
-            ]),
-            3 => self.scratch + (r >> 16) % SCRATCH,
-            4 => self.rng.pick(&HOSTILE),
-            5 => (r >> 32) & self.rng.next() & 0xffff_ffff,
-            6 => ARENA + ((r >> 12) % (1 << 18)) * 4096,
-            7 => self.rng.next(),
-            8 => (r >> 56).wrapping_neg(),
+            7..=9 => {
+                if self.rng.next_u64().is_multiple_of(16) {
+                    self.rng.pick(&[1 << 20, 64 << 30, u64::MAX])
+                } else {
+                    self.rng
+                        .pick(&[0, 1, 8, 24, 32, 144, 4095, 4096, 4097, SCRATCH, r >> 52])
+                }
+            }
+            10..=11 => self.scratch + (r >> 16) % SCRATCH,
+            12 => self.rng.pick(&HOSTILE),
+            13 => (r >> 32) & self.rng.next_u64() & 0xffff_ffff,
+            14 => ARENA + ((r >> 12) % (1 << 18)) * 4096,
+            15 => self.rng.next_u64(),
+            16 => (r >> 56).wrapping_neg(),
             _ => self.last,
         }
     }
 
     fn number(&mut self) -> u64 {
-        let r = self.rng.next();
+        let r = self.rng.next_u64();
         let number = match r % 10 {
             0..=6 => self.rng.pick(&IMPLEMENTED),
             7 | 8 => (r >> 8) % 600,
-            _ => self.rng.next(),
+            _ => self.rng.next_u64(),
         };
         if number == NR_EXIT || number == NR_EXIT_GROUP {
             1
@@ -201,9 +198,9 @@ pub fn run(seed: u64, calls: u64, initial_sp: u64) -> Option<u64> {
         if number == NR_POLL {
             // A random timeout could sleep for days with nothing to wait
             // for; keep it at 0-2 ms.
-            a[2] = state.rng.next() % 3;
+            a[2] = state.rng.next_u64() % 3;
         }
-        if number == NR_OPENAT && state.rng.next() % 4 != 0 {
+        if number == NR_OPENAT && !state.rng.next_u64().is_multiple_of(4) {
             // openat only reads its path, so a read-only string in this
             // program's image is safe to hand out here.
             a[1] = state.rng.pick(&PATHS).as_ptr() as u64;

@@ -1145,7 +1145,13 @@ struct FuzzReport {
 /// Runs fuzz processes one after another, run `i` with seed `seed + i`,
 /// until `deadline_ns` (monotonic) or `max_runs`. Each seed is logged
 /// before its run, so the last one in the log is the one to replay.
-fn fuzz_session(seed: u64, deadline_ns: u64, max_runs: u64, verbose: bool) -> FuzzReport {
+fn fuzz_session(
+    seed: u64,
+    deadline_ns: u64,
+    max_runs: u64,
+    calls_per_run: u64,
+    verbose: bool,
+) -> FuzzReport {
     use alloc::format;
     const PATH: &[u8] = b"/test/fuzz";
     let mut report = FuzzReport {
@@ -1163,7 +1169,7 @@ fn fuzz_session(seed: u64, deadline_ns: u64, max_runs: u64, verbose: bool) -> Fu
         return report;
     };
     let calls_before = keel_linux_abi::syscall::count();
-    let calls = format!("{FUZZ_CALLS}");
+    let calls = format!("{calls_per_run}");
     let start = time::monotonic_nanos();
     let mut next_report = start + 60_000_000_000;
     while report.runs < max_runs && time::monotonic_nanos() < deadline_ns {
@@ -1240,7 +1246,7 @@ pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
     let frames_before = memory::free_frames();
     let start = time::monotonic_nanos();
     let deadline = start.saturating_add(minutes.saturating_mul(60_000_000_000));
-    let report = fuzz_session(seed, deadline, u64::MAX, true);
+    let report = fuzz_session(seed, deadline, u64::MAX, FUZZ_CALLS, true);
     let elapsed_s = (time::monotonic_nanos() - start) / 1_000_000_000;
     kprintln!(
         "fuzz: done: {} runs, {} system calls, {} runs ended by a fault, {} s, worst harness wake-up delay {} ms, free frames {} -> {}",
@@ -1361,10 +1367,10 @@ pub fn phase1_robustness(t: &mut Runner) {
     kprintln!("  longcall: {elapsed_ms} ms, ticker ran {ticks} times, exit {status:?}");
 }
 
-/// A short fuzzing smoke test in every phase 1 boot: three runs with fixed
-/// seeds (the full session is `cargo xtask fuzz`).
+/// A short fuzzing smoke test in every phase 1 boot: three runs of 200
+/// calls with fixed seeds (the full session is `cargo xtask fuzz`).
 pub fn phase1_fuzz_smoke(t: &mut Runner) {
-    let report = fuzz_session(0x6b65_656c, u64::MAX, 3, false);
+    let report = fuzz_session(0x6b65_656c, u64::MAX, 3, 200, false);
     t.check(
         "fuzz.smoke",
         report.hung.is_none() && report.runs == 3 && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
