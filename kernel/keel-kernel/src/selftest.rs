@@ -1568,10 +1568,13 @@ pub fn phase1_resource_limits(t: &mut Runner) {
         "with only the kernel's reserve free, system calls are refused with ENOMEM instead of taking it (F-0011)",
     );
 
-    // A3: console writes on a UART as slow as a real one (115200 baud,
+    // A3: console writes on a UART at least as slow as a real one (115200 baud,
     // 8N1: 11,520 bytes a second) must not keep interrupts off. A kernel
     // thread counting 5 ms sleeps keeps running while a program writes
-    // 32 KiB to the console (about 2.8 s of transmission).
+    // 8 KiB to the console: about 0.7 s of transmission, each 4 KiB write
+    // 0.36 s with interrupts off if it went out in one piece. (Kept small:
+    // under nested KVM each UART port access is an exit to QEMU, about
+    // 0.5 ms a byte in CI, so 32 KiB overran the 15 s join.)
     use keel_hal::drivers::serial::TEST_BYTE_DELAY_NS;
     STOP.store(false, Ordering::Relaxed);
     let ticker = sched::spawn("ticker", || {
@@ -1593,7 +1596,7 @@ pub fn phase1_resource_limits(t: &mut Runner) {
     }
     t.check(
         "console.slow_uart_preemptible",
-        flood == Some((0, None)) && elapsed_ms >= 2_000 && ticks >= elapsed_ms / 50,
+        flood == Some((0, None)) && elapsed_ms >= 500 && ticks >= elapsed_ms / 50,
         "a program flooding a real-speed UART does not keep interrupts off: a kernel thread keeps running (A3)",
     );
     kprintln!("  conflood: {elapsed_ms} ms, ticker ran {ticks} times, exit {flood:?}");
