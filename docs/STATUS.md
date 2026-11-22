@@ -110,7 +110,15 @@ starts runs back to back, logs each seed, and fails on a kernel panic, a
 run that does not end within 10 minutes, or a harness wake-up more than
 5 s late (kernel not preempting). Every phase 1 boot also runs a short
 smoke (`fuzz.smoke`). The first sessions found F-0005 to F-0008, all
-fixed with regression tests. The one-hour session is in progress.
+fixed with regression tests, and a check of frame use after the first
+one-hour session found F-0009 (also fixed). **Passed on the final code:**
+`cargo xtask fuzz --minutes 60 --seed 20261122` (no KVM): 62 runs,
+124,434 system calls, 3,781 s, no panic, no hung run, worst harness
+wake-up delay 702 ms. Free frames went 1,034,119 → 1,034,108. All 11
+frames are accounted for: kernel page tables 282 → 290, level from run 9
+onward (the high-water mark of kernel address space), and heap pages
+173 → 176. No address spaces were left alive, tmpfs grew by 0 bytes, and
+0 heap pages were lost.
 `.github/workflows/security.yml` (nightly and manual) runs four
 60-minute fuzz shards with distinct seeds under KVM and keeps each serial
 log; it is on the working branch for the owner to review and merge
