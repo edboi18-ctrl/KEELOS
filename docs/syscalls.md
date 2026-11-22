@@ -35,7 +35,7 @@ half and the last byte of the address space, returns EFAULT.
 
 | Number | Name | Status | Right | Authority and checks |
 | --- | --- | --- | --- | --- |
-| 0 | `read` | Complete for files and the four devices | READ | Regular files advance the shared offset. `/dev/console` reads as end of file until P1-T14. Directories: EISDIR. |
+| 0 | `read` | Complete for files and the four devices | READ | Regular files advance the shared offset. `/dev/console` waits for a line and returns at most one. Directories: EISDIR. |
 | 1 | `write` | Complete for files and devices | WRITE | O_APPEND writes at the end. File growth is capped by the tmpfs limit (ENOSPC). Console output is filtered to text. |
 | 3 | `close` | Complete | none (the handle is the caller's own) | |
 | 5 | `fstat` | Complete | STAT | x86-64 `struct stat`; uid/gid 0 and reported only (SR-6); times 0 until there is a real-time clock. |
@@ -68,7 +68,7 @@ gets only the direction it is for.
 
 | Path | Device | Authority and checks | Tests |
 | --- | --- | --- | --- |
-| `/dev/console` | 5:1 | Writes go to the kernel console, filtered to text (no control characters or escape sequences). Reads return end of file until the keyboard driver (P1-T14). | `fs.dev_nodes`, `fs.devices` |
+| `/dev/console` | 5:1 | Writes go to the kernel console, filtered to text (no control characters or escape sequences). Reads wait for a line from the keyboard (canonical mode, echo; Ctrl+D is end of file). Every process shares the one console until compartments (Phase 3) give each its own. | `fs.dev_nodes`, `fs.devices`, `console.keyboard_line` |
 | `/dev/null` | 1:3 | Reads return end of file; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
 | `/dev/zero` | 1:5 | Reads return zeros; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
 | `/dev/urandom` | 1:9 | Reads return random bytes (interim source until P1-S5); writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |

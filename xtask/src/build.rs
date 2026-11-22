@@ -91,6 +91,8 @@ pub struct TestProgram {
     /// Arguments after argv[0], and the environment, for a passing run.
     pub args: &'static [&'static str],
     pub env: &'static [(&'static str, &'static str)],
+    /// Standard input for the Linux run (Keel's self-test types it).
+    pub stdin: &'static [u8],
 }
 
 pub const TEST_PROGRAMS: &[TestProgram] = &[
@@ -99,12 +101,21 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         binary: "startup",
         args: &["alpha"],
         env: &[("KEEL_TEST", "1")],
+        stdin: b"",
     },
     TestProgram {
         path: "test/syscalls",
         binary: "syscalls",
         args: &[],
         env: &[],
+        stdin: b"",
+    },
+    TestProgram {
+        path: "test/readline",
+        binary: "readline",
+        args: &[],
+        env: &[],
+        stdin: b"keel\n",
     },
 ];
 

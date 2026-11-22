@@ -633,6 +633,8 @@ pub fn phase1_sched(t: &mut Runner) {
     use core::sync::atomic::Ordering::Relaxed;
 
     let frames_before = memory::free_frames();
+    // System threads (idle, console echo) are not this test's business.
+    let threads_before = sched::thread_count();
     let switches_before = sched::switch_count();
     let mut ids = alloc::vec::Vec::new();
     for _ in 0..4 {
@@ -706,7 +708,7 @@ pub fn phase1_sched(t: &mut Runner) {
     sched::yield_now();
     t.check(
         "sched.reclaim",
-        sched::thread_count() == 2 && memory::free_frames() + 64 >= frames_before,
+        sched::thread_count() == threads_before && memory::free_frames() + 64 >= frames_before,
         "exited threads are removed and their stack frames returned",
     );
 }
@@ -1020,6 +1022,29 @@ pub fn phase1_exec(t: &mut Runner) {
             "  syscalls: exit status {status} (number of the first failed check), fault {fault:?}"
         );
     }
+    // P1-T14: the keyboard feeds /dev/console. The program must be blocked
+    // in read(2) before anything is typed; then "keel", Enter, Ctrl+D.
+    let readline = keel_linux_abi::fs::read_file(b"/test/readline")
+        .ok()
+        .and_then(|file| {
+            let loaded = exec::load(&file, b"/test/readline", &[b"/test/readline"], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("readline", &loaded).ok()?;
+            sched::sleep_ms(20);
+            let was_waiting = sched::exit_status(spawned.thread).is_none();
+            // Set 1: k e e l (press, release), Enter, then Ctrl down, D, Ctrl up.
+            let keys = [
+                0x25, 0xa5, 0x12, 0x92, 0x12, 0x92, 0x26, 0xa6, 0x1c, 0x9c, 0x1d, 0x20, 0xa0, 0x9d,
+            ];
+            let typed = keel_linux_abi::tty::type_scancodes(&keys).is_ok();
+            sched::join(spawned.thread);
+            Some((was_waiting, typed, sched::exit_status(spawned.thread)?))
+        });
+    t.check(
+        "console.keyboard_line",
+        readline == Some((true, true, (0, None))),
+        "a program blocked reading /dev/console gets the typed line, then end of file at Ctrl+D",
+    );
+
     t.check(
         "process.teardown",
         keel_linux_abi::process::count() == 0,

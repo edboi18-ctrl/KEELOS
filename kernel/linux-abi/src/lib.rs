@@ -21,3 +21,5 @@ pub mod fs;
 pub mod process;
 #[cfg(target_os = "none")]
 pub mod syscall;
+#[cfg(target_os = "none")]
+pub mod tty;

@@ -99,11 +99,12 @@ pub fn read_file(path: &[u8]) -> Result<Arc<Vec<u8>>, Errno> {
     })
 }
 
-/// Reads from a device. `/dev/console` input arrives with P1-T14; until
-/// then it reads as end of file.
+/// Reads from a device. `/dev/console` waits for a line from the
+/// keyboard (see `tty`); call it with no lock held.
 pub fn device_read(device: Device, buf: &mut [u8]) -> usize {
     match device {
-        Device::Null | Device::Console => 0,
+        Device::Null => 0,
+        Device::Console => crate::tty::read(buf),
         Device::Zero => {
             buf.fill(0);
             buf.len()

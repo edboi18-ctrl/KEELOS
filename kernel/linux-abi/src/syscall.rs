@@ -171,18 +171,25 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
     let mut done = 0usize;
     while done < count {
         let want = (count - done).min(CHUNK);
-        let n = {
-            let mut f = file.lock();
-            let n = match f.kind {
-                Kind::File => fs::with(|fs| fs.read(f.node, f.offset, &mut chunk[..want]))?,
-                Kind::Directory => return Err(Errno::EISDIR),
-                Kind::Device(device) => fs::device_read(device, &mut chunk[..want]),
-            };
-            if f.kind == Kind::File {
+        let kind = file.lock().kind;
+        let n = match kind {
+            Kind::File => {
+                let mut f = file.lock();
+                let n = fs::with(|fs| fs.read(f.node, f.offset, &mut chunk[..want]))?;
                 f.offset += n as u64;
+                n
             }
-            n
+            Kind::Directory => return Err(Errno::EISDIR),
+            // No lock held: a console read can wait for the keyboard.
+            Kind::Device(device) => fs::device_read(device, &mut chunk[..want]),
         };
+        // A terminal read returns at most one line.
+        if kind == Kind::Device(Device::Console) {
+            if n > 0 && copy_to_user(buf, &chunk[..n]).is_err() {
+                return Err(Errno::EFAULT);
+            }
+            return Ok(n as u64);
+        }
         if n == 0 {
             break;
         }

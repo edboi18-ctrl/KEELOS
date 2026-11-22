@@ -71,6 +71,10 @@ against copies downloaded from the vendors:
 | Linux `arch/x86/entry/syscalls/syscall_64.tbl` at v6.12, `common` and `64` rows (numbers and names) | Generated `kernel/linux-abi/src/names.rs` |
 | Intel SDM Vol. 3 section 4.5.3 (WRMSR to IA32_FS_BASE/IA32_GS_BASE requires a canonical value); AMD APM Vol. 2 Table A-1 (FS.Base C000_0100h, GS.Base C000_0101h); Intel SDM Vol. 1 section 3.4.2.1 (FS and GS bases still apply in 64-bit mode) | `hal::sched::set_user_base`, `cpu.rs`, `keel-rt::sys::fs_base_round_trip` |
 | `man 2 syscall` (x86-64: fourth argument in R10) | `keel-rt::syscall6` |
+| Linux `drivers/input/serio/i8042-io.h` (ports 0x60/0x64, keyboard IRQ 1) and `include/linux/i8042.h` (status, command and configuration bits; 0xD2 keyboard loop) at v6.12 | `kernel/hal/src/drivers/ps2.rs` |
+| QEMU v9.2.0 `hw/input/pckbd.c` (0xD2 queues a byte as keyboard data) and `hw/input/ps2.c` (set-1 release = make code \| 0x80; 0xE0 prefix; Pause and Print Screen sequences), read 2026-11-22 | `ps2::inject`; `kernel/core/src/keyboard.rs` |
+| keycodemapdb `data/keymaps.csv` (QEMU project; column "AT set1 keycode"; SHA-256 527727ef96d7103a8d7725a6ed9738812660b5a3f4aec086dd7b587b1ba9fcca, read 2026-11-22) | Set-1 table in `kernel/core/src/keyboard.rs` |
+| Linux `include/linux/termios_internal.h` (INIT_C_CC: VINTR ^C, VERASE DEL, VKILL ^U, VEOF ^D) and `drivers/tty/tty_io.c` (`tty_std_termios`: ICRNL, ICANON, ECHO, ECHOE, ECHOK, ECHOCTL) at v6.12; N_TTY_BUF_SIZE 4096 | `kernel/core/src/tty.rs` |
 | cpio(5), "New ASCII Format"; Linux `Documentation/driver-api/early-userspace/buffer-format.rst` | `kernel/core/src/cpio.rs` (reader), `xtask/src/cpio.rs` (writer) |
 | Linux `arch/x86/entry/syscalls/syscall_64.tbl`, `include/uapi/asm-generic/errno.h`, `arch/x86/include/uapi/asm/signal.h` at v6.12 (exit 60, exit_group 231, ENOSYS 38, SIGILL 4, SIGTRAP 5, SIGBUS 7, SIGFPE 8, SIGSEGV 11), read 2026-11-22 | `kernel/hal/src/syscall.rs`, `docs/syscalls.md` |
 

@@ -20,3 +20,8 @@ keel-rt = { path = "../keel-rt" }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "readline"
+test = false
+bench = false

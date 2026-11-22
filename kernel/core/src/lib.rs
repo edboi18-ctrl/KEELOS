@@ -14,6 +14,8 @@ pub mod exec;
 
 pub mod frame;
 pub mod handle;
+pub mod keyboard;
 pub mod paging;
+pub mod tty;
 pub mod vfs;
 pub mod vm;

@@ -550,11 +550,19 @@ fn test_user_programs_on_host() -> Result<()> {
     println!("xtask: ---- user programs on the host (Linux) ----");
     let binaries = build::build_user_tests(&util::workspace_root())?;
     for (program, binary) in build::TEST_PROGRAMS.iter().zip(binaries) {
-        let output = Command::new(&binary)
+        let mut child = Command::new(&binary)
             .args(program.args)
             .env_clear()
             .envs(program.env.iter().copied())
-            .output()?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            std::io::Write::write_all(&mut stdin, program.stdin)?;
+            // Dropping stdin closes the pipe: the program sees end of file.
+        }
+        let output = child.wait_with_output()?;
         let name = format!("host.{}", program.binary);
         if output.status.success() {
             println!("  TEST {name} PASS runs to exit 0 under Linux");

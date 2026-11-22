@@ -140,6 +140,13 @@ extern "C" fn kmain() -> ! {
         // running so the console shows why.
         Err(error) => kprintln!("fs: root filesystem not available: {error}"),
     }
+    match keel_linux_abi::tty::init() {
+        Ok(()) => {
+            kprintln!("keyboard: i8042 ready (IRQ 1, scancode set 1, US layout) on /dev/console")
+        }
+        // No keyboard is not fatal: output still works.
+        Err(error) => kprintln!("keyboard: not available ({error:?}); /dev/console is output only"),
+    }
 
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {

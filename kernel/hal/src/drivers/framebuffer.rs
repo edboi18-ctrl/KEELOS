@@ -268,6 +268,9 @@ impl<'a> TextConsole<'a> {
         match ch {
             '\n' => self.newline(),
             '\r' => self.col = 0,
+            // Backspace moves left within the line (terminal behaviour;
+            // the echo of an erased character is BS, space, BS).
+            '\u{8}' => self.col = self.col.saturating_sub(1),
             _ => {
                 if self.col >= self.cols {
                     self.newline();
