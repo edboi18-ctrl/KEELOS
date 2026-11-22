@@ -1131,6 +1131,27 @@ pub fn phase1_prot_none(t: &mut Runner) {
         ok == Some(true),
         "PROT_NONE pages are unreadable, keep their data, and come back after mprotect and fork (F-0002)",
     );
+    // F-0003 regression: a context switch inside with_address_space must
+    // not undo the switch (it used to put the kernel thread back on the
+    // kernel's tables, so the user copy after the sleep found no page).
+    let survives = (|| {
+        let space = AddressSpace::new().ok()?;
+        space
+            .map(Placement::Fixed(AT), 4096, Prot::READ_WRITE)
+            .ok()?;
+        Some(with_address_space(&space, || {
+            let written = copy_to_user(AT, b"survives").is_ok();
+            sched::sleep_ms(5);
+            sched::yield_now();
+            let mut back = [0u8; 8];
+            written && copy_from_user(&mut back, AT).is_ok() && back == *b"survives"
+        }))
+    })();
+    t.check(
+        "vm.borrowed_space_survives_switch",
+        survives == Some(true),
+        "a thread working in another address space keeps it across a context switch (F-0003)",
+    );
     t.check(
         "vm.prot_none_frames_returned",
         memory::free_frames() + 8 >= frames_at_start,

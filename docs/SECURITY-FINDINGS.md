@@ -10,6 +10,25 @@ None.
 
 ## Closed
 
+### F-0003: a context switch undid `with_address_space`
+
+- Found: 2026-11-22, from an intermittent failure of the `smap` scenario
+  after KASLR changed boot timing (P1-S5). In code since P1-T9.
+- Problem: `vm::with_address_space` loaded another address space's CR3
+  directly. If the thread was preempted inside it, the scheduler restored
+  the thread's own recorded space (the kernel's tables, for a kernel
+  thread), so the rest of the work ran without the borrowed mappings: the
+  ELF loader could fail with a spurious EFAULT, and the SMAP scenario saw
+  a not-present page. It also always returned to the kernel's tables, even
+  for a caller running in a process. Impact: reliability; no access to
+  the wrong address space was possible (the fallback tables map no user
+  memory).
+- Fix: `sched::swap_space` makes the borrowed space the thread's recorded
+  space for the duration and restores the previous one afterwards.
+- Regression test: `vm.borrowed_space_survives_switch` (sleeps and yields
+  inside the borrowed space, then reads it back); checked to fail with the
+  old code.
+
 ### F-0002: mprotect(PROT_NONE) left populated pages readable
 
 - Found: 2026-11-22, while checking the page tables for L1TF (P1-S4), in

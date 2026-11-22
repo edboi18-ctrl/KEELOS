@@ -295,6 +295,37 @@ pub fn set_ibpb_on_switch(enabled: bool) {
     IBPB_ON_SWITCH.store(enabled, Ordering::Relaxed);
 }
 
+/// Makes `space` the running thread's address space and switches to it;
+/// returns the previous one. The scheduler restores a thread's recorded
+/// space whenever it runs again, so a temporary switch made this way
+/// survives preemption (a bare CR3 write would be undone by the next
+/// context switch). Used by `vm::with_address_space`.
+pub(crate) fn swap_space(space: Option<Arc<AddressSpace>>) -> Option<Arc<AddressSpace>> {
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let current = sched.current;
+    let thread = sched
+        .threads
+        .get_mut(&current)
+        .expect("current thread exists");
+    let previous = core::mem::replace(&mut thread.space, space);
+    let kernel_root = paging::kernel_root().map_or(0, |r| r.address());
+    let kernel_cr3 = thread
+        .space
+        .as_ref()
+        .map_or(kernel_root, |s| s.root().address());
+    let user_cr3 = thread.space.as_ref().map_or(0, |s| s.user_root().address());
+    let stack_top = thread.stack.as_ref().map_or(0, |s| s.top);
+    entry::set_current(kernel_cr3, user_cr3, stack_top);
+    crate::vm::set_current(thread.space.clone());
+    if cpu::read_cr3() & !0xFFF != kernel_cr3 {
+        // SAFETY: every kernel view shares the kernel half, which maps all
+        // kernel code, data and stacks, so execution continues unchanged.
+        unsafe { cpu::write_cr3(kernel_cr3) };
+    }
+    previous
+}
+
 /// Called with the thread's ID whenever a thread exits, before it stops
 /// running (process teardown in `linux-abi`).
 static EXIT_HOOK: IrqMutex<Option<fn(ThreadId)>> = IrqMutex::new(None);

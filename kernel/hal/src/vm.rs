@@ -380,16 +380,14 @@ pub(crate) fn set_current(space: Option<Arc<AddressSpace>>) {
 /// kernel tables. Used by kernel threads (and self-tests) to work in
 /// another address space.
 pub fn with_address_space<R>(space: &Arc<AddressSpace>, f: impl FnOnce() -> R) -> R {
-    let kernel = kernel_root().expect("paging is set up");
-    *CURRENT.lock() = Some(space.clone());
-    // SAFETY: the address space shares the kernel's upper half, which maps
-    // all kernel code, data, stacks and devices, so everything the kernel
-    // touches stays mapped.
-    unsafe { cpu::write_cr3(space.root().address()) };
+    // The space becomes the thread's own for the duration, so a context
+    // switch in the middle restores it instead of the thread's usual
+    // tables; afterwards whatever was there before comes back (the
+    // kernel's tables for a kernel thread, the process's own space for a
+    // thread in a system call).
+    let previous = crate::sched::swap_space(Some(space.clone()));
     let result = f();
-    // SAFETY: the kernel's own tables map everything the kernel uses.
-    unsafe { cpu::write_cr3(kernel.address()) };
-    *CURRENT.lock() = None;
+    crate::sched::swap_space(previous);
     result
 }
 
