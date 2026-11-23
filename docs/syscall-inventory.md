@@ -20,9 +20,9 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 10 | `fstat` | 2142 | 0 | 2142 | partial | `syscalls.conformance` |
 | 11 | `read` | 65920 | 0 | 66407 | partial | `syscalls.conformance` |
 | 12 | `close` | 3296 | 57 | 3262 | partial | `syscalls.conformance` |
-| 13 | `rt_sigprocmask` | 62162 | 0 | 62419 | partial | `syscalls.conformance` |
+| 13 | `rt_sigprocmask` | 62162 | 0 | 62419 | complete | `syscalls.conformance`, `exec.signals` |
 | 14 | `membarrier` | 19 | 12 | 19 | missing |  |
-| 15 | `rt_sigaction` | 161 | 0 | 161 | partial | `syscalls.conformance` |
+| 15 | `rt_sigaction` | 161 | 0 | 161 | partial (no SA_RESTART) | `syscalls.conformance`, `exec.signals` |
 | 16 | `getuid` | 24 | 0 | 24 | missing |  |
 | 17 | `lseek` | 188 | 0 | 188 | missing |  |
 | 18 | `munmap` | 1999 | 11 | 2001 | partial | `syscalls.conformance` |
@@ -65,7 +65,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 55 | `accept` | 1 | 0 | 1 | missing |  |
 | 56 | `sendmsg` | 829 | 0 | 820 | missing |  |
 | 57 | `recvmsg` | 833 | 4 | 822 | missing |  |
-| 58 | `sigaltstack` | 58 | 0 | 55 | partial | `syscalls.conformance` |
+| 58 | `sigaltstack` | 58 | 0 | 55 | complete | `syscalls.conformance`, `exec.signals` |
 | 59 | `gettid` | 58 | 0 | 55 | complete | `exec.thread_calls` |
 | 60 | `sched_getaffinity` | 12 | 0 | 12 | missing |  |
 | 61 | `writev` | 19573 | 0 | 19734 | partial | `syscalls.conformance` |
@@ -91,9 +91,9 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 81 | `exit` | 43 | 0 |  | partial | `syscalls.conformance` |
 | 82 | `sendto` | 2 | 0 | 2 | missing |  |
 | 83 | `recvfrom` | 5 | 0 | 5 | missing |  |
-| 84 | `kill` | 11 | 11 | 11 | partial (0, SIGKILL) | `exec.thread_calls` |
-| 85 | `tgkill` | 10 | 0 | 13 | missing |  |
-| 86 | `rt_sigreturn` | 1 | 0 | 2 | missing |  |
+| 84 | `kill` | 11 | 11 | 11 | partial (no process groups) | `exec.thread_calls`, `exec.signals` |
+| 85 | `tgkill` | 10 | 0 | 13 | complete | `exec.signals` |
+| 86 | `rt_sigreturn` | 1 | 0 | 2 | complete | `exec.signals` |
 | 87 | `rename` | 3 | 0 | 3 | missing |  |
 
 ## `clone` flag combinations

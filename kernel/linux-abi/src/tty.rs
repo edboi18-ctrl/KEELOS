@@ -73,12 +73,17 @@ pub fn init() -> Result<(), ps2::Ps2Error> {
 }
 
 /// Reads one line (or what fits in `buf`), waiting until one is ready.
-/// Returns 0 at end of file (Ctrl+D on an empty line).
-pub fn read(buf: &mut [u8]) -> usize {
+/// Returns 0 at end of file (Ctrl+D on an empty line), and None if the
+/// wait was cut short by a signal or an exit request (the read is then
+/// EINTR, as read(2) "was interrupted by a signal before any data was
+/// read").
+pub fn read(buf: &mut [u8]) -> Option<usize> {
     loop {
-        INPUT.wait_until(|| TERMINAL.lock().line.readable());
+        if !INPUT.wait_until(|| TERMINAL.lock().line.readable()) {
+            return None;
+        }
         if let Some(n) = TERMINAL.lock().line.read(buf) {
-            return n;
+            return Some(n);
         }
     }
 }

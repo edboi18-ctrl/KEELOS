@@ -200,6 +200,7 @@ pub fn futex(
             while !woken()
                 && time::monotonic_nanos() < deadline
                 && sched::exit_requested().is_none()
+                && !sched::interrupted()
             {
                 sched::sleep_ms(1);
             }
@@ -207,7 +208,9 @@ pub fn futex(
     }
     if leave(me) {
         Ok(0)
-    } else if sched::exit_requested().is_some() {
+    } else if sched::exit_requested().is_some() || sched::interrupted() {
+        // futex(2): "EINTR: A FUTEX_WAIT ... operation was interrupted by
+        // a signal". SA_RESTART is not honoured yet (ADR 0020).
         Err(Errno::EINTR)
     } else {
         Err(Errno::ETIMEDOUT)

@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use keel_core::compartment::{Compartment, Member};
 use keel_core::errno::Errno;
 use keel_core::handle::{Handle, HandleTable, Rights};
-use keel_core::signal::SignalState;
+use keel_core::signal::{Pending, SignalState, ThreadSignals};
 use keel_core::vfs::{Device, Ino, Kind};
 use keel_hal::arch::x86_64::idt::TrapFrame;
 use keel_hal::sched::{self, ThreadId};
@@ -87,9 +87,11 @@ pub struct Process {
     /// The signal that is ending it (SIGKILL, or a fault in one of its
     /// threads), for the wait status.
     pub killed_by: Option<i32>,
-    /// Signal dispositions, blocked mask and alternate stack, recorded
-    /// only until delivery arrives (P3-T6).
+    /// Signal dispositions, shared by its threads (P3-T6, ADR 0020).
     pub signals: SignalState,
+    /// Signals sent to the process as a whole (`shared_pending`): any
+    /// thread that does not block one may take it.
+    pub pending: Pending,
     /// The process that forked this one, if any (getppid, and where the
     /// exit status goes). Processes the kernel starts have none.
     pub parent: Option<Weak<IrqMutex<Process>>>,
@@ -110,14 +112,30 @@ pub struct ThreadInfo {
     /// set_tid_address(2) and CLONE_CHILD_CLEARTID: at exit, 0 is written
     /// there and one waiter woken (Linux's mm_release, `kernel/fork.c`).
     pub clear_child_tid: u64,
+    /// Its blocked mask, alternate stack and the signals sent to it alone.
+    pub signals: ThreadSignals,
+    /// Its last CPU fault, as Linux keeps `trap_nr`, `error_code` and
+    /// `cr2` in the thread for the next signal frame's `trapno`, `err` and
+    /// `cr2`.
+    pub trap: Trap,
+}
+
+/// `thread.trap_nr`, `thread.error_code` and `thread.cr2`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Trap {
+    pub trapno: u64,
+    pub err: u64,
+    pub cr2: u64,
 }
 
 impl ThreadInfo {
-    fn first(tid: u32) -> ThreadInfo {
+    fn first(tid: u32, signals: ThreadSignals) -> ThreadInfo {
         ThreadInfo {
             tid,
             _slot: None,
             clear_child_tid: 0,
+            signals,
+            trap: Trap::default(),
         }
     }
 }
@@ -226,6 +244,7 @@ pub fn spawn_in(
         root,
         cwd: root,
         signals: SignalState::new(),
+        pending: Pending::new(),
         parent: None,
         children: Vec::new(),
         threads: BTreeMap::new(),
@@ -237,7 +256,9 @@ pub fn spawn_in(
     let thread = sched::spawn_user(name, loaded.space.clone(), loaded.entry, loaded.rsp, 0)
         .map_err(|_| Errno::ENOMEM)?;
     let mut process = process;
-    process.threads.insert(thread.0, ThreadInfo::first(pid));
+    process
+        .threads
+        .insert(thread.0, ThreadInfo::first(pid, ThreadSignals::new()));
     processes.insert(thread.0, Arc::new(IrqMutex::new(process)));
     Ok(Spawned { pid, thread })
 }
@@ -259,13 +280,17 @@ pub fn current() -> Option<Arc<IrqMutex<Process>>> {
 /// copy), its clear_child_tid is not inherited and it has no children of
 /// its own.
 pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno> {
-    let (compartment, space, handles, signals, brk_start, brk, root, cwd) = {
+    let (compartment, space, handles, signals, thread_signals, brk_start, brk, root, cwd) = {
         let process = p.lock();
         (
             process.member.compartment().clone(),
             process.space()?,
             process.handles.clone(),
             process.signals.clone(),
+            process
+                .threads
+                .get(&sched::current().0)
+                .map_or_else(ThreadSignals::new, |t| t.signals.for_child(false)),
             process.brk_start,
             process.brk,
             process.root,
@@ -287,6 +312,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         root,
         cwd,
         signals,
+        pending: Pending::new(),
         parent: Some(Arc::downgrade(p)),
         children: Vec::new(),
         threads: BTreeMap::new(),
@@ -304,7 +330,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
     child
         .lock()
         .threads
-        .insert(thread.0, ThreadInfo::first(pid));
+        .insert(thread.0, ThreadInfo::first(pid, thread_signals));
     processes.insert(thread.0, child.clone());
     p.lock().children.push(Child {
         process: child,
@@ -361,9 +387,16 @@ pub fn clone_thread(
     } else {
         None
     };
-    let (compartment, space) = {
+    let (compartment, space, signals) = {
         let process = p.lock();
-        (process.member.compartment().clone(), process.space()?)
+        (
+            process.member.compartment().clone(),
+            process.space()?,
+            process
+                .threads
+                .get(&sched::current().0)
+                .map_or_else(ThreadSignals::new, |t| t.signals.for_child(true)),
+        )
     };
     let member = compartment.admit()?;
     let tid = member.pid();
@@ -393,6 +426,8 @@ pub fn clone_thread(
             } else {
                 0
             },
+            signals,
+            trap: Trap::default(),
         },
     );
     processes.insert(thread.0, p.clone());
@@ -436,35 +471,36 @@ fn find(compartment: &Arc<Compartment>, pid: u32) -> Option<Arc<IrqMutex<Process
         .cloned()
 }
 
-/// kill(2), until signals are delivered (P3-T6): signal 0 checks that the
-/// process exists, SIGKILL ends all its threads (wait status: signal 9).
-/// A PID names a process only in the caller's compartment (ESRCH
-/// otherwise). Other signals are EINVAL for now, and process groups (PID
-/// 0 or negative) ESRCH: Linux would deliver them.
-pub fn kill(p: &Arc<IrqMutex<Process>>, pid: i32, signal: i32) -> Result<u64, Errno> {
-    const SIGKILL: i32 = 9;
-    if !(0..=64).contains(&signal) {
-        return Err(Errno::EINVAL);
-    }
-    if pid <= 0 {
-        return Err(Errno::ESRCH);
-    }
-    let compartment = p.lock().member.compartment().clone();
-    let target = find(&compartment, pid as u32).ok_or(Errno::ESRCH)?;
-    match signal {
-        0 => Ok(0),
-        SIGKILL => {
-            let threads: Vec<u64> = {
-                let mut t = target.lock();
-                t.killed_by.get_or_insert(SIGKILL);
-                t.threads.keys().copied().collect()
-            };
-            for thread in threads {
-                sched::request_exit(ThreadId(thread), 128 + i64::from(SIGKILL));
-            }
-            Ok(0)
-        }
-        _ => Err(Errno::EINVAL),
+/// The running process in the caller's compartment with PID `pid`, if any
+/// (kill(2) and tgkill(2) name processes this way).
+pub fn find_in(compartment: &Arc<Compartment>, pid: u32) -> Option<Arc<IrqMutex<Process>>> {
+    find(compartment, pid)
+}
+
+/// The thread with TID `tid` in `compartment`, and its process.
+pub fn find_thread(
+    compartment: &Arc<Compartment>,
+    tid: u32,
+) -> Option<(Arc<IrqMutex<Process>>, ThreadId)> {
+    PROCESSES.lock().iter().find_map(|(&thread, p)| {
+        let process = p.lock();
+        (Arc::ptr_eq(process.member.compartment(), compartment)
+            && process.threads.get(&thread).is_some_and(|t| t.tid == tid))
+        .then(|| (p.clone(), ThreadId(thread)))
+    })
+}
+
+/// Ends every thread of `target` because of `signal` (SIGKILL, or a
+/// signal whose default action terminates): the wait status is the
+/// signal.
+pub fn kill_all_threads(target: &Arc<IrqMutex<Process>>, signal: i32) {
+    let threads: Vec<u64> = {
+        let mut t = target.lock();
+        t.killed_by.get_or_insert(signal);
+        t.threads.keys().copied().collect()
+    };
+    for thread in threads {
+        sched::request_exit(ThreadId(thread), 128 + i64::from(signal));
     }
 }
 
@@ -603,7 +639,11 @@ pub fn wait(
         true
     };
     if block {
-        CHILD_EXITS.wait_until(&mut try_reap);
+        if !CHILD_EXITS.wait_until(&mut try_reap) {
+            // wait(2): "EINTR: WNOHANG was not set and an unblocked
+            // signal or a SIGCHLD was caught".
+            return Err(Errno::EINTR);
+        }
     } else {
         try_reap();
     }

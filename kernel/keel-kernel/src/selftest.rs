@@ -1035,11 +1035,11 @@ pub fn phase1_fs(t: &mut Runner) {
     let mut zeros = [0xAAu8; 64];
     let mut a = [0u8; 32];
     let mut b = [0u8; 32];
-    let devices_ok = fs::device_read(Device::Zero, &mut zeros) == 64
+    let devices_ok = fs::device_read(Device::Zero, &mut zeros) == Ok(64)
         && zeros == [0; 64]
-        && fs::device_read(Device::Null, &mut a) == 0
-        && fs::device_read(Device::Urandom, &mut a) == 32
-        && fs::device_read(Device::Urandom, &mut b) == 32
+        && fs::device_read(Device::Null, &mut a) == Ok(0)
+        && fs::device_read(Device::Urandom, &mut a) == Ok(32)
+        && fs::device_read(Device::Urandom, &mut b) == Ok(32)
         && a != b
         && fs::device_write(Device::Null, b"discarded") == 9
         && fs::device_write(Device::Console, b"") == 0;
@@ -1918,6 +1918,7 @@ fn phase3(t: &mut Runner) {
     phase3_hostile_executables(t);
     phase3_exit_status_order(t);
     phase3_threads(t);
+    phase3_signals(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -1953,6 +1954,33 @@ fn phase3_threads(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  threads: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T6: signal delivery on musl (fixtures/musl-dynamic/signals): 24
+/// checks that pass on Linux too (handlers and siginfo, masks, the
+/// alternate stack, SIGSEGV and SIGILL handlers that move RIP, FPU state
+/// kept and edited across a handler, default actions in forked children,
+/// tgkill to a thread blocked in a futex (EINTR) and to one spinning).
+/// Its line is checked on serial; nothing may be left over.
+fn phase3_signals(t: &mut Runner) {
+    use keel_linux_abi::process;
+    const PROGRAM: &[u8] = b"/test/musl-signals";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let (frames, processes) = (outside_heap(), process::count());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = status == Some((0, None)) && processes_after == processes && frames_after == frames;
+    t.check(
+        "exec.signals",
+        ok,
+        "signals on musl as on Linux: handlers with siginfo, masks, SA_RESETHAND, SIG_IGN, the alternate stack, fault handlers that edit the context (SEGV_MAPERR, SEGV_ACCERR, SIGILL), FPU state across a handler, default actions, tgkill with EINTR; nothing left over",
+    );
+    if !ok {
+        kprintln!(
+            "  signals: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

@@ -49,6 +49,9 @@ pub mod nr {
     pub const CLONE: u64 = 56;
     pub const FORK: u64 = 57;
     pub const KILL: u64 = 62;
+    pub const RT_SIGRETURN: u64 = 15;
+    pub const TKILL: u64 = 200;
+    pub const TGKILL: u64 = 234;
     pub const GETTID: u64 = 186;
     pub const FUTEX: u64 = 202;
     pub const EXECVE: u64 = 59;
@@ -75,6 +78,7 @@ pub fn init() {
     keel_hal::syscall::set_handler(handle);
     keel_hal::vm::set_file_reader(read_mapped_page);
     sched::set_exit_hook(process::on_thread_exit);
+    crate::signal::init();
 }
 
 /// Which unimplemented numbers below TABLE_SIZE have been logged: a fixed
@@ -114,7 +118,16 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
     t[nr::GETTID as usize] =
         Some(|p, _| process::with_current_thread(p, |t| u64::from(t.tid)).ok_or(Errno::ESRCH));
-    t[nr::KILL as usize] = Some(|p, a| process::kill(p, a[0] as u32 as i32, a[1] as u32 as i32));
+    t[nr::KILL as usize] = Some(|p, a| kill(p, a[0] as u32 as i32, a[1] as u32 as i32));
+    t[nr::TKILL as usize] = Some(|p, a| tgkill(p, None, a[0] as u32 as i32, a[1] as u32 as i32));
+    t[nr::TGKILL as usize] = Some(|p, a| {
+        tgkill(
+            p,
+            Some(a[0] as u32 as i32),
+            a[1] as u32 as i32,
+            a[2] as u32 as i32,
+        )
+    });
     t[nr::FUTEX as usize] = Some(|p, a| {
         let space = p.lock().space()?.id();
         crate::futex::futex(
@@ -240,6 +253,12 @@ fn dispatch(call: &SyscallArgs) -> i64 {
         // do not get.
         nr::FORK => match process::current() {
             Some(p) => process::fork(&p, &call.frame),
+            None => unimplemented(number, &a),
+        },
+        // rt_sigreturn replaces every register, so it needs the caller's
+        // frame; its result is the restored RAX, not an errno.
+        nr::RT_SIGRETURN => match process::current() {
+            Some(p) => return crate::signal::rt_sigreturn(&p, &call.frame),
             None => unimplemented(number, &a),
         },
         nr::SIGALTSTACK => match process::current() {
@@ -516,6 +535,9 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
             t.clear_child_tid = 0;
         }
         process.signals.reset_for_exec();
+        if let Some(t) = process.threads.get_mut(&sched::current().0) {
+            t.signals.reset_for_exec();
+        }
         (old, process.handles.take_close_on_exec())
     };
     // Closed outside the process lock, as close(2) does.
@@ -614,7 +636,7 @@ fn read_at(
             }
             Kind::Directory => return Err(Errno::EISDIR),
             // No lock held: a console read can wait for the keyboard.
-            Kind::Device(device) => fs::device_read(device, &mut chunk[..want]),
+            Kind::Device(device) => fs::device_read(device, &mut chunk[..want])?,
         };
         // A terminal read returns at most one line.
         if kind == Kind::Device(Device::Console) {
@@ -1278,14 +1300,36 @@ fn rt_sigaction(
     } else {
         None
     };
-    let old = p.lock().signals.sigaction(sig, new)?;
+    let old = {
+        let mut process = p.lock();
+        let old = process.signals.sigaction(sig, new)?;
+        // do_sigaction: a signal set to be ignored is dropped wherever it
+        // is pending ("POSIX 3.3.1.3: Setting a signal action to SIG_IGN
+        // for a signal that is pending shall cause the pending signal to
+        // be discarded, whether or not it is blocked"), SIGCHLD,
+        // SIGWINCH and SIGURG with SIG_DFL too.
+        if let Some(action) = new
+            && (action.handler == keel_core::signal::SIG_IGN
+                || (action.handler == keel_core::signal::SIG_DFL
+                    && keel_core::signal::default_action(sig)
+                        == keel_core::signal::DefaultAction::Ignore))
+        {
+            let bit = keel_core::signal::sigmask(sig);
+            process.pending.discard(bit);
+            for t in process.threads.values_mut() {
+                t.signals.pending.discard(bit);
+            }
+        }
+        old
+    };
     if oldact != 0 {
         copy_to_user(oldact, &old.to_bytes()).map_err(fault)?;
     }
     Ok(0)
 }
 
-/// rt_sigprocmask(2): records the blocked mask.
+/// rt_sigprocmask(2): the calling thread's blocked mask. A signal it
+/// unblocks that is pending is delivered as the call returns.
 fn rt_sigprocmask(
     p: &Arc<IrqMutex<Process>>,
     how: i32,
@@ -1304,14 +1348,15 @@ fn rt_sigprocmask(
     } else {
         None
     };
-    let old = p.lock().signals.sigprocmask(how, new)?;
+    let old = process::with_current_thread(p, |t| t.signals.sigprocmask(how, new))
+        .ok_or(Errno::ESRCH)??;
     if oldset != 0 {
         copy_to_user(oldset, &old.to_le_bytes()).map_err(fault)?;
     }
     Ok(0)
 }
 
-/// sigaltstack(2): records the alternate signal stack. `user_rsp` decides
+/// sigaltstack(2): the calling thread's alternate signal stack. `user_rsp` decides
 /// whether the caller runs on it (then a change is EPERM).
 fn sigaltstack(p: &Arc<IrqMutex<Process>>, ss: u64, old_ss: u64, user_rsp: u64) -> SysResult {
     use keel_core::signal::{AltStack, STACK_T_SIZE};
@@ -1322,9 +1367,62 @@ fn sigaltstack(p: &Arc<IrqMutex<Process>>, ss: u64, old_ss: u64, user_rsp: u64) 
     } else {
         None
     };
-    let old = p.lock().signals.sigaltstack(new, user_rsp)?;
+    let old = process::with_current_thread(p, |t| t.signals.sigaltstack(new, user_rsp))
+        .ok_or(Errno::ESRCH)??;
     if old_ss != 0 {
         copy_to_user(old_ss, &old.to_bytes()).map_err(fault)?;
+    }
+    Ok(0)
+}
+
+/// kill(2) (P3-T6): sends `signal` to the process `pid` of the caller's
+/// compartment (ESRCH if there is none: a PID names a process only in its
+/// own compartment, ADR 0014), with `si_code` SI_USER and the caller's PID
+/// as `si_pid`. Signal 0 only checks that the process exists. EINVAL
+/// outside 0 to 64. Process groups (PID 0 or negative) are ESRCH for now:
+/// they arrive with P3-T7.
+fn kill(p: &Arc<IrqMutex<Process>>, pid: i32, signal: i32) -> SysResult {
+    use keel_core::signal::{NSIG, SI_USER, SigInfo};
+    if !(0..=NSIG as i32).contains(&signal) {
+        return Err(Errno::EINVAL);
+    }
+    if pid <= 0 {
+        return Err(Errno::ESRCH);
+    }
+    let (compartment, me) = {
+        let process = p.lock();
+        (process.member.compartment().clone(), process.pid())
+    };
+    let target = process::find_in(&compartment, pid as u32).ok_or(Errno::ESRCH)?;
+    if signal != 0 {
+        crate::signal::send_to_process(&target, SigInfo::from_process(signal, SI_USER, me, 0));
+    }
+    Ok(0)
+}
+
+/// tgkill(2) and, with `tgid` None, tkill(2): sends `signal` to the thread
+/// `tid` (of the process `tgid`) in the caller's compartment, with
+/// `si_code` SI_TKILL. EINVAL for a TID or TGID not above 0 or a signal
+/// outside 0 to 64; ESRCH if no such thread.
+fn tgkill(p: &Arc<IrqMutex<Process>>, tgid: Option<i32>, tid: i32, signal: i32) -> SysResult {
+    use keel_core::signal::{NSIG, SI_TKILL, SigInfo};
+    if !(0..=NSIG as i32).contains(&signal) || tid <= 0 || tgid.is_some_and(|g| g <= 0) {
+        return Err(Errno::EINVAL);
+    }
+    let (compartment, me) = {
+        let process = p.lock();
+        (process.member.compartment().clone(), process.pid())
+    };
+    let (target, thread) = process::find_thread(&compartment, tid as u32).ok_or(Errno::ESRCH)?;
+    if tgid.is_some_and(|g| target.lock().pid() != g as u32) {
+        return Err(Errno::ESRCH);
+    }
+    if signal != 0 {
+        crate::signal::send_to_thread(
+            &target,
+            thread,
+            SigInfo::from_process(signal, SI_TKILL, me, 0),
+        );
     }
     Ok(0)
 }

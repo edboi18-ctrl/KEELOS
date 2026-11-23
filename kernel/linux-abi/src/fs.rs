@@ -117,11 +117,12 @@ pub fn read_file(path: &[u8]) -> Result<Arc<Vec<u8>>, Errno> {
 }
 
 /// Reads from a device. `/dev/console` waits for a line from the
-/// keyboard (see `tty`); call it with no lock held.
-pub fn device_read(device: Device, buf: &mut [u8]) -> usize {
-    match device {
+/// keyboard (see `tty`); call it with no lock held. EINTR if a signal
+/// cuts that wait short.
+pub fn device_read(device: Device, buf: &mut [u8]) -> Result<usize, Errno> {
+    Ok(match device {
         Device::Null => 0,
-        Device::Console => crate::tty::read(buf),
+        Device::Console => crate::tty::read(buf).ok_or(Errno::EINTR)?,
         Device::Zero => {
             buf.fill(0);
             buf.len()
@@ -131,7 +132,7 @@ pub fn device_read(device: Device, buf: &mut [u8]) -> usize {
             random::fill(buf);
             buf.len()
         }
-    }
+    })
 }
 
 /// Writes to a device; returns the bytes consumed.

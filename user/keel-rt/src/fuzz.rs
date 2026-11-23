@@ -57,11 +57,29 @@ const NR_OPENAT: u64 = 257;
 /// compartment with a process limit (P3-S8); fork has its own tests. Nor
 /// kill (a random SIGKILL could end the fuzzer itself) or futex (a
 /// FUTEX_WAIT whose value happens to match would block for ever, which the
-/// harness counts as a hung run); both have their own tests.
+/// harness counts as a hung run); both have their own tests. Nor
+/// rt_sigreturn (it would load registers from whatever lies on the stack
+/// and jump there) or tkill and tgkill (a random fatal signal, as kill);
+/// signals have their own test (exec.signals).
 const NR_EXIT: u64 = 60;
 const NR_EXIT_GROUP: u64 = 231;
 const NR_EXECVE: u64 = 59;
-const NEVER: [u64; 8] = [56, 57, 58, NR_EXECVE, 62, NR_EXIT, 202, NR_EXIT_GROUP];
+const NR_RT_SIGRETURN: u64 = 15;
+const NR_TKILL: u64 = 200;
+const NR_TGKILL: u64 = 234;
+const NEVER: [u64; 11] = [
+    56,
+    57,
+    58,
+    NR_EXECVE,
+    62,
+    NR_EXIT,
+    202,
+    NR_EXIT_GROUP,
+    NR_RT_SIGRETURN,
+    NR_TKILL,
+    NR_TGKILL,
+];
 
 /// Size of the scratch region whose address the fuzzer hands out.
 const SCRATCH: u64 = 64 * 1024;

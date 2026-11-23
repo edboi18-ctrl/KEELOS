@@ -78,6 +78,7 @@ pub const PHASES: &[Phase] = &[
             "Hello from dynamically linked musl on Keel",
             "Hello from a musl shared library on Keel (count 3)",
             "threads: 4 workers, counter 40000, results 100, thread-local values kept",
+            "signals: 24 checks passed",
         ],
         expect_prefixes: &[],
     },

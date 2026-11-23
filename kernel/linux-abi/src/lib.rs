@@ -24,6 +24,8 @@ pub mod futex;
 #[cfg(target_os = "none")]
 pub mod process;
 #[cfg(target_os = "none")]
+pub mod signal;
+#[cfg(target_os = "none")]
 pub mod syscall;
 #[cfg(target_os = "none")]
 pub mod tty;

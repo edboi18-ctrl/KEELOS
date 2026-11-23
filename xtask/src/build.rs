@@ -346,6 +346,16 @@ pub const TEST_FIXTURES: &[TestFixture] = &[
         stdout: Some("threads: 4 workers, counter 40000, results 100, thread-local values kept\n"),
         host_via: Some("lib/ld-musl-x86_64.so.1"),
     },
+    // P3-T6: signal delivery on musl (handlers, masks, the alternate
+    // stack, faults with an edited context, FPU state, default actions,
+    // per-thread signals and EINTR).
+    TestFixture {
+        path: "test/musl-signals",
+        file: "fixtures/musl-dynamic/signals",
+        hash_file: "fixtures/musl-dynamic/signals.sha256",
+        stdout: Some("signals: 24 checks passed\n"),
+        host_via: Some("lib/ld-musl-x86_64.so.1"),
+    },
     TestFixture {
         path: "lib/libkeelgreet.so",
         file: "fixtures/musl-dynamic/libkeelgreet.so",

@@ -30,6 +30,9 @@ const WANTED_XCR0: u64 = 0b1110_0111;
 /// 0: FXSAVE; otherwise the XCR0 mask used with XSAVE.
 static XSAVE_MASK: AtomicU64 = AtomicU64::new(0);
 static AREA_SIZE: AtomicU64 = AtomicU64::new(FXSAVE_SIZE);
+/// The MXCSR bits this CPU accepts (`MXCSR_MASK`, FXSAVE bytes 28-31; 0
+/// there means 0xFFBF: SDM Vol. 1 section 11.6.6). Read once at `init`.
+static MXCSR_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0xFFBF);
 
 /// Configuration chosen by `init`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub struct FpuReport {
 pub fn init() -> FpuReport {
     let (_, _, ecx1, _) = cpu::cpuid(1, 0);
     let xsave = ecx1 & (1 << 26) != 0;
+    record_mxcsr_mask();
     // SAFETY: CR0.MP = 1 and EM = 0 are the documented settings for SSE
     // (SDM Vol. 3 section 14.1.3); TS = 0 so FPU instructions do not trap.
     // OSFXSR and OSXMMEXCPT are architectural on every x86-64 CPU;
@@ -82,6 +86,56 @@ pub fn init() -> FpuReport {
         xcr0: Some(mask),
         area_size: u64::from(size),
     }
+}
+
+/// Reads MXCSR_MASK with one FXSAVE into a scratch area.
+fn record_mxcsr_mask() {
+    #[repr(C, align(16))]
+    struct Area([u8; 512]);
+    let mut area = Area([0; 512]);
+    // Assembly reasoning (spec section 1, rule 4)
+    // Instruction: `fxsave64 [area]` stores the 512-byte legacy area,
+    //   which needs a 16-byte aligned destination (SDM Vol. 2A "FXSAVE");
+    //   `Area` is aligned 16 and 512 bytes long. MXCSR_MASK is at bytes
+    //   28-31 (Table 10-2). Registers and flags are unchanged.
+    // SAFETY: the area is a local, aligned and large enough.
+    unsafe {
+        core::arch::asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack, preserves_flags));
+    }
+    let mask = u32::from_le_bytes([area.0[28], area.0[29], area.0[30], area.0[31]]);
+    MXCSR_MASK.store(if mask == 0 { 0xFFBF } else { mask }, Ordering::Relaxed);
+}
+
+/// Size of a thread's save area (what a signal frame carries).
+pub fn area_size() -> usize {
+    AREA_SIZE.load(Ordering::Relaxed) as usize
+}
+
+/// The XCR0 mask in use, or 0 when only FXSAVE is.
+pub fn xsave_mask() -> u64 {
+    XSAVE_MASK.load(Ordering::Relaxed)
+}
+
+/// Whether `bytes`, a save area from user memory (rt_sigreturn), can be
+/// loaded without a fault: the right size; MXCSR within MXCSR_MASK (FXRSTOR
+/// and XRSTOR raise #GP otherwise: SDM Vol. 2A "FXRSTOR"); and with XSAVE
+/// a standard-form header (SDM Vol. 1 section 13.8.1, Vol. 2C "XRSTOR"):
+/// XSTATE_BV only components enabled in XCR0, XCOMP_BV 0, and the rest of
+/// the 64-byte header zero.
+pub fn valid_user_area(bytes: &[u8]) -> bool {
+    if bytes.len() != area_size() {
+        return false;
+    }
+    let mxcsr = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    if mxcsr & !MXCSR_MASK.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let mask = xsave_mask();
+    if mask == 0 {
+        return true;
+    }
+    let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0xff; 8]));
+    word(512) & !mask == 0 && word(520) == 0 && bytes[528..576].iter().all(|&b| b == 0)
 }
 
 /// Writes an extended control register.
@@ -177,6 +231,28 @@ impl FpuState {
                 core::arch::asm!("fxrstor64 [{}]", in(reg) area, options(nostack, readonly));
             }
         }
+    }
+}
+
+impl FpuState {
+    /// The saved registers, as `save` stored them.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: the area is `size` bytes, allocated in `new` and owned
+        // exclusively by this value; any bytes are valid `u8`s.
+        unsafe { core::slice::from_raw_parts(self.area.as_ptr(), self.size) }
+    }
+
+    /// Replaces the saved registers with `bytes`, which must pass
+    /// `valid_user_area` (so a later `restore` cannot fault). Returns
+    /// whether it did.
+    pub fn load_bytes(&mut self, bytes: &[u8]) -> bool {
+        if !valid_user_area(bytes) || bytes.len() != self.size {
+            return false;
+        }
+        // SAFETY: as `bytes`, mutably: the borrow of `self` is exclusive.
+        unsafe { core::slice::from_raw_parts_mut(self.area.as_ptr(), self.size) }
+            .copy_from_slice(bytes);
+        true
     }
 }
 

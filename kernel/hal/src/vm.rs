@@ -549,6 +549,14 @@ impl AddressSpace {
         Ok(child)
     }
 
+    /// Whether a mapping covers `address` (whatever its protection): a
+    /// fault there is an access error, SEGV_ACCERR, and elsewhere a
+    /// missing mapping, SEGV_MAPERR (Linux `arch/x86/mm/fault.c`,
+    /// bad_area and access_error).
+    pub fn is_mapped(&self, address: u64) -> bool {
+        self.inner.lock().layout.find(address).is_some()
+    }
+
     /// Bytes of user address space covered by mappings (reserved or not).
     pub fn mapped_bytes(&self) -> u64 {
         self.inner

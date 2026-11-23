@@ -61,9 +61,14 @@ struct Thread {
     /// whenever this thread is switched in. The kernel never uses FS or GS
     /// itself (ADR 0005), so these need no saving on kernel entry.
     user_bases: [u64; 2],
-    /// Set by `exec_current` during a system call: the new program's RIP
-    /// and RSP, which the system-call return path puts in the frame.
-    pending_exec: Option<(u64, u64)>,
+    /// Set during a system call by `exec_current` (the new program's
+    /// entry) or `set_pending_frame` (rt_sigreturn): the user registers the
+    /// system-call return path puts in the frame in place of the caller's.
+    pending_frame: Option<crate::arch::x86_64::idt::TrapFrame>,
+    /// Set by `interrupt`: a signal is waiting for this thread, so a
+    /// blocking system call should return early (EINTR). Cleared by
+    /// `clear_interrupt` once the signal code has looked.
+    interrupted: bool,
     /// Set by `request_exit`: the thread ends with this status the next
     /// time it would return to user mode, and stops blocking meanwhile.
     exit_request: Option<i64>,
@@ -155,7 +160,8 @@ pub fn init() -> Result<(), SchedError> {
         space: None,
         user_entry: None,
         user_bases: [0; 2],
-        pending_exec: None,
+        pending_frame: None,
+        interrupted: false,
         exit_request: None,
     });
     let mut sched = Scheduler {
@@ -241,7 +247,8 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         space: None,
         user_entry: None,
         user_bases: [0; 2],
-        pending_exec: None,
+        pending_frame: None,
+        interrupted: false,
         exit_request: None,
     }))
 }
@@ -600,7 +607,12 @@ pub fn exec_current(space: Arc<AddressSpace>, rip: u64, rsp: u64) -> Result<(), 
         // area for the next switch.
         fresh.restore();
         thread.fpu = fresh;
-        thread.pending_exec = Some((rip, rsp));
+        thread.pending_frame = Some(crate::arch::x86_64::idt::TrapFrame {
+            rip,
+            rsp,
+            rflags: crate::arch::x86_64::entry::RFLAGS_FIXED,
+            ..Default::default()
+        });
     }
     drop(old);
     Ok(())
@@ -641,13 +653,128 @@ pub fn exit_requested() -> Option<i64> {
         .and_then(|t| t.exit_request)
 }
 
-/// The entry point and stack `exec_current` left for the running thread,
-/// taken (so they are used once).
-pub(crate) fn take_pending_exec() -> Option<(u64, u64)> {
+/// The user registers `exec_current` or `set_pending_frame` left for the
+/// running thread, taken (so they are used once).
+pub(crate) fn take_pending_frame() -> Option<crate::arch::x86_64::idt::TrapFrame> {
     let mut guard = SCHED.lock();
     let sched = guard.as_mut()?;
     let current = sched.current;
-    sched.threads.get_mut(&current)?.pending_exec.take()
+    sched.threads.get_mut(&current)?.pending_frame.take()
+}
+
+/// Makes the running thread's current system call return to user mode
+/// with `frame`'s registers instead of the caller's (rt_sigreturn). Only
+/// the registers are taken: the selectors stay the user ones, and RFLAGS,
+/// RIP and RSP are made safe by `prepare_user_return`, as on every return.
+pub fn set_pending_frame(frame: crate::arch::x86_64::idt::TrapFrame) {
+    let mut guard = SCHED.lock();
+    if let Some(sched) = guard.as_mut() {
+        let current = sched.current;
+        if let Some(thread) = sched.threads.get_mut(&current) {
+            thread.pending_frame = Some(frame);
+        }
+    }
+}
+
+/// Tells thread `id` a signal is waiting for it: if it is blocked or
+/// sleeping it is made ready, and `WaitQueue::wait_until` returns early for
+/// it, so a blocking system call can return EINTR (signal(7), "Interruption
+/// of system calls and library functions by signal handlers"). Returns
+/// whether the thread exists and has not exited.
+pub fn interrupt(id: ThreadId) -> bool {
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else {
+        return false;
+    };
+    let Some(thread) = sched.threads.get_mut(&id.0) else {
+        return false;
+    };
+    if thread.state == State::Exited {
+        return false;
+    }
+    thread.interrupted = true;
+    if matches!(thread.state, State::Blocked | State::Sleeping { .. }) {
+        thread.state = State::Ready;
+        sched.ready.push_back(id.0);
+    }
+    true
+}
+
+/// Whether the running thread has been interrupted (`interrupt`) since the
+/// last `clear_interrupt`.
+pub fn interrupted() -> bool {
+    SCHED
+        .lock()
+        .as_ref()
+        .and_then(|s| s.threads.get(&s.current))
+        .is_some_and(|t| t.interrupted)
+}
+
+/// Clears the running thread's interrupt flag (the signal code calls it on
+/// the way back to user mode, when it has seen what is pending).
+pub fn clear_interrupt() {
+    let mut guard = SCHED.lock();
+    if let Some(sched) = guard.as_mut() {
+        let current = sched.current;
+        if let Some(thread) = sched.threads.get_mut(&current) {
+            thread.interrupted = false;
+        }
+    }
+}
+
+/// The running thread's user FPU/SSE/AVX registers, in the save format
+/// (XSAVE standard form, or FXSAVE), for a signal frame. The CPU's
+/// registers are the running thread's own (they are switched eagerly), so
+/// they are saved first.
+pub fn save_user_fpu() -> Option<Vec<u8>> {
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let current = sched.current;
+    let thread = sched.threads.get_mut(&current)?;
+    thread.fpu.save();
+    Some(thread.fpu.bytes().to_vec())
+}
+
+/// Loads `bytes` into the running thread's FPU registers (rt_sigreturn),
+/// if they pass `fpu::valid_user_area`; returns whether they did. Saved
+/// area and registers change together under the scheduler lock, so a
+/// switch in between cannot overwrite one with the other.
+pub fn load_user_fpu(bytes: &[u8]) -> bool {
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else {
+        return false;
+    };
+    let current = sched.current;
+    let Some(thread) = sched.threads.get_mut(&current) else {
+        return false;
+    };
+    if !thread.fpu.load_bytes(bytes) {
+        return false;
+    }
+    thread.fpu.restore();
+    true
+}
+
+/// Puts the running thread's FPU registers in their initial state (x87
+/// control word 037FH, MXCSR 1F80H): what a signal handler starts with,
+/// as Linux's fpu__clear_user_states (`arch/x86/kernel/fpu/core.c`).
+pub fn reset_user_fpu() -> bool {
+    let Some(fresh) = FpuState::new() else {
+        return false;
+    };
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else {
+        return false;
+    };
+    let current = sched.current;
+    let Some(thread) = sched.threads.get_mut(&current) else {
+        return false;
+    };
+    fresh.restore();
+    let old = core::mem::replace(&mut thread.fpu, fresh);
+    drop(guard);
+    drop(old);
+    true
 }
 
 /// Ends the running thread.
@@ -892,14 +1019,15 @@ impl WaitQueue {
     /// Blocks until `condition` returns true.
     /// Blocks until `condition` returns true, and returns true; or returns
     /// false early if the running thread has been asked to exit
-    /// (`request_exit`), so its system call can end.
+    /// (`request_exit`) or interrupted by a signal (`interrupt`), so its
+    /// system call can end.
     pub fn wait_until(&self, mut condition: impl FnMut() -> bool) -> bool {
         loop {
             let mut waiters = self.waiters.lock();
             if condition() {
                 return true;
             }
-            if exit_requested().is_some() {
+            if exit_requested().is_some() || interrupted() {
                 return false;
             }
             let me = SCHED.lock().as_ref().map_or(0, |s| s.current);

@@ -26,7 +26,8 @@ the same as `fixtures/musl-hello`. The build writes these files to `out/`:
 - `ld-musl.owner`, the package that owns the dynamic linker:
   `musl-1.2.6-r3`;
 - `greet` and `libkeelgreet.so`, with `greet.sha256` and
-  `libkeelgreet.sha256`.
+  `libkeelgreet.sha256`;
+- `threads` and `signals`, with `threads.sha256` and `signals.sha256`.
 
 ## Reference build
 
@@ -49,6 +50,10 @@ These were built on 2026-11-23 and committed:
 - `threads` (P3-T4, musl pthreads; see the comments in `threads.c`):
   SHA-256
   `5f9a6dba8d4a4bd87868874b984f1ae605dd4a97ab4ab2d0845ba0b7d5206f57`.
+- `signals` (P3-T6, signal delivery; see the comments in `signals.c`):
+  SHA-256
+  `57ac1a919156ed1a40d624171d7f84f7720c2304aba82cfccdb42d8a2c81ae6d`.
+  Adding it changed no other output or `packages.txt`.
 
 Two more builds with `--no-cache` gave the same hashes and the same
 `packages.txt`. Adding `greet` changed neither `hello` nor the dynamic
