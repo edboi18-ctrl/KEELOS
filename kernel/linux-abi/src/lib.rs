@@ -14,9 +14,13 @@ pub mod abi;
 pub mod names;
 
 #[cfg(target_os = "none")]
+pub mod compartment;
+#[cfg(target_os = "none")]
 pub mod exec;
 #[cfg(target_os = "none")]
 pub mod fs;
+#[cfg(target_os = "none")]
+pub mod futex;
 #[cfg(target_os = "none")]
 pub mod process;
 #[cfg(target_os = "none")]

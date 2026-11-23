@@ -74,7 +74,7 @@ Built by `wine/build/Dockerfile` (the `wine-image` workflow); see
 | --- | --- | --- | --- |
 | Wine source | 11.0 (stable, 2026-01-13) | LGPL-2.1-or-later | `https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz`, SHA-256 `c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701`, checked by the build. Upstream signature verified 2026-11-22 against key `DA23 579A 74D4 AD9A F9D3 F945 CEFA C8EA AF17 519D` (Alexandre Julliard), fetched from keyserver.ubuntu.com: trust on first use. |
 | Base image | `alpine:3.24.4` | MIT and others (Alpine) | digest `sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf` |
-| Build packages | Alpine 3.24 (`build-base`, `mingw-w64-gcc` 15.2.0, `flex`, `bison`, `linux-headers`, `perl`; `strace` for the trace) | various | not hash-pinned; every installed version is written to `packages.txt` in the output |
+| Build packages | Alpine 3.24: `build-base`, `mingw-w64-gcc` 15.2.0, `flex`, `bison`, `linux-headers`, `perl`, `xz`, `strace` 6.19 and their dependencies, 39 files | various (each package's license is in `packages.txt` in the output) | every file by SHA-256 in `wine/build/packages.lock`, checked before install; renewal procedure in `wine/build/README.md` |
 
 ## Host tools (not build inputs)
 

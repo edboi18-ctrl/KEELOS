@@ -5,14 +5,49 @@
 #
 # Pinned and verified (SR-29): the base image by digest; the Wine source
 # by SHA-256 (its upstream signature was checked when the pin was made,
-# see README.md); every installed Alpine package is listed with its exact
-# version in packages.txt next to the output.
-FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS build
+# see README.md); every Alpine package the build adds by SHA-256, in
+# packages.lock. To renew the package pins (Alpine replaces a package when
+# it publishes a fix, and the old file leaves the mirror, so the build then
+# fails until the pins are renewed on purpose):
+#     docker build --target pins --output type=local,dest=. wine/build
 
 # build-base: gcc, make, musl-dev. mingw-w64-gcc: the PE cross-compiler
 # that --enable-archs requires for Wine's Windows-side DLLs. flex and
-# bison: Wine's parsers. linux-headers: kernel UAPI headers.
-RUN apk add --no-cache build-base mingw-w64-gcc flex bison linux-headers perl xz
+# bison: Wine's parsers. linux-headers: kernel UAPI headers. perl: build
+# scripts. xz: compressing the output. strace: the trace.
+ARG PACKAGES="build-base mingw-w64-gcc flex bison linux-headers perl xz strace"
+
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS base
+
+# Writes packages.lock: the SHA-256 and file name of every package
+# `apk add $PACKAGES` installs on top of the base image, dependencies
+# included. File names carry the exact version.
+FROM base AS lock
+ARG PACKAGES
+WORKDIR /pins
+RUN apk info -v | sort > /before \
+ && apk add --no-cache ${PACKAGES} \
+ && apk info -v | sort > /after \
+ && comm -13 /before /after | sed 's/-[^-]*-r[0-9]*$//' > names \
+ && apk fetch --no-cache $(cat names) \
+ && sha256sum *.apk > packages.lock \
+ && test "$(wc -l < packages.lock)" = "$(wc -l < names)"
+FROM scratch AS pins
+COPY --from=lock /pins/packages.lock /
+
+# Installs exactly the pinned files: apk fetches each package by name,
+# sha256sum -c then requires every pinned file name (so every version) and
+# hash, no other file may be present, and apk installs from those files
+# alone with no network (so every dependency must be among them). apk also
+# checks each package's Alpine signature, as for any install.
+FROM base AS build
+WORKDIR /pkgs
+COPY packages.lock .
+RUN apk fetch --no-cache $(sed -e 's/^[0-9a-f]*  //' -e 's/-[^-]*-r[0-9]*\.apk$//' packages.lock) \
+ && sha256sum -c packages.lock \
+ && test "$(ls *.apk | wc -l)" = "$(wc -l < packages.lock)" \
+ && apk add --no-cache --no-network ./*.apk \
+ && cd / && rm -rf /pkgs
 
 ARG WINE_VERSION=11.0
 ARG WINE_SHA256=c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
@@ -55,8 +90,7 @@ RUN ./configure --prefix=/opt/wine \
  && grep -x "LDFLAGS = -Wl,-rpath,'\$\$ORIGIN'" Makefile \
  && make -j"$(nproc)" \
  && make install \
- && readelf -d /opt/wine/lib/wine/x86_64-unix/ws2_32.so | grep -F 'RUNPATH' | grep -F '$ORIGIN' \
- && apk list --installed | sort > /packages-build.txt
+ && readelf -d /opt/wine/lib/wine/x86_64-unix/ws2_32.so | grep -F 'RUNPATH' | grep -F '$ORIGIN'
 
 # The trace (spec section 10, "trace first"): on the CI runner's real
 # Linux kernel, through musl. The prefix is created first and traced on
@@ -68,7 +102,6 @@ RUN ./configure --prefix=/opt/wine \
 # install only when .update-timestamp is stale (programs/wineboot/
 # wineboot.c, update_wineprefix).
 FROM build AS trace
-RUN apk add --no-cache strace
 ENV WINEPREFIX=/tmp/prefix WINEDEBUG=-all PATH=/opt/wine/bin:$PATH
 WORKDIR /trace
 RUN strace -f -s 256 -o prefix-trace.txt wineboot --init > prefix-stdout.txt 2>&1; \
@@ -77,6 +110,7 @@ RUN strace -f -s 256 -o prefix-trace.txt wineboot --init > prefix-stdout.txt 2>&
     echo "exit $?" >> hello-stdout.txt; \
     strace -f -c -o counts.txt wine cmd /c echo hello > /dev/null 2>&1; \
     apk list --installed | sort > packages.txt; \
+    uname -srm > kernel.txt; \
     cd /opt && tar -cf - wine | xz -9 > /trace/wine-11.0-musl-x86_64.tar.xz; \
     cd /trace && sha256sum * > SHA256SUMS
 

@@ -8,11 +8,15 @@
 //! chapters; Linux `include/uapi/linux/elf.h` and `elf-em.h` at v6.12
 //! (`Elf64_Ehdr`, `Elf64_Phdr`, `PT_*`, `PF_*`, `ET_*`, `EM_X86_64` = 62).
 //!
-//! Accepted: little-endian ELF64 for x86-64, `ET_EXEC`, or `ET_DYN` with no
-//! `PT_INTERP` (static PIE; the caller picks the load bias). Refused:
-//! `PT_INTERP` (dynamic linking arrives in Phase 3, P3-T2), any segment
-//! that is both writable and executable, and an executable stack request
-//! (`PT_GNU_STACK` with `PF_X`), both by SR-12.
+//! Accepted: little-endian ELF64 for x86-64, `ET_EXEC` or `ET_DYN` (the
+//! caller picks the load bias), with at most one `PT_INTERP` naming the
+//! dynamic linker (P3-T2). Its path is checked as Linux does in
+//! `load_elf_binary` (`fs/binfmt_elf.c` at v6.12): between 2 and
+//! `PATH_MAX` bytes including the terminating NUL, which must be the last
+//! byte, else ENOEXEC. Stricter than Linux (SR-10, fail closed): a NUL
+//! before the end, or a second `PT_INTERP`, is refused rather than
+//! ignored. Refused: any segment that is both writable and executable, and
+//! an executable stack request (`PT_GNU_STACK` with `PF_X`), both by SR-12.
 
 use alloc::vec::Vec;
 
@@ -33,6 +37,9 @@ const EM_X86_64: u16 = 62;
 /// Sizes of `Elf64_Ehdr` and `Elf64_Phdr`.
 pub const EHDR_SIZE: usize = 64;
 pub const PHDR_SIZE: usize = 56;
+
+/// Longest `PT_INTERP` contents, NUL included: Linux's PATH_MAX.
+const PATH_MAX: u64 = 4096;
 
 /// Largest program-header table accepted: one page, as Linux
 /// (`load_elf_phdrs` in `fs/binfmt_elf.c` refuses `size > ELF_MIN_ALIGN`).
@@ -62,8 +69,13 @@ pub enum ElfError {
     /// Header or program-header sizes are not the ELF64 ones, or the table
     /// is empty or larger than one page.
     BadHeaderTable,
-    /// Needs an interpreter (dynamic linking); not supported yet.
+    /// Names an interpreter where none may be (the interpreter itself has
+    /// a `PT_INTERP`).
     Interpreter,
+    /// A malformed `PT_INTERP`: outside the file, shorter than 2 or longer
+    /// than `PATH_MAX` bytes, not NUL-terminated, a NUL inside, or a
+    /// second one.
+    BadInterpreter,
     /// A segment's file bytes lie outside the file, or exceed its memory
     /// size.
     BadSegment,
@@ -129,9 +141,17 @@ pub struct Image {
     pub phdr_vaddr: Option<u64>,
     /// Number of program headers (`AT_PHNUM`).
     pub phnum: u16,
+    /// Where the interpreter's path lies in the file, without the NUL.
+    pub interpreter: Option<core::ops::Range<usize>>,
 }
 
 impl Image {
+    /// The interpreter path (`PT_INTERP`, without its NUL) in `file`, the
+    /// bytes this image was parsed from.
+    pub fn interpreter<'f>(&self, file: &'f [u8]) -> Option<&'f [u8]> {
+        file.get(self.interpreter.clone()?)
+    }
+
     /// First page and end of the last page of the loaded image, before the
     /// load bias.
     pub fn span(&self) -> (u64, u64) {
@@ -231,13 +251,33 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut phdr_segment: Option<u64> = None;
+    let mut interpreter = None;
     for header in table.as_chunks::<PHDR_SIZE>().0 {
         // Elf64_Phdr: p_type 0, p_flags 4, p_offset 8, p_vaddr 16,
         // p_filesz 32, p_memsz 40.
         let p_type = u32_at(header, 0)?;
         let flags = u32_at(header, 4)?;
         match p_type {
-            PT_INTERP => return Err(ElfError::Interpreter),
+            PT_INTERP => {
+                if interpreter.is_some() {
+                    return Err(ElfError::BadInterpreter);
+                }
+                let size = u64_at(header, 32)?;
+                if !(2..=PATH_MAX).contains(&size) {
+                    return Err(ElfError::BadInterpreter);
+                }
+                let start =
+                    usize::try_from(u64_at(header, 8)?).map_err(|_| ElfError::BadInterpreter)?;
+                let end = start
+                    .checked_add(size as usize)
+                    .ok_or(ElfError::BadInterpreter)?;
+                let path = bytes.get(start..end).ok_or(ElfError::BadInterpreter)?;
+                // The last byte is the NUL, and the only one.
+                if path.iter().position(|&b| b == 0) != Some(path.len() - 1) {
+                    return Err(ElfError::BadInterpreter);
+                }
+                interpreter = Some(start..end - 1);
+            }
             PT_GNU_STACK if flags & PF_X != 0 => return Err(ElfError::ExecutableStack),
             PT_PHDR => phdr_segment = Some(u64_at(header, 16)?),
             PT_LOAD => {
@@ -300,6 +340,7 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
         segments,
         phdr_vaddr,
         phnum,
+        interpreter,
     };
     if kind == Kind::Fixed {
         image.check_bias(0)?;
@@ -541,24 +582,47 @@ mod tests {
     }
 
     #[test]
-    fn refuses_interpreters_and_executable_stacks() {
-        let interp = Phdr {
+    fn reads_the_interpreter_and_refuses_executable_stacks() {
+        const PATH: &[u8] = b"/lib/ld-musl-x86_64.so.1\0";
+        let interp = |offset: u64, size: u64| Phdr {
             p_type: PT_INTERP,
             flags: PF_R,
-            offset: 0x200,
-            vaddr: BASE + 0x200,
-            file_size: 16,
-            mem_size: 16,
+            offset,
+            vaddr: BASE.wrapping_add(offset),
+            file_size: size,
+            mem_size: size,
         };
-        let bytes = file(ET_EXEC, BASE, &[interp, text(0, BASE, 0x800)], 0x1000);
-        assert_eq!(parse(&bytes), Err(ElfError::Interpreter));
-        let mut stack = interp;
+        let with = |phdrs: &[Phdr], path: &[u8]| {
+            let mut bytes = file(ET_EXEC, BASE, phdrs, 0x1000);
+            bytes[0x200..0x200 + path.len()].copy_from_slice(path);
+            bytes
+        };
+        let text = text(0, BASE, 0x800);
+        let size = PATH.len() as u64;
+        let bytes = with(&[interp(0x200, size), text], PATH);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.interpreter(&bytes), Some(&PATH[..PATH.len() - 1]));
+        assert_eq!(parse(&good()).unwrap().interpreter(&good()), None);
+        // Linux's rules: 2..=PATH_MAX bytes, the last one NUL.
+        let refused = |phdrs: &[Phdr], path: &[u8]| {
+            assert_eq!(parse(&with(phdrs, path)), Err(ElfError::BadInterpreter));
+        };
+        refused(&[interp(0x200, 1), text], b"\0");
+        refused(&[interp(0x200, 4097), text], PATH);
+        refused(&[interp(0x200, size - 1), text], PATH); // no NUL at the end
+        refused(&[interp(0xff0, size), text], PATH); // past the end of the file
+        refused(&[interp(u64::MAX, size), text], PATH);
+        // Stricter than Linux: a NUL inside, or a second PT_INTERP.
+        refused(&[interp(0x200, size), text], b"/lib\0ld-musl-x86_64.so.1\0");
+        refused(&[interp(0x200, size), interp(0x200, size), text], PATH);
+
+        let mut stack = interp(0x200, 16);
         stack.p_type = PT_GNU_STACK;
         stack.flags = PF_R | PF_W;
-        let bytes = file(ET_EXEC, BASE, &[stack, text(0, BASE, 0x800)], 0x1000);
+        let bytes = file(ET_EXEC, BASE, &[stack, text], 0x1000);
         assert!(parse(&bytes).is_ok(), "a non-executable stack is fine");
         stack.flags = PF_R | PF_W | PF_X;
-        let bytes = file(ET_EXEC, BASE, &[stack, text(0, BASE, 0x800)], 0x1000);
+        let bytes = file(ET_EXEC, BASE, &[stack, text], 0x1000);
         assert_eq!(parse(&bytes), Err(ElfError::ExecutableStack));
     }
 

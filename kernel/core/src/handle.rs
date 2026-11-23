@@ -83,8 +83,12 @@ pub struct Handle<T> {
     pub close_on_exec: bool,
 }
 
-/// The table. Indices are Linux file descriptors.
-#[derive(Debug)]
+/// The table. Indices are Linux file descriptors. Cloning it copies every
+/// handle with its rights and close-on-exec flag (fork); the objects are
+/// cloned too, so for shared objects (an `Arc`) both tables refer to the
+/// same ones, as fork(2)'s duplicated descriptors refer to the same open
+/// file descriptions.
+#[derive(Clone, Debug)]
 pub struct HandleTable<T> {
     slots: Vec<Option<Handle<T>>>,
     limit: usize,
@@ -113,6 +117,38 @@ impl<T: Clone> HandleTable<T> {
         };
         self.slots[index] = Some(handle);
         i32::try_from(index).map_err(|_| Errno::EMFILE)
+    }
+
+    /// Removes every handle marked close-on-exec and returns them (execve;
+    /// Linux's do_close_on_exec). The caller drops them, outside any lock
+    /// it holds.
+    pub fn take_close_on_exec(&mut self) -> alloc::vec::Vec<Handle<T>> {
+        let mut closed = alloc::vec::Vec::new();
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|h| h.close_on_exec)
+                && let Some(handle) = slot.take()
+            {
+                closed.push(handle);
+            }
+        }
+        closed
+    }
+
+    /// Whether `fd` is closed by execve (FD_CLOEXEC). EBADF if no handle.
+    pub fn close_on_exec(&self, fd: i32) -> Result<bool, Errno> {
+        self.slot(fd).map(|h| h.close_on_exec).ok_or(Errno::EBADF)
+    }
+
+    /// Sets whether `fd` is closed by execve. EBADF if no handle.
+    pub fn set_close_on_exec(&mut self, fd: i32, close: bool) -> Result<(), Errno> {
+        let index = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        if index >= self.slots.len() {
+            return Err(Errno::EBADF);
+        }
+        let index = index_nospec(index, self.slots.len());
+        let handle = self.slots[index].as_mut().ok_or(Errno::EBADF)?;
+        handle.close_on_exec = close;
+        Ok(())
     }
 
     fn slot(&self, fd: i32) -> Option<&Handle<T>> {
@@ -260,5 +296,67 @@ mod tests {
         let plain = t.insert(h(5, Rights::READ)).unwrap();
         assert_eq!(t.duplicate(plain, all), Err(Errno::EBADF));
         assert_eq!(t.duplicate(77, all), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn close_on_exec_is_per_handle_and_needs_one() {
+        let mut table: HandleTable<u8> = HandleTable::new(4);
+        let fd = table
+            .insert(Handle {
+                object: 1,
+                rights: Rights::READ,
+                close_on_exec: false,
+            })
+            .unwrap();
+        assert_eq!(table.close_on_exec(fd), Ok(false));
+        table.set_close_on_exec(fd, true).unwrap();
+        assert_eq!(table.close_on_exec(fd), Ok(true));
+        assert_eq!(table.close_on_exec(fd + 1), Err(Errno::EBADF));
+        assert_eq!(table.set_close_on_exec(-1, true), Err(Errno::EBADF));
+        assert_eq!(table.set_close_on_exec(100, true), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn exec_closes_only_close_on_exec_handles() {
+        let mut table: HandleTable<u8> = HandleTable::new(4);
+        let handle = |object, close_on_exec| Handle {
+            object,
+            rights: Rights::READ,
+            close_on_exec,
+        };
+        let kept = table.insert(handle(1, false)).unwrap();
+        let gone = table.insert(handle(2, true)).unwrap();
+        let closed = table.take_close_on_exec();
+        assert_eq!(closed.iter().map(|h| h.object).collect::<Vec<_>>(), [2]);
+        assert_eq!(table.get(kept, Rights::READ), Ok(&1));
+        assert_eq!(table.get(gone, Rights::NONE), Err(Errno::EBADF));
+        // The freed number is used again.
+        assert_eq!(table.insert(handle(3, false)), Ok(gone));
+    }
+
+    #[test]
+    fn a_cloned_table_shares_its_objects_and_keeps_rights_and_flags() {
+        use alloc::sync::Arc;
+        let mut table: HandleTable<Arc<u8>> = HandleTable::new(4);
+        let object = Arc::new(7u8);
+        let fd = table
+            .insert(Handle {
+                object: object.clone(),
+                rights: Rights::READ,
+                close_on_exec: true,
+            })
+            .unwrap();
+        let copy = table.clone();
+        let shared = copy.get(fd, Rights::READ).unwrap();
+        assert!(
+            Arc::ptr_eq(shared, &object),
+            "the same object, as fork's descriptors"
+        );
+        assert_eq!(copy.close_on_exec(fd), Ok(true));
+        assert_eq!(
+            copy.get(fd, Rights::WRITE),
+            Err(Errno::EBADF),
+            "rights are copied, not widened"
+        );
     }
 }

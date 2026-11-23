@@ -16,6 +16,7 @@
 | `prefix-trace.txt` | `strace -f` of `wineboot --init` (creating the prefix) |
 | `hello-stdout.txt`, `prefix-stdout.txt` | Their output and exit status |
 | `packages.txt` | Every Alpine package installed, with its exact version |
+| `kernel.txt` | `uname -srm` of the kernel the trace ran on |
 | `SHA256SUMS` | Hashes of all of the above |
 
 ## Pins
@@ -48,5 +49,23 @@
   L"C:\\windows\\syswow64\\rundll32.exe": c0000135`. Expected: the build
   is 64-bit only, so there are no 32-bit (WoW64) programs to run.
 
-Alpine packages are not pinned by hash; `packages.txt` records exactly
-which versions a build used, so two builds can be compared.
+## Package pins
+
+Every package the build adds to the base image, dependencies included
+(39 files), is pinned by SHA-256 in `packages.lock`. The build fetches
+each by name, then `sha256sum -c` requires every pinned file name (the
+name carries the exact version) with its hash, no extra file may be
+present, and apk installs from those files alone with the network off,
+so a missing dependency also fails. apk still checks Alpine's signature
+on each package. Checked by tampering: a changed hash, a changed version
+and a removed dependency each fail the build.
+
+Alpine replaces a package in a stable branch when it ships a fix, and
+the old file leaves the mirror, so in time the build fails to fetch a
+pinned file. That is deliberate: renew the pins on purpose,
+
+    docker build --target pins --output type=local,dest=wine/build wine/build
+
+review the diff of `packages.lock` (which packages changed and why), and
+commit it. The lock was made on 2026-11-23 and matches the versions CI's
+`wine-image` run 4 installed.

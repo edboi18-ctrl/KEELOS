@@ -20,6 +20,9 @@ pub struct SyscallArgs {
     pub args: [u64; 6],
     /// The caller's user stack pointer (sigaltstack(2) checks it).
     pub user_rsp: u64,
+    /// All of the caller's user registers as they came in (fork copies
+    /// them into the child).
+    pub frame: TrapFrame,
 }
 
 /// The registered system-call handler: arguments in, RAX out.
@@ -40,6 +43,7 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ],
         user_rsp: frame.rsp,
+        frame: *frame,
     };
     // Copy the handler out so the lock is not held during the call, which
     // may block or switch threads.
@@ -67,6 +71,27 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
     };
     crate::arch::x86_64::cpu::disable_interrupts();
     frame.rax = result as u64;
+    // execve replaced the program: return into it with a fresh frame.
+    // Every general register is 0, as Linux's elf_common_init clears them
+    // for a new program (`arch/x86/include/asm/elf.h` at v6.12; RAX is
+    // execve's return value, 0), and RFLAGS has only IF and the reserved
+    // bit 1, as start_thread_common sets (`arch/x86/kernel/process_64.c`);
+    // prepare_user_return then sets the user selectors and the new space's
+    // user-view CR3.
+    if let Some((rip, rsp)) = sched::take_pending_exec() {
+        // CS and SS stay the user selectors the call came in with: the
+        // return path recognizes a return to user mode by CS's privilege
+        // level and only then runs prepare_user_return.
+        *frame = TrapFrame {
+            rip,
+            rsp,
+            rflags: crate::arch::x86_64::entry::RFLAGS_FIXED,
+            cs: frame.cs,
+            ss: frame.ss,
+            vector: frame.vector,
+            ..TrapFrame::default()
+        };
+    }
 }
 
 /// Exit status for a thread killed by an exception: 128 + the signal

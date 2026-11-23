@@ -60,6 +60,50 @@ pub struct Vma {
     pub start: u64,
     pub end: u64,
     pub prot: Prot,
+    /// For a private file mapping (P3-T7): which file, and where in it
+    /// `start` is. Pages are read from the file when first touched; until
+    /// then the file's later changes show through, which mmap(2) allows
+    /// for MAP_PRIVATE ("It is unspecified whether changes made to the
+    /// file after the mmap() call are visible in the mapped region").
+    pub backing: Option<Backing>,
+}
+
+/// What a private file mapping maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Backing {
+    /// The file, as the owner of the layout names it (an inode number).
+    pub object: u64,
+    /// File offset of the VMA's first page.
+    pub offset: u64,
+    /// Whether the mapping may be made executable: the handle it came from
+    /// had MAP_EXEC (SR-1). mprotect cannot add PROT_EXEC otherwise.
+    pub may_exec: bool,
+}
+
+impl Vma {
+    /// The file offset of the page at `address`, for a file mapping.
+    pub fn file_offset(&self, address: u64) -> Option<u64> {
+        let backing = self.backing?;
+        let page = address & !(PAGE - 1);
+        backing.offset.checked_add(page.checked_sub(self.start)?)
+    }
+
+    /// Whether `next`, which starts where this ends, continues it: same
+    /// rights and either both anonymous or the same file, contiguously.
+    fn continues_with(&self, next: &Vma) -> bool {
+        if next.start != self.end || next.prot != self.prot {
+            return false;
+        }
+        match (self.backing, next.backing) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.object == b.object
+                    && a.may_exec == b.may_exec
+                    && a.offset.checked_add(self.end - self.start) == Some(b.offset)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Errors, named after the errno each maps to.
@@ -73,6 +117,10 @@ pub enum VmError {
     Exists,
     /// EACCES: writable and executable together (SR-12).
     WriteExec,
+    /// EACCES: PROT_EXEC on a file mapping whose handle lacked MAP_EXEC.
+    NotExecutable,
+    /// EINVAL: a file offset that overflows with the mapping's length.
+    BadOffset,
 }
 
 /// How a new mapping is placed.
@@ -194,7 +242,7 @@ impl Layout {
             if next.start > to {
                 return;
             }
-            if next.start == current.end && next.prot == current.prot {
+            if current.continues_with(&next) {
                 self.vmas.remove(&next.start);
                 self.vmas.insert(
                     key,
@@ -242,16 +290,35 @@ impl Layout {
         (top >= USER_START + length).then(|| top - length)
     }
 
-    /// Adds a mapping. Returns its start and the ranges previously mapped
-    /// there (for MAP_FIXED), whose pages the caller must unmap.
+    /// Adds an anonymous mapping. Returns its start and the ranges
+    /// previously mapped there (for MAP_FIXED), whose pages the caller must
+    /// unmap.
     pub fn map(
         &mut self,
         placement: Placement,
         length: u64,
         prot: Prot,
     ) -> Result<(u64, Changed), VmError> {
+        self.map_backed(placement, length, prot, None)
+    }
+
+    /// Adds a mapping, of `backing` if given (a private file mapping).
+    pub fn map_backed(
+        &mut self,
+        placement: Placement,
+        length: u64,
+        prot: Prot,
+        backing: Option<Backing>,
+    ) -> Result<(u64, Changed), VmError> {
         if prot.write && prot.exec {
             return Err(VmError::WriteExec);
+        }
+        if let Some(b) = backing {
+            if prot.exec && !b.may_exec {
+                return Err(VmError::NotExecutable);
+            }
+            // Every page's file offset must fit (checked once here).
+            b.offset.checked_add(length).ok_or(VmError::BadOffset)?;
         }
         if length == 0 {
             return Err(VmError::Invalid);
@@ -310,6 +377,7 @@ impl Layout {
                 start,
                 end: start + length,
                 prot,
+                backing,
             },
         );
         self.coalesce(start, start + length);
@@ -322,7 +390,19 @@ impl Layout {
             && vma.start < at
         {
             self.vmas.insert(vma.start, Vma { end: at, ..vma });
-            self.vmas.insert(at, Vma { start: at, ..vma });
+            // The upper part maps the file from further in.
+            let backing = vma.backing.map(|b| Backing {
+                offset: b.offset + (at - vma.start),
+                ..b
+            });
+            self.vmas.insert(
+                at,
+                Vma {
+                    start: at,
+                    backing,
+                    ..vma
+                },
+            );
         }
     }
 
@@ -357,10 +437,13 @@ impl Layout {
             return Err(VmError::WriteExec);
         }
         let end = check_range(start, length)?;
-        // Fully mapped?
+        // Fully mapped, and executable only where the file allows it?
         let mut cursor = start;
         while cursor < end {
             match self.find(cursor) {
+                Some(v) if prot.exec && v.backing.is_some_and(|b| !b.may_exec) => {
+                    return Err(VmError::NotExecutable);
+                }
                 Some(v) => cursor = v.end,
                 None => return Err(VmError::NoMemory),
             }
@@ -383,6 +466,13 @@ impl Layout {
 pub enum FaultAction {
     /// No page yet: map a fresh zeroed page with these rights.
     DemandZero(Prot),
+    /// No page yet in a private file mapping: map a fresh page holding the
+    /// file's bytes from `offset` (zero past the end of the file).
+    FromFile {
+        prot: Prot,
+        object: u64,
+        offset: u64,
+    },
     /// A write to a page shared copy-on-write: give the writer its own
     /// copy (or reuse the page if it is the only user).
     CopyOnWrite(Prot),
@@ -413,7 +503,14 @@ pub fn classify_fault(
     };
     match (allowed, present) {
         (false, _) => FaultAction::Violation,
-        (true, false) => FaultAction::DemandZero(vma.prot),
+        (true, false) => match (vma.backing, vma.file_offset(address)) {
+            (Some(b), Some(offset)) => FaultAction::FromFile {
+                prot: vma.prot,
+                object: b.object,
+                offset,
+            },
+            _ => FaultAction::DemandZero(vma.prot),
+        },
         // Present and allowed by the VMA but the page table said no: only
         // a write to a page left read-only for copy-on-write fits.
         (true, true) if write => FaultAction::CopyOnWrite(vma.prot),
@@ -470,7 +567,8 @@ mod tests {
             Some(Vma {
                 start: b,
                 end: a + 3 * PAGE,
-                prot: RW
+                prot: RW,
+                backing: None,
             })
         );
     }
@@ -538,7 +636,8 @@ mod tests {
             Some(Vma {
                 start: 0x40_0000,
                 end: 0x40_3000,
-                prot: RW
+                prot: RW,
+                backing: None,
             })
         );
     }
@@ -687,5 +786,103 @@ mod tests {
             Violation
         );
         assert_eq!(classify_fault(&l, 0x20_0000, false, false, true), Violation);
+    }
+
+    fn file(object: u64, offset: u64, may_exec: bool) -> Option<Backing> {
+        Some(Backing {
+            object,
+            offset,
+            may_exec,
+        })
+    }
+
+    #[test]
+    fn file_mappings_keep_their_offsets_through_splits_and_merges() {
+        let mut l = Layout::new();
+        let base = 0x40_0000;
+        l.map_backed(Placement::Fixed(base), 4 * PAGE, RO, file(7, 0x2000, false))
+            .unwrap();
+        // A page fault reads the right part of the file.
+        let fault = |l: &Layout, at| classify_fault(l, at, false, false, false);
+        assert_eq!(
+            fault(&l, base + 2 * PAGE + 5),
+            FaultAction::FromFile {
+                prot: RO,
+                object: 7,
+                offset: 0x4000
+            }
+        );
+        // Cutting the middle out leaves the top part mapping further in.
+        l.unmap(base + PAGE, PAGE).unwrap();
+        assert_eq!(
+            l.find(base + 2 * PAGE).unwrap().backing,
+            file(7, 0x4000, false)
+        );
+        assert_eq!(l.find(base).unwrap().backing, file(7, 0x2000, false));
+        // Mapping the hole back contiguously merges into one VMA again.
+        l.map_backed(
+            Placement::Fixed(base + PAGE),
+            PAGE,
+            RO,
+            file(7, 0x3000, false),
+        )
+        .unwrap();
+        assert_eq!(l.count(), 1);
+        // Not contiguous in the file, another file, or anonymous: separate.
+        l.map_backed(
+            Placement::Fixed(base + 4 * PAGE),
+            PAGE,
+            RO,
+            file(7, 0x9000, false),
+        )
+        .unwrap();
+        l.map_backed(
+            Placement::Fixed(base + 5 * PAGE),
+            PAGE,
+            RO,
+            file(8, 0x8000, false),
+        )
+        .unwrap();
+        l.map(Placement::Fixed(base + 6 * PAGE), PAGE, RO).unwrap();
+        assert_eq!(l.count(), 4);
+        // Anonymous pages fault as zero pages.
+        assert_eq!(fault(&l, base + 6 * PAGE), FaultAction::DemandZero(RO));
+    }
+
+    #[test]
+    fn a_file_mapping_is_executable_only_if_its_handle_allowed_it() {
+        let rx = Prot {
+            read: true,
+            write: false,
+            exec: true,
+        };
+        let mut l = Layout::new();
+        let base = 0x40_0000;
+        assert_eq!(
+            l.map_backed(Placement::Fixed(base), PAGE, rx, file(1, 0, false)),
+            Err(VmError::NotExecutable)
+        );
+        l.map_backed(Placement::Fixed(base), 2 * PAGE, RO, file(1, 0, false))
+            .unwrap();
+        assert_eq!(l.protect(base, PAGE, rx), Err(VmError::NotExecutable));
+        assert_eq!(l.find(base).unwrap().prot, RO, "a refusal changes nothing");
+        l.map_backed(
+            Placement::Fixed(base + 2 * PAGE),
+            PAGE,
+            RO,
+            file(2, 0, true),
+        )
+        .unwrap();
+        assert!(l.protect(base + 2 * PAGE, PAGE, rx).is_ok());
+        // An offset that would overflow is refused.
+        assert_eq!(
+            l.map_backed(
+                Placement::Fixed(base),
+                PAGE,
+                RO,
+                file(1, u64::MAX - 10, true)
+            ),
+            Err(VmError::BadOffset)
+        );
     }
 }

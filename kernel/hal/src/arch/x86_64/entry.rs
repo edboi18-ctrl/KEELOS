@@ -416,7 +416,7 @@ const SYSCALL_FLAG_MASK: u64 = 1 << 8 | 1 << 9 | 1 << 10 | 3 << 12 | 1 << 14 | 1
 /// ID. IOPL, NT, RF, VM, VIF and VIP are forced to 0 and IF to 1 on every
 /// return to user mode (SR-9: IOPL must stay 0).
 const USER_RFLAGS_MASK: u64 = 0x24_0DD5;
-const RFLAGS_FIXED: u64 = 0x202;
+pub(crate) const RFLAGS_FIXED: u64 = 0x202;
 
 /// Sets up the SYSCALL MSRs and points TSS.RSP0 at the trampoline stack.
 /// Call once at boot, after paging.
@@ -478,13 +478,20 @@ pub fn prepare_user_return(frame: &mut TrapFrame) -> bool {
 /// stack, and `argument` in RDI. Never returns; later entries to the kernel come back through
 /// the entry code on this thread's kernel stack.
 pub fn enter_user(rip: u64, rsp: u64, argument: u64) -> ! {
-    let mut frame = TrapFrame {
+    enter_user_frame(TrapFrame {
         rip,
         rsp,
         rdi: argument,
         rflags: RFLAGS_FIXED,
         ..TrapFrame::default()
-    };
+    })
+}
+
+/// Enters user mode for the first time with every register from `frame`
+/// (a forked thread starts with a copy of its parent's). The selectors,
+/// RFLAGS, RIP, RSP and CR3 are made safe by `prepare_user_return`, as on
+/// every return to user mode.
+pub fn enter_user_frame(mut frame: TrapFrame) -> ! {
     let _ = cpu::disable_interrupts();
     if !prepare_user_return(&mut frame) {
         panic!("enter_user on a thread without an address space");

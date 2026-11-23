@@ -69,6 +69,18 @@ pub const PHASES: &[Phase] = &[
         expect_lines: &["Hello from a Windows executable on Keel"],
         expect_prefixes: &[],
     },
+    Phase {
+        number: 3,
+        complete: false,
+        scenarios: &[],
+        // P3-T2 and P3-T7: the dynamically linked musl programs' lines.
+        expect_lines: &[
+            "Hello from dynamically linked musl on Keel",
+            "Hello from a musl shared library on Keel (count 3)",
+            "threads: 4 workers, counter 40000, results 100, thread-local values kept",
+        ],
+        expect_prefixes: &[],
+    },
 ];
 
 /// First line of the kernel's panic output (`keel-kernel/src/main.rs`).
@@ -848,7 +860,9 @@ fn test_user_programs_on_host() -> Result<()> {
                 "host.peldr.{}{mode}",
                 fixture.path.rsplit('/').next().unwrap_or(fixture.path)
             );
-            if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+            if output.status.success()
+                && Some(output.stdout.as_slice()) == fixture.stdout.map(str::as_bytes)
+            {
                 println!("  TEST {name} PASS peldr runs it under Linux: exact line, exit 0");
             } else {
                 return Err(format!(
@@ -861,9 +875,9 @@ fn test_user_programs_on_host() -> Result<()> {
             }
         }
     }
-    for fixture in build::TEST_FIXTURES {
-        // Run a copy: the committed file may lack the executable bit (it
-        // was committed from Windows).
+    // Copies of every fixture under target/fixtures (the committed files
+    // may lack the executable bit: they were committed from Windows).
+    let copy = |fixture: &build::TestFixture| -> Result<std::path::PathBuf> {
         let data = build::load_fixture(&root, fixture)?;
         let path = root.join("target").join("fixtures").join(fixture.path);
         util::write(&path, &data)?;
@@ -872,15 +886,47 @@ fn test_user_programs_on_host() -> Result<()> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
-        let output = Command::new(&path)
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()?;
+        Ok(path)
+    };
+    for fixture in build::TEST_FIXTURES {
+        let Some(stdout) = fixture.stdout else {
+            continue;
+        };
+        let path = copy(fixture)?;
+        let mut command = match fixture.host_via {
+            Some(via) => {
+                let interpreter = build::TEST_FIXTURES
+                    .iter()
+                    .find(|f| f.path == via)
+                    .ok_or_else(|| format!("{}: no fixture {via}", fixture.path))?;
+                // Every fixture library is copied, and the dynamic linker
+                // is told where (it looks in /lib on Keel).
+                for library in build::TEST_FIXTURES
+                    .iter()
+                    .filter(|f| f.stdout.is_none() && f.path.starts_with("lib/"))
+                {
+                    copy(library)?;
+                }
+                let mut command = Command::new(copy(interpreter)?);
+                // Nothing from the developer's environment but this.
+                command.env_clear().arg(&path).env(
+                    "LD_LIBRARY_PATH",
+                    root.join("target").join("fixtures").join("lib"),
+                );
+                command
+            }
+            None => {
+                let mut command = Command::new(&path);
+                command.env_clear();
+                command
+            }
+        };
+        let output = command.stdin(Stdio::null()).output()?;
         let name = format!(
             "host.{}",
             fixture.path.rsplit('/').next().unwrap_or(fixture.path)
         );
-        if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+        if output.status.success() && output.stdout == stdout.as_bytes() {
             println!("  TEST {name} PASS prints the expected line under Linux");
         } else {
             return Err(format!(

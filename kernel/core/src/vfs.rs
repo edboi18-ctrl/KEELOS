@@ -22,6 +22,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::compartment::Quota;
 use crate::cpio;
 use crate::errno::Errno;
 
@@ -83,6 +84,13 @@ struct Node {
     /// node has exactly one (there are no hard links), so this also
     /// answers "is this beneath that root?" for files and devices.
     parent: Ino,
+    /// The compartment quota this node's data is charged to (P3-S4): the
+    /// creator's, or for a node the kernel made (none), the first
+    /// compartment to grow it. Its node was charged to the creator.
+    owner: Option<Arc<Quota>>,
+    /// Bytes of a file charged to `owner`: the last `charged` bytes of the
+    /// file (so shrinking gives them back first). At most its length.
+    charged: usize,
 }
 
 /// What a node is.
@@ -201,6 +209,8 @@ impl Fs {
                 contents: Contents::Directory(BTreeMap::new()),
                 permissions: 0o755,
                 parent: ROOT,
+                owner: None,
+                charged: 0,
             })],
             bytes_used: 0,
             byte_limit,
@@ -341,6 +351,12 @@ impl Fs {
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
+        // Charged last, after every other reason to refuse.
+        if let Some(quota) = &node.owner
+            && !quota.nodes.try_charge(1)
+        {
+            return Err(Errno::ENOSPC);
+        }
         entries.insert(name.to_vec(), ino);
         self.nodes.push(Some(Node {
             parent: dir,
@@ -349,8 +365,21 @@ impl Fs {
         Ok(ino)
     }
 
-    /// Creates an empty file.
+    /// Creates an empty file (for the kernel: charged to no quota).
     pub fn create_file(&mut self, dir: Ino, name: &[u8], permissions: u32) -> Result<Ino, Errno> {
+        self.create_file_as(dir, name, permissions, None)
+    }
+
+    /// Creates an empty file owned by `quota` (its creator's compartment),
+    /// which is charged one node: ENOSPC if it has none left (open(2):
+    /// "the device containing path has no room for the new file").
+    pub fn create_file_as(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        permissions: u32,
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<Ino, Errno> {
         self.add(
             dir,
             name,
@@ -358,12 +387,25 @@ impl Fs {
                 contents: Contents::File(Arc::new(Vec::new())),
                 permissions: permissions & 0o7777,
                 parent: dir,
+                owner: quota.cloned(),
+                charged: 0,
             },
         )
     }
 
-    /// Creates a directory.
+    /// Creates a directory (for the kernel: charged to no quota).
     pub fn create_dir(&mut self, dir: Ino, name: &[u8], permissions: u32) -> Result<Ino, Errno> {
+        self.create_dir_as(dir, name, permissions, None)
+    }
+
+    /// Creates a directory owned by `quota`, charged one node.
+    pub fn create_dir_as(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        permissions: u32,
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<Ino, Errno> {
         self.add(
             dir,
             name,
@@ -371,6 +413,8 @@ impl Fs {
                 contents: Contents::Directory(BTreeMap::new()),
                 permissions: permissions & 0o7777,
                 parent: dir,
+                owner: quota.cloned(),
+                charged: 0,
             },
         )
     }
@@ -384,6 +428,8 @@ impl Fs {
                 contents: Contents::Device(device),
                 permissions: 0o666,
                 parent: dir,
+                owner: None,
+                charged: 0,
             },
         )
     }
@@ -417,46 +463,129 @@ impl Fs {
 
     /// Writes to a regular file at `offset`, extending it (with zeros
     /// before `offset` if needed). Fails with ENOSPC past the byte limit
-    /// and EFBIG if the end does not fit.
+    /// and EFBIG if the end does not fit. For the kernel: no quota.
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        self.write_as(ino, offset, data, None)
+    }
+
+    /// [`Fs::write`] by a process whose compartment has `quota`. Growth is
+    /// charged to the file's owner, or, if the kernel made the file, to
+    /// `quota`, which then owns it (so a compartment cannot grow a file
+    /// the kernel put in its tree at nobody's expense). ENOSPC past the
+    /// owner's byte limit: to the compartment its quota is the size of the
+    /// device, and write(2) gives "ENOSPC The device containing the file
+    /// referred to by fd has no room for the data".
+    pub fn write_as(
+        &mut self,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<usize, Errno> {
         let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
         let end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
+        self.resize(ino, end, quota, |file| {
+            file[start..end].copy_from_slice(data);
+        })?;
+        Ok(data.len())
+    }
+
+    /// Makes the file at `ino` at least `len` bytes long (`grow_only`) or
+    /// exactly `len` bytes, charging growth to the filesystem's cap and to
+    /// the payer's quota, then lets `finish` change the data. Shrinking
+    /// gives charged bytes back.
+    fn resize(
+        &mut self,
+        ino: Ino,
+        len: usize,
+        quota: Option<&Arc<Quota>>,
+        finish: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Errno> {
+        self.resize_to(ino, len, true, quota, finish)
+    }
+
+    fn resize_to(
+        &mut self,
+        ino: Ino,
+        len: usize,
+        grow_only: bool,
+        quota: Option<&Arc<Quota>>,
+        finish: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Errno> {
         let (bytes_used, byte_limit) = (self.bytes_used, self.byte_limit);
         let may_allocate = self.may_allocate;
-        let Contents::File(file) = &mut self.node_mut(ino)?.contents else {
+        let is_file = matches!(self.node(ino)?.contents, Contents::File(_));
+        if !is_file {
             return Err(match self.kind(ino)? {
                 Kind::Directory => Errno::EISDIR,
                 _ => Errno::EINVAL,
             });
+        }
+        let node = self.node_mut(ino)?;
+        let Contents::File(file) = &mut node.contents else {
+            return Err(Errno::EINVAL);
         };
-        let growth = end.saturating_sub(file.len());
+        let old = file.len();
+        let new = if grow_only { old.max(len) } else { len };
+        let growth = new.saturating_sub(old);
         if bytes_used
             .checked_add(growth)
             .is_none_or(|total| total > byte_limit)
         {
             return Err(Errno::ENOSPC);
         }
-        let file = grow_file(file, end, may_allocate)?;
-        file[start..end].copy_from_slice(data);
-        self.bytes_used += growth;
-        Ok(data.len())
-    }
-
-    /// Sets a file's length (truncate), zero-filling any growth.
-    pub fn set_len(&mut self, ino: Ino, len: u64) -> Result<(), Errno> {
-        let len = usize::try_from(len).map_err(|_| Errno::EFBIG)?;
-        let (bytes_used, byte_limit) = (self.bytes_used, self.byte_limit);
-        let may_allocate = self.may_allocate;
-        let Contents::File(file) = &mut self.node_mut(ino)?.contents else {
-            return Err(Errno::EINVAL);
-        };
-        let old = file.len();
-        if len > old && bytes_used + (len - old) > byte_limit {
+        // Who pays: the owner, or a kernel-made file's first grower.
+        if growth > 0 && node.owner.is_none() {
+            node.owner = quota.cloned();
+        }
+        let payer = node.owner.clone();
+        if growth > 0
+            && let Some(payer) = &payer
+            && !payer.bytes.try_charge(growth)
+        {
             return Err(Errno::ENOSPC);
         }
-        grow_file(file, len, may_allocate)?.truncate(len);
-        self.bytes_used = bytes_used - old + len;
+        let grown = match grow_file(file, new, may_allocate) {
+            Ok(data) => data,
+            Err(error) => {
+                if let Some(payer) = &payer {
+                    payer.bytes.uncharge(growth);
+                }
+                return Err(error);
+            }
+        };
+        grown.truncate(new);
+        finish(grown);
+        if growth > 0 && payer.is_some() {
+            node.charged += growth;
+        }
+        // Shrinking removes the last bytes, which are the charged ones.
+        let shrink = old.saturating_sub(new);
+        let given_back = node.charged.min(shrink);
+        node.charged -= given_back;
+        if let Some(payer) = &payer {
+            payer.bytes.uncharge(given_back);
+        }
+        self.bytes_used = bytes_used - old + new;
         Ok(())
+    }
+
+    /// Sets a file's length (truncate), zero-filling any growth. For the
+    /// kernel: no quota.
+    pub fn set_len(&mut self, ino: Ino, len: u64) -> Result<(), Errno> {
+        self.set_len_as(ino, len, None)
+    }
+
+    /// [`Fs::set_len`] by a process whose compartment has `quota`, charged
+    /// as [`Fs::write_as`]. Shrinking gives the owner its bytes back.
+    pub fn set_len_as(
+        &mut self,
+        ino: Ino,
+        len: u64,
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<(), Errno> {
+        let len = usize::try_from(len).map_err(|_| Errno::EFBIG)?;
+        self.resize_to(ino, len, false, quota, |_| {})
     }
 
     /// File status.
@@ -840,5 +969,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn quota(bytes: usize, nodes: usize) -> Arc<Quota> {
+        use crate::compartment::Budget;
+        Arc::new(Quota {
+            bytes: Budget::new(bytes),
+            nodes: Budget::new(nodes),
+        })
+    }
+
+    #[test]
+    fn a_quota_caps_its_files_bytes_and_gives_back_on_truncate() {
+        let mut fs = Fs::new(1 << 20);
+        let q = quota(10, 8);
+        let f = fs.create_file_as(ROOT, b"f", 0o644, Some(&q)).unwrap();
+        assert_eq!(fs.write_as(f, 0, &[1; 10], Some(&q)), Ok(10));
+        assert_eq!(fs.write_as(f, 10, b"x", Some(&q)), Err(Errno::ENOSPC));
+        assert_eq!(
+            fs.write_as(f, 0, b"abc", Some(&q)),
+            Ok(3),
+            "overwriting is free"
+        );
+        assert_eq!(fs.set_len_as(f, 11, Some(&q)), Err(Errno::ENOSPC));
+        assert_eq!(q.bytes.used(), 10);
+        fs.set_len_as(f, 4, Some(&q)).unwrap();
+        assert_eq!(q.bytes.used(), 4, "truncating gives the bytes back");
+        assert_eq!(fs.write_as(f, 4, &[2; 6], Some(&q)), Ok(6));
+        // A refused write changed nothing.
+        assert_eq!(fs.stat(f).unwrap().size, 10);
+        assert_eq!(fs.bytes_used(), 10);
+    }
+
+    #[test]
+    fn a_quota_caps_the_nodes_it_creates_and_a_refusal_costs_nothing() {
+        let mut fs = Fs::new(1 << 20);
+        let q = quota(1 << 20, 2);
+        let d = fs.create_dir_as(ROOT, b"d", 0o755, Some(&q)).unwrap();
+        assert_eq!(
+            fs.create_file_as(d, b"d", 0o644, Some(&q)).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(q.nodes.used(), 2);
+        assert_eq!(
+            fs.create_file_as(d, b"e", 0o644, Some(&q)),
+            Err(Errno::ENOSPC)
+        );
+        assert_eq!(
+            fs.create_file_as(ROOT, b"d", 0o644, Some(&q)),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(q.nodes.used(), 2, "refused creations charge nothing");
+        // The kernel is not held to it.
+        assert!(fs.create_file(d, b"kernel", 0o644).is_ok());
+    }
+
+    #[test]
+    fn a_kernel_made_file_is_charged_to_the_first_compartment_that_grows_it() {
+        let mut fs = Fs::new(1 << 20);
+        let f = fs.create_file(ROOT, b"given", 0o644).unwrap();
+        fs.write(f, 0, &[0; 100]).unwrap();
+        let a = quota(30, 8);
+        let b = quota(30, 8);
+        // Overwriting the kernel's bytes costs nothing; growing does.
+        assert_eq!(fs.write_as(f, 0, &[1; 100], Some(&a)), Ok(100));
+        assert_eq!(a.bytes.used(), 0);
+        assert_eq!(fs.write_as(f, 100, &[1; 30], Some(&a)), Ok(30));
+        assert_eq!(fs.write_as(f, 130, b"x", Some(&a)), Err(Errno::ENOSPC));
+        // A owns it now: growth by anyone is charged to A, not to B.
+        assert_eq!(fs.write_as(f, 130, b"x", Some(&b)), Err(Errno::ENOSPC));
+        assert_eq!(b.bytes.used(), 0);
+        // Truncating below the kernel's 100 bytes gives back only A's 30.
+        fs.set_len(f, 50).unwrap();
+        assert_eq!(a.bytes.used(), 0);
+        assert_eq!(fs.bytes_used(), 50);
     }
 }

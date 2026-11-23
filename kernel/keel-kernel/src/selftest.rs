@@ -195,6 +195,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
         (0, Scenario::None) => phase0(&mut runner),
         (1, Scenario::None) => phase1(&mut runner),
         (2, Scenario::None) => phase2(&mut runner),
+        (3, Scenario::None) => phase3(&mut runner),
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -1343,6 +1344,7 @@ pub fn phase1_robustness(t: &mut Runner) {
             number: 0x1_0000_0000 + number * 7919,
             args: [0; 6],
             user_rsp: 0,
+            frame: keel_hal::arch::x86_64::idt::TrapFrame::default(),
         };
         let _ = keel_linux_abi::syscall::handle(&call);
     }
@@ -1790,6 +1792,706 @@ fn phase2(t: &mut Runner) {
     // Phase 2 acceptance marker, only when every test above passed.
     if t.failed == 0 {
         kresult!("KEEL P2 OK");
+    }
+}
+
+/// Runs `path` in `compartment` to completion: its exit status and fault.
+fn run_in(
+    compartment: &alloc::sync::Arc<keel_core::compartment::Compartment>,
+    path: &[u8],
+    args: &[&[u8]],
+) -> Option<(i64, Option<sched::UserFault>)> {
+    let file = keel_linux_abi::fs::read_file(path).ok()?;
+    // Its interpreter, if any, is looked up in the compartment's own tree.
+    let loaded = keel_linux_abi::exec::load_in(compartment.root(), &file, path, args, &[]).ok()?;
+    let spawned = keel_linux_abi::process::spawn_in(compartment, "test", &loaded).ok()?;
+    join(spawned.thread);
+    sched::exit_status(spawned.thread)
+}
+
+/// Phase 3 (in progress): compartments first (P3-S1 to P3-S4), before any
+/// program from outside the tree runs.
+fn phase3(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::errno::Errno;
+    use keel_linux_abi::{compartment, fs};
+
+    let made = fs::with(|fs| {
+        let comp = fs.create_dir(keel_core::vfs::ROOT, b"comp", 0o755)?;
+        for name in [&b"a"[..], b"b", b"c"] {
+            fs.create_dir(comp, name, 0o755)?;
+        }
+        Ok(())
+    });
+    let limits = Limits {
+        processes: 4,
+        ..Limits::UNLIMITED
+    };
+    let (Ok(()), Ok(a), Ok(b)) = (
+        made,
+        compartment::create(b"/comp/a", limits),
+        compartment::create(b"/comp/b", limits),
+    ) else {
+        t.check(
+            "compartment.create",
+            false,
+            "creating /comp/a and /comp/b and their compartments",
+        );
+        return;
+    };
+
+    // Security acceptance P3 item 2, files: A, then B, then A again, so
+    // each looks for the other's marker after it exists. Each run also
+    // checks it cannot name the system's /test and that its PID counts
+    // from 1 in its own compartment.
+    const PROBE: &[u8] = b"/test/compprobe";
+    let first_a = run_in(&a, PROBE, &[PROBE, b"a", b"b", b"1"]);
+    let first_b = run_in(&b, PROBE, &[PROBE, b"b", b"a", b"1"]);
+    let second_a = run_in(&a, PROBE, &[PROBE, b"a", b"b", b"2"]);
+    // Seen from the system root, each marker is in its own compartment's
+    // directory and nowhere else.
+    let placed = fs::lookup(b"/comp/a/marker-a").is_ok()
+        && fs::lookup(b"/comp/b/marker-b").is_ok()
+        && fs::lookup(b"/marker-a").is_err()
+        && fs::lookup(b"/marker-b").is_err()
+        && fs::lookup(b"/comp/a/marker-b").is_err();
+    let ok = [first_a, first_b, second_a] == [Some((0, None)); 3];
+    t.check(
+        "compartment.files_confined",
+        ok && placed,
+        "two compartments cannot name each other's files, or the system's, in either direction; absolute paths and .. stay in the compartment root",
+    );
+    if !(ok && placed) {
+        kprintln!(
+            "  compprobe: A {first_a:?}, B {first_b:?}, A again {second_a:?}; markers placed: {placed}"
+        );
+    }
+    t.check(
+        "compartment.pid_space",
+        ok && a.processes() == 0 && b.processes() == 0,
+        "each compartment numbers its processes from 1 (getpid), and its count returns to 0 when they exit",
+    );
+
+    // P3-S4: a compartment's process limit. One slot: a second process
+    // is refused with EAGAIN while the first lives, and admitted after.
+    const NAP: &[u8] = b"/test/nap";
+    let one = compartment::create(
+        b"/comp/c",
+        Limits {
+            processes: 1,
+            ..Limits::UNLIMITED
+        },
+    );
+    let limited = one.as_ref().ok().and_then(|c| {
+        let file = fs::read_file(NAP).ok()?;
+        let load = || keel_linux_abi::exec::load(&file, NAP, &[NAP, b"300"], &[]).ok();
+        let first = keel_linux_abi::process::spawn_in(c, "nap", &load()?).ok()?;
+        let refused = keel_linux_abi::process::spawn_in(c, "nap", &load()?).err();
+        join(first.thread);
+        let first_status = sched::exit_status(first.thread);
+        let again = keel_linux_abi::process::spawn_in(c, "nap", &load()?).ok()?;
+        join(again.thread);
+        Some((
+            refused,
+            first_status,
+            sched::exit_status(again.thread),
+            c.processes(),
+        ))
+    });
+    t.check(
+        "compartment.process_limit",
+        limited == Some((Some(Errno::EAGAIN), Some((0, None)), Some((0, None)), 0)),
+        "at a compartment's process limit a new process is refused with EAGAIN, and admitted once one exits",
+    );
+    if let Some(result) =
+        limited.filter(|r| *r != (Some(Errno::EAGAIN), Some((0, None)), Some((0, None)), 0))
+    {
+        kprintln!("  process limit: {result:?}");
+    }
+    phase3_memory_limit(t);
+    phase3_tmpfs_quota(t);
+    phase3_dynamic(t);
+    phase3_file_mappings(t);
+    phase3_execve(t);
+    phase3_fork(t);
+    phase3_shared_frame_limit(t);
+    phase3_hostile_executables(t);
+    phase3_exit_status_order(t);
+    phase3_threads(t);
+    const THREAD_PROBE: &[u8] = b"/test/threadprobe";
+    let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
+    t.check(
+        "exec.thread_calls",
+        status == Some((0, None)),
+        "clone flag refusals, gettid, kill (0, ESRCH, SIGKILL ending a waiting child) and futex errors (EAGAIN, EINVAL, ETIMEDOUT, ENOSYS) as Linux",
+    );
+    if status != Some((0, None)) {
+        kprintln!("  threadprobe: {status:?}");
+    }
+}
+
+/// P3-T4: POSIX threads on musl (fixtures/musl-dynamic/threads): clone
+/// with musl's thread flags, futex contention, condition variables, TLS,
+/// pthread_join, and exit_group ending a thread blocked in a futex wait and
+/// one spinning in user mode. Its line is checked on serial.
+fn phase3_threads(t: &mut Runner) {
+    use keel_linux_abi::process;
+    const PROGRAM: &[u8] = b"/test/musl-threads";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let (frames, processes) = (outside_heap(), process::count());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    // The two left-behind threads end at exit_group; give them a moment
+    // to be scheduled and reaped.
+    sched::sleep_ms(50);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = status == Some((0, None)) && processes_after == processes && frames_after == frames;
+    t.check(
+        "exec.threads",
+        ok,
+        "POSIX threads on musl: 4 workers contend on a mutex, wait on a condition variable, keep thread-local values and are joined; exit_group ends a blocked and a spinning thread; nothing left over",
+    );
+    if !ok {
+        kprintln!(
+            "  threads: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// The scheduler keeps the last 1024 exit statuses. A thread whose 1100
+/// children exited before it still has its own status afterwards: the
+/// oldest exit is dropped, not the smallest thread id (the parent's).
+fn phase3_exit_status_order(t: &mut Runner) {
+    fn child() {}
+    fn parent() {
+        let mut children = alloc::vec::Vec::new();
+        for _ in 0..1100 {
+            match sched::spawn("short", child) {
+                Ok(id) => children.push(id),
+                Err(_) => sched::exit_with(1),
+            }
+            if children.len() == 64 {
+                children.drain(..).for_each(join);
+            }
+        }
+        children.into_iter().for_each(join);
+        sched::exit_with(42);
+    }
+    let status = sched::spawn("parent", parent).ok().and_then(|id| {
+        join(id);
+        sched::exit_status(id)
+    });
+    t.check(
+        "sched.exit_status_order",
+        status == Some((42, None)),
+        "a thread's exit status survives 1100 children exiting before it (the oldest status is dropped first, not the smallest thread id)",
+    );
+    if status != Some((42, None)) {
+        kprintln!("  parent status: {status:?}");
+    }
+}
+
+/// Phase 2 audit item 5: execve makes the ELF parser and loader attack
+/// surface. user/tests/badexec has 400 randomly damaged executables run
+/// by forked children, in a compartment with process, memory and tmpfs
+/// limits. The kernel must not panic, and every process slot and user
+/// frame must come back.
+fn phase3_hostile_executables(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs};
+
+    const PROGRAM: &[u8] = b"/test/badexec";
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"hostile", 0o755)
+    });
+    let limits = Limits {
+        processes: 8,
+        memory_frames: 8192,
+        tmpfs_bytes: 1 << 20,
+        tmpfs_nodes: 64,
+    };
+    let (Ok(_), Ok(c)) = (made, compartment::create(b"/comp/hostile", limits)) else {
+        t.check(
+            "exec.hostile_executables",
+            false,
+            "creating the compartment",
+        );
+        return;
+    };
+    let status = run_in(&c, PROGRAM, &[PROGRAM, b"20261123", b"400"]);
+    let ok = status == Some((0, None)) && c.processes() == 0 && c.memory().used() == 0;
+    t.check(
+        "exec.hostile_executables",
+        ok,
+        "400 randomly damaged executables, each run by a forked child in a limited compartment: refused or run, never a kernel panic; every slot and frame back (the summary line is on serial)",
+    );
+    if !ok {
+        kprintln!(
+            "  badexec: {status:?}; processes left {}, memory left {}",
+            c.processes(),
+            c.memory().used()
+        );
+    }
+}
+
+/// Phase 2 audit item 4: a frame's reference count can fill up from user
+/// mode. The real limit, 65534, is tested on the host
+/// (`keel_core::frame`); here it is lowered to 12 so a dozen processes
+/// reach it: the program's pages then have 12 sharers, so fork number 12
+/// is refused with ENOMEM. The partial copy is undone, the kernel carries
+/// on, every frame comes back, and the limit is restored.
+fn phase3_shared_frame_limit(t: &mut Runner) {
+    const PROGRAM: &[u8] = b"/test/forkprobe";
+    const LIMIT: u16 = 12;
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let before = outside_heap();
+    let previous = memory::set_reference_limit(LIMIT);
+    let status = run_test_program(PROGRAM, &[PROGRAM, b"sharers"]);
+    memory::set_reference_limit(previous);
+    let after = outside_heap();
+    // The program's text pages are shared by it and every child, so they
+    // hit the limit first: LIMIT - 1 children.
+    let ok = status == Some((i64::from(LIMIT) - 1, None)) && after == before;
+    t.check(
+        "vm.shared_frame_limit",
+        ok,
+        "with a frame's reference limit lowered to 12, fork from user mode gets 11 children and then ENOMEM; nothing leaks and the program keeps running",
+    );
+    if !ok {
+        kprintln!("  sharers: {status:?}; frames outside the heap {before} -> {after}");
+    }
+}
+
+/// P3-T3: fork and wait4, and a fork bomb against a compartment's process
+/// limit (security acceptance P3 item 3).
+fn phase3_fork(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs, process};
+
+    const PROGRAM: &[u8] = b"/test/forkprobe";
+    // Frames outside the kernel heap. The heap may keep a few more pages
+    // after a run: the scheduler keeps the exit statuses of the last 1024
+    // threads (audit 2, A7.2), and this run ends 22, so that table grows
+    // until it is full. Every other frame must come back.
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let (frames, processes) = (outside_heap(), process::count());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = status == Some((0, None)) && frames_after == frames && processes_after == processes;
+    t.check(
+        "exec.fork_wait",
+        ok,
+        "fork gives the child a copy-on-write copy and shared open files; wait4 reaps exits (status code << 8), faults (signal 11) and twenty zombies, with WNOHANG, ECHILD and EINVAL as Linux; no frame or process is left over",
+    );
+    if !ok {
+        kprintln!(
+            "  forkprobe: {status:?}; frames outside the heap {frames} -> {frames_after}; processes {processes} -> {processes_after}"
+        );
+    }
+
+    // The bomb: a compartment of 8 processes. The program forks until
+    // EAGAIN and exits with the number of children it got (7), while a
+    // program in another compartment runs normally.
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"bomb", 0o755)?;
+        fs.create_dir(comp, b"bystander", 0o755)
+    });
+    let limits = Limits {
+        processes: 8,
+        ..Limits::UNLIMITED
+    };
+    let (Ok(_), Ok(bomb), Ok(bystander)) = (
+        made,
+        compartment::create(b"/comp/bomb", limits),
+        compartment::create(b"/comp/bystander", Limits::UNLIMITED),
+    ) else {
+        t.check(
+            "compartment.fork_bomb",
+            false,
+            "creating the bomb compartments",
+        );
+        return;
+    };
+    let started = fs::read_file(PROGRAM).ok().and_then(|file| {
+        let loaded =
+            keel_linux_abi::exec::load_in(bomb.root(), &file, PROGRAM, &[PROGRAM, b"bomb"], &[])
+                .ok()?;
+        keel_linux_abi::process::spawn_in(&bomb, "bomb", &loaded).ok()
+    });
+    const NAP: &[u8] = b"/test/nap";
+    let other = run_in(&bystander, NAP, &[NAP, b"10"]);
+    let bombed = started.and_then(|s| {
+        join(s.thread);
+        sched::exit_status(s.thread)
+    });
+    let ok = bombed == Some((7, None))
+        && other == Some((0, None))
+        && bomb.processes() == 0
+        && bomb.memory().used() == 0;
+    t.check(
+        "compartment.fork_bomb",
+        ok,
+        "a fork bomb in a compartment of 8 processes gets 7 children and then EAGAIN; zombies keep their slots until reaped; all reaped, every slot and frame back; a program in another compartment runs meanwhile",
+    );
+    if !ok {
+        kprintln!(
+            "  bomb: {bombed:?}; bystander {other:?}; processes left {}, memory left {}",
+            bomb.processes(),
+            bomb.memory().used()
+        );
+    }
+}
+
+/// P3-T3: execve. user/tests/execprobe runs itself three times; it passes
+/// under Linux too (`host.execprobe`).
+fn phase3_execve(t: &mut Runner) {
+    const PROGRAM: &[u8] = b"/test/execprobe";
+    // Frames outside the kernel heap, which may keep a page for the
+    // tables a run grows (as in exec.fork_wait).
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let before = outside_heap();
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    let after = outside_heap();
+    let ok = status == Some((0, None)) && after == before;
+    t.check(
+        "exec.execve",
+        ok,
+        "execve replaces the program: refusals as Linux (ENOENT, EACCES, EFAULT), an empty argv arrives as [\"\"], close-on-exec handles closed and others kept, caught signals reset, ignored ones and the blocked mask kept, the FS base cleared; no frame is lost across three programs",
+    );
+    if !ok {
+        kprintln!("  execprobe: {status:?}, frames outside the heap {before} -> {after}");
+    }
+}
+
+/// P3-T7, private file mappings: user/tests/filemap maps its own
+/// executable and compares every byte with read(2). It passes under Linux
+/// too (`host.filemap`).
+fn phase3_file_mappings(t: &mut Runner) {
+    // A program with a shared library of its own: musl's dynamic linker
+    // opens /lib/libkeelgreet.so (open, read, fstat), maps it from the
+    // file and runs. The line, with the count kept in the library's data
+    // segment, is checked on serial.
+    const GREET: &[u8] = b"/test/musl-greet";
+    let greet = run_test_program(GREET, &[GREET]);
+    t.check(
+        "exec.shared_library",
+        greet == Some((0, None)),
+        "a musl program linked against its own shared library runs: the dynamic linker finds it in /lib and maps it from the file (its line is checked on serial)",
+    );
+    if greet != Some((0, None)) {
+        kprintln!("  musl-greet: {greet:?}");
+    }
+
+    const PROGRAM: &[u8] = b"/test/filemap";
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    t.check(
+        "exec.file_mappings",
+        status == Some((0, None)),
+        "private file mappings hold the file's bytes at the right offsets (zero past the end), stay private when written, survive a split, and are refused as Linux refuses them (EACCES, EBADF, ENODEV, EINVAL)",
+    );
+    if status != Some((0, None)) {
+        kprintln!("  filemap: {status:?}");
+    }
+
+    // A page wholly past the end of the file cannot be filled: Linux sends
+    // SIGBUS (mmap(2)); here a kernel copy from it gets EFAULT, while the
+    // page holding the file's last byte reads normally.
+    use keel_core::vm::{Backing, Placement, Prot};
+    use keel_hal::vm::{AddressSpace, copy_from_user, with_address_space};
+    const AT: u64 = 0x1000_0000;
+    let ino = keel_linux_abi::fs::lookup(PROGRAM).ok();
+    let size = ino
+        .and_then(|ino| keel_linux_abi::fs::with(|fs| fs.stat(ino)).ok())
+        .map(|s| s.size);
+    let space = AddressSpace::new().ok();
+    let past_end = match (ino, size, space) {
+        (Some(ino), Some(size), Some(space)) => {
+            let last = (size - 1) / 4096 * 4096;
+            let map = |at, offset| {
+                let backing = Backing {
+                    object: u64::from(ino),
+                    offset,
+                    may_exec: false,
+                };
+                space.map_file(
+                    Placement::Fixed(at),
+                    4096,
+                    Prot {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                    backing,
+                )
+            };
+            let (a, b) = (map(AT, last), map(AT + 0x10000, last + 4096));
+            let mut byte = [0u8; 1];
+            let mut magic = [0u8; 4];
+            let tail = with_address_space(&space, || copy_from_user(&mut byte, AT));
+            let beyond = with_address_space(&space, || copy_from_user(&mut byte, AT + 0x10000));
+            let head = map(AT + 0x20000, 0).and_then(|_| {
+                with_address_space(&space, || copy_from_user(&mut magic, AT + 0x20000))
+                    .map_err(|_| keel_hal::vm::AsError::OutOfMemory)
+            });
+            a.is_ok()
+                && b.is_ok()
+                && tail.is_ok()
+                && beyond.is_err()
+                && head.is_ok()
+                && &magic == b"\x7fELF"
+        }
+        _ => false,
+    };
+    t.check(
+        "exec.file_mapping_past_end",
+        past_end,
+        "a mapped page wholly past the end of its file is not filled (a copy from it gets EFAULT; Linux sends SIGBUS), while the page holding the last byte and the first page read normally",
+    );
+}
+
+/// P3-T2: dynamically linked programs. The musl program names
+/// /lib/ld-musl-x86_64.so.1, musl's dynamic linker; the kernel loads both
+/// and starts the dynamic linker, which runs the program.
+fn phase3_dynamic(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::elf::ElfError;
+    use keel_core::errno::Errno;
+    use keel_linux_abi::exec::{self, LoadError};
+    use keel_linux_abi::{compartment, fs};
+
+    const PROGRAM: &[u8] = b"/test/musl-dynamic";
+    const LDSO: &[u8] = b"/lib/ld-musl-x86_64.so.1";
+    let file = fs::read_file(PROGRAM).ok();
+    // In the system compartment: the program's line is checked on serial.
+    let loaded = file
+        .as_ref()
+        .and_then(|f| exec::load(f, PROGRAM, &[PROGRAM], &[]).ok());
+    let base = loaded.as_ref().and_then(|l| l.interpreter_base);
+    let status = loaded.and_then(|l| {
+        let spawned = keel_linux_abi::process::spawn("musl-dynamic", &l).ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    });
+    // The interpreter lies in the mmap area, below the randomized stack,
+    // away from the program (loaded near DYN_BASE).
+    let placed = base.is_some_and(|b| b > exec::DYN_BASE + (1 << 40) && b % 4096 == 0);
+    t.check(
+        "exec.dynamic_musl",
+        status == Some((0, None)) && placed,
+        "a dynamically linked musl program runs: the kernel loads its PT_INTERP (musl's dynamic linker) in the mmap area and starts it, AT_BASE set (its line is checked on serial)",
+    );
+    if !(status == Some((0, None)) && placed) {
+        kprintln!("  musl-dynamic: exit {status:?}, interpreter at {base:#x?}");
+    }
+
+    // In a compartment, the interpreter is found in the compartment's own
+    // tree: without /lib there the program cannot load (ENOENT), with a
+    // copy of the dynamic linker it runs.
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"bare", 0o755)?;
+        let dyn_root = fs.create_dir(comp, b"dyn", 0o755)?;
+        let lib = fs.create_dir(dyn_root, b"lib", 0o755)?;
+        let ldso = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, LDSO)?;
+        let bytes = fs.contents(ldso)?;
+        let copy = fs.create_file(lib, b"ld-musl-x86_64.so.1", 0o755)?;
+        fs.write(copy, 0, &bytes)?;
+        // A static executable as the "interpreter": refused.
+        let fixed = fs.create_dir(comp, b"fixed", 0o755)?;
+        let lib = fs.create_dir(fixed, b"lib", 0o755)?;
+        let startup = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/test/startup")?;
+        let bytes = fs.contents(startup)?;
+        let copy = fs.create_file(lib, b"ld-musl-x86_64.so.1", 0o755)?;
+        fs.write(copy, 0, &bytes)?;
+        Ok(())
+    });
+    let at = |path: &[u8]| compartment::create(path, Limits::UNLIMITED).ok();
+    let (Ok(()), Some(file), Some(bare), Some(with_ldso), Some(fixed)) = (
+        made,
+        file,
+        at(b"/comp/bare"),
+        at(b"/comp/dyn"),
+        at(b"/comp/fixed"),
+    ) else {
+        t.check(
+            "exec.interpreter_in_root",
+            false,
+            "setting up the interpreter compartments",
+        );
+        return;
+    };
+    let missing = exec::load_in(bare.root(), &file, PROGRAM, &[PROGRAM], &[]).err();
+    let refused = exec::load_in(fixed.root(), &file, PROGRAM, &[PROGRAM], &[]).err();
+    let runs = run_in(&with_ldso, PROGRAM, &[PROGRAM]);
+    let ok = missing == Some(LoadError::Interpreter(Errno::ENOENT))
+        && refused == Some(LoadError::BadInterpreter(ElfError::BadInterpreter))
+        && runs == Some((0, None));
+    t.check(
+        "exec.interpreter_in_root",
+        ok,
+        "a compartment's program finds its interpreter in the compartment's tree: ENOENT without one, a fixed-address one refused, a copy of the dynamic linker runs it",
+    );
+    if !ok {
+        kprintln!("  missing {missing:?}, fixed {refused:?}, with ld.so {runs:?}");
+    }
+}
+
+/// P3-S4 tmpfs, the rest of Phase 2 audit item 1: each compartment's file
+/// bytes and nodes are capped on their own. Two compartments with the same
+/// quota each reach exactly their own limits, so neither's use is counted
+/// against the other, and a file the kernel placed is charged to the
+/// compartment that grows it.
+fn phase3_tmpfs_quota(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs};
+
+    const PROGRAM: &[u8] = b"/test/tmpquota";
+    const BYTES: usize = 64 << 10;
+    const NODES: usize = 8;
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        for name in [&b"qa"[..], b"qb"] {
+            let dir = fs.create_dir(comp, name, 0o755)?;
+            fs.create_file(dir, b"given", 0o644)?;
+        }
+        Ok(())
+    });
+    let limits = Limits {
+        tmpfs_bytes: BYTES,
+        tmpfs_nodes: NODES,
+        ..Limits::UNLIMITED
+    };
+    let (Ok(()), Ok(a), Ok(b)) = (
+        made,
+        compartment::create(b"/comp/qa", limits),
+        compartment::create(b"/comp/qb", limits),
+    ) else {
+        t.check(
+            "compartment.tmpfs_quota",
+            false,
+            "creating the quota compartments",
+        );
+        return;
+    };
+    let args: [&[u8]; 3] = [PROGRAM, b"65536", b"8"];
+    let in_a = run_in(&a, PROGRAM, &args);
+    let in_b = run_in(&b, PROGRAM, &args);
+    let used = |c: &alloc::sync::Arc<keel_core::compartment::Compartment>| {
+        c.tmpfs().map(|q| (q.bytes.used(), q.nodes.used()))
+    };
+    // After the run: one chunk in /given, and the eight files.
+    let expected = Some((4096, NODES));
+    let ok = in_a == Some((0, None))
+        && in_b == Some((0, None))
+        && used(&a) == expected
+        && used(&b) == expected;
+    t.check(
+        "compartment.tmpfs_quota",
+        ok,
+        "file bytes and nodes are capped per compartment (ENOSPC at exactly 64 KiB and 8 nodes, in each of two compartments); a kernel-made file is charged to the compartment that grows it; truncating gives bytes back",
+    );
+    if !ok {
+        kprintln!(
+            "  tmpquota: A {in_a:?} {:?}, B {in_b:?} {:?}",
+            used(&a),
+            used(&b)
+        );
+    }
+}
+
+/// P3-S4 memory, and security acceptance P3 item 3 for memory: a program
+/// that touches more than its compartment's memory limit is ended by the
+/// fault at the limit; every frame comes back; the kernel and another
+/// compartment carry on.
+fn phase3_memory_limit(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::errno::Errno;
+    use keel_linux_abi::compartment;
+
+    const HOG: &[u8] = b"/test/hog";
+    const NAP: &[u8] = b"/test/nap";
+    // 17 MiB. Not a multiple of 512: hog needs a new page table every 512
+    // pages, so with a limit on that boundary a fault that ignored the
+    // limit would still stop exactly at it (the next table is refused).
+    const LIMIT: usize = 4352;
+    let made = keel_linux_abi::fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"hog", 0o755)?;
+        fs.create_dir(comp, b"calm", 0o755)
+    });
+    let limited = |frames| {
+        compartment::create(
+            b"/comp/hog",
+            Limits {
+                processes: 4,
+                memory_frames: frames,
+                ..Limits::UNLIMITED
+            },
+        )
+    };
+    let (Ok(_), Ok(hog)) = (made, limited(LIMIT)) else {
+        t.check(
+            "compartment.memory_limit",
+            false,
+            "creating the hog compartment",
+        );
+        return;
+    };
+    let free_before = memory::free_frames();
+    // 64 MiB of touches against a 17 MiB limit.
+    let status = run_in(&hog, HOG, &[HOG, b"64"]);
+    let used_after = hog.memory().used();
+    let free_after = memory::free_frames();
+    // Within the limit the same program finishes.
+    let small = run_in(&hog, HOG, &[HOG, b"8"]);
+    let calm = compartment::create(b"/comp/calm", Limits::UNLIMITED);
+    let other = calm.ok().and_then(|c| run_in(&c, NAP, &[NAP, b"10"]));
+    // hog touches pages in order from 1 TiB (its BASE): the fault address
+    // says how many it touched. Every touched page and every table is
+    // charged, so that is at most the limit, and the image, stack and
+    // tables take only a few dozen frames, so it is close to the limit.
+    const BASE: u64 = 1 << 40;
+    let touched = match status {
+        Some((_, Some(fault))) if fault.vector == 14 && fault.address >= BASE => {
+            Some(((fault.address - BASE) / 4096) as usize)
+        }
+        _ => None,
+    };
+    let killed = matches!(touched, Some(pages) if pages <= LIMIT && pages + 64 >= LIMIT);
+    let ok = killed
+        && used_after == 0
+        && free_after == free_before
+        && small == Some((0, None))
+        && other == Some((0, None));
+    t.check(
+        "compartment.memory_limit",
+        ok,
+        "touching 64 MiB in a compartment limited to 17 MiB ends the program at the limit (its fault address is within the limit, near it); all its frames come back; 8 MiB fits; another compartment runs normally",
+    );
+    if !ok {
+        kprintln!(
+            "  hog: {status:?}, {touched:?} pages touched, budget after {used_after}, free frames {free_before} -> {free_after}; 8 MiB: {small:?}; other compartment: {other:?}"
+        );
+    }
+
+    // What the loader populated counts too: a limit below it refuses the
+    // process at spawn, with ENOMEM, before it runs.
+    let tiny = limited(2).ok().and_then(|c| {
+        let file = keel_linux_abi::fs::read_file(HOG).ok()?;
+        let loaded = keel_linux_abi::exec::load(&file, HOG, &[HOG], &[]).ok()?;
+        let charged = loaded.space.charged_frames();
+        let refused = keel_linux_abi::process::spawn_in(&c, "hog", &loaded).err();
+        Some((charged, refused, c.memory().used(), c.processes()))
+    });
+    let refused = matches!(tiny, Some((charged, Some(Errno::ENOMEM), 0, 0)) if charged > 2);
+    t.check(
+        "compartment.memory_limit_at_spawn",
+        refused,
+        "a program whose loaded image already exceeds its compartment's memory limit is refused at spawn with ENOMEM, charging nothing",
+    );
+    if !refused {
+        kprintln!("  tiny limit: {tiny:?}");
     }
 }
 

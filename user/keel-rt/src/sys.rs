@@ -16,6 +16,7 @@ use crate::{syscall3, syscall6};
 pub mod nr {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
     pub const POLL: u64 = 7;
@@ -26,7 +27,18 @@ pub mod nr {
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
+    pub const PREAD64: u64 = 17;
+    pub const FCNTL: u64 = 72;
     pub const WRITEV: u64 = 20;
+    pub const GETPID: u64 = 39;
+    pub const CLONE: u64 = 56;
+    pub const FORK: u64 = 57;
+    pub const KILL: u64 = 62;
+    pub const GETTID: u64 = 186;
+    pub const FUTEX: u64 = 202;
+    pub const EXECVE: u64 = 59;
+    pub const WAIT4: u64 = 61;
+    pub const GETPPID: u64 = 110;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
@@ -37,6 +49,7 @@ pub mod nr {
 
 pub const AT_FDCWD: i32 = -100;
 pub const O_RDONLY: u64 = 0;
+pub const O_CLOEXEC: u64 = 0o2000000;
 pub const O_WRONLY: u64 = 1;
 pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
@@ -145,6 +158,186 @@ pub fn openat_from(path: Hostile, flags: u64) -> i64 {
     call6(nr::OPENAT, [AT_FDCWD as u64, path.0, flags, 0, 0, 0])
 }
 
+/// fork(2): the child's PID in the parent, 0 in the child, or -errno.
+/// The child continues with a copy of this program's memory and state,
+/// so nothing in Rust's model is affected: each process has its own.
+pub fn fork() -> i64 {
+    call3(nr::FORK, 0, 0, 0)
+}
+
+/// wait4(2) with the status written to `status` and no rusage.
+pub fn wait4(pid: i32, status: &mut i32, options: u32) -> i64 {
+    call6(
+        nr::WAIT4,
+        [
+            pid as u32 as u64,
+            status as *mut i32 as u64,
+            u64::from(options),
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// kill(2).
+pub fn kill(pid: i32, signal: i32) -> i64 {
+    call3(nr::KILL, pid as u32 as u64, signal as u32 as u64, 0)
+}
+
+/// gettid(2).
+pub fn gettid() -> i64 {
+    call3(nr::GETTID, 0, 0, 0)
+}
+
+/// clone(2) with flags that are refused before anything is created (the
+/// kernel checks them first), for testing those refusals. Any other use
+/// would start a thread on this program's stack: not offered.
+pub fn clone_refused(flags: u64) -> i64 {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    let thread_without_sighand = flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0;
+    let sighand_without_vm = flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0;
+    if !(thread_without_sighand || sighand_without_vm) {
+        return -22;
+    }
+    call6(nr::CLONE, [flags, 0, 0, 0, 0, 0])
+}
+
+/// futex(2) on `word`, a u32 this program owns. `timeout` is a relative
+/// timespec (seconds, nanoseconds) for FUTEX_WAIT.
+pub fn futex(
+    word: &core::sync::atomic::AtomicU32,
+    op: u32,
+    val: u32,
+    timeout: Option<&[i64; 2]>,
+) -> i64 {
+    let timeout = timeout.map_or(0, |t| t.as_ptr() as u64);
+    call6(
+        nr::FUTEX,
+        [
+            word.as_ptr() as u64,
+            u64::from(op),
+            u64::from(val),
+            timeout,
+            0,
+            0,
+        ],
+    )
+}
+
+/// futex(2) with an address that is not 4-byte aligned (EINVAL), inside
+/// `buf`.
+pub fn futex_misaligned(buf: &[u8; 8], op: u32) -> i64 {
+    call6(
+        nr::FUTEX,
+        [buf.as_ptr() as u64 + 1, u64::from(op), 0, 0, 0, 0],
+    )
+}
+
+/// FUTEX_CMP_REQUEUE from `from` to `to` (both this program's).
+pub fn futex_cmp_requeue(
+    from: &core::sync::atomic::AtomicU32,
+    to: &core::sync::atomic::AtomicU32,
+    wake: u32,
+    requeue: u32,
+    expected: u32,
+) -> i64 {
+    call6(
+        nr::FUTEX,
+        [
+            from.as_ptr() as u64,
+            4 | 128,
+            u64::from(wake),
+            u64::from(requeue),
+            to.as_ptr() as u64,
+            u64::from(expected),
+        ],
+    )
+}
+
+/// getppid(2).
+pub fn getppid() -> i64 {
+    call3(nr::GETPPID, 0, 0, 0)
+}
+
+/// execve(2) of `path` with these arguments (`None`: a NULL argv) and
+/// environment, at most 15 of each. Returns only on failure, with -errno;
+/// on success this program is replaced, so no Rust state of it survives.
+pub fn execve(path: &CStr, argv: Option<&[&CStr]>, envp: &[&CStr]) -> i64 {
+    let mut args = [0u64; 16];
+    let mut env = [0u64; 16];
+    let Some(argv_list) = argv.map_or(Some(&[][..]), Some).filter(|a| a.len() < 16) else {
+        return -7; // E2BIG
+    };
+    if envp.len() >= 16 {
+        return -7;
+    }
+    for (slot, arg) in args.iter_mut().zip(argv_list) {
+        *slot = arg.as_ptr() as u64;
+    }
+    for (slot, var) in env.iter_mut().zip(envp) {
+        *slot = var.as_ptr() as u64;
+    }
+    let argv_ptr = if argv.is_some() {
+        args.as_ptr() as u64
+    } else {
+        0
+    };
+    call3(
+        nr::EXECVE,
+        path.as_ptr() as u64,
+        argv_ptr,
+        env.as_ptr() as u64,
+    )
+}
+
+/// execve(2) with the path at a hostile address (and no arguments).
+pub fn execve_from(path: Hostile) -> i64 {
+    call3(nr::EXECVE, path.0, 0, 0)
+}
+
+/// The FS base (arch_prctl ARCH_GET_FS), or -errno.
+pub fn fs_base() -> Result<u64, i64> {
+    let mut base = 0u64;
+    let r = call3(nr::ARCH_PRCTL, ARCH_GET_FS, &raw mut base as u64, 0);
+    if r < 0 { Err(r) } else { Ok(base) }
+}
+
+/// The GS base (arch_prctl ARCH_GET_GS, 0x1004), or -errno.
+pub fn gs_base() -> Result<u64, i64> {
+    let mut base = 0u64;
+    let r = call3(nr::ARCH_PRCTL, 0x1004, &raw mut base as u64, 0);
+    if r < 0 { Err(r) } else { Ok(base) }
+}
+
+/// fcntl(2) with an integer argument.
+pub fn fcntl(fd: i32, cmd: u32, arg: u64) -> i64 {
+    call3(nr::FCNTL, fd as u64, u64::from(cmd), arg)
+}
+
+/// open(2), the legacy call musl uses on x86-64.
+pub fn open(path: &CStr, flags: u64, mode: u64) -> i64 {
+    call3(nr::OPEN, path.as_ptr() as u64, flags, mode)
+}
+
+/// pread64(2) into `buf` from file offset `offset` (as an `off_t`: a value
+/// above `i64::MAX` is a negative offset).
+pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> i64 {
+    call6(
+        nr::PREAD64,
+        [
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            offset,
+            0,
+            0,
+        ],
+    )
+}
+
 pub fn close(fd: i32) -> i64 {
     call3(nr::CLOSE, fd as u64, 0, 0)
 }
@@ -180,6 +373,11 @@ pub fn getrandom(buf: &mut [u8], flags: u64) -> i64 {
 
 pub fn getrandom_into(target: Hostile, len: u64) -> i64 {
     call3(nr::GETRANDOM, target.0, len, 0)
+}
+
+/// getpid(2): the PID inside the caller's compartment.
+pub fn getpid() -> i64 {
+    call3(nr::GETPID, 0, 0, 0)
 }
 
 pub fn set_tid_address(slot: &mut u32) -> i64 {
@@ -387,6 +585,24 @@ impl Region {
         }
     }
 
+    /// A private mapping of `fd` from file offset `offset` (mmap with
+    /// MAP_PRIVATE), placed by the kernel. Writes to it stay in this
+    /// process; the file is not changed.
+    pub fn map_file_private(length: u64, prot: u64, fd: i32, offset: u64) -> Result<Region, i64> {
+        let result = call6(
+            nr::MMAP,
+            [0, length, prot, MAP_PRIVATE, fd as u32 as u64, offset],
+        );
+        if result < 0 {
+            Err(result)
+        } else {
+            Ok(Region {
+                address: result as u64,
+                length,
+            })
+        }
+    }
+
     /// mmap at `address` exactly, with MAP_FIXED_NOREPLACE: fails (EEXIST)
     /// rather than replace anything already mapped, so it can never land
     /// on this program's own memory.
@@ -446,6 +662,18 @@ impl Region {
         // SAFETY: inside the mapping (checked); read_unaligned allows any
         // alignment; any 8 bytes are a valid u64.
         Some(unsafe { (at as *const u64).read_unaligned() })
+    }
+
+    /// Copies `buf.len()` bytes at `offset` into `buf`. Fails (`None`) if
+    /// the range does not fit. The region must be readable there; if it
+    /// is not, the read faults and the kernel ends the program.
+    pub fn read(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        let at = self.range(offset, buf.len())?;
+        // SAFETY: `[at, at + len)` lies inside this mapping (checked), in
+        // which no Rust object or reference exists (module rule), so it
+        // cannot overlap `buf`; any bytes are valid `u8`s.
+        unsafe { core::ptr::copy_nonoverlapping(at as *const u8, buf.as_mut_ptr(), buf.len()) };
+        Some(())
     }
 
     /// Writes `value` at `offset` (any alignment).

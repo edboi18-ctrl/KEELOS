@@ -309,6 +309,17 @@ pub(crate) fn retain(frame: Frame) -> Result<(), FrameError> {
         .retain(frame)
 }
 
+/// Lowers the most references a frame may have (tests), and returns the
+/// previous limit. See `FrameAllocator::set_reference_limit`.
+pub fn set_reference_limit(limit: u16) -> u16 {
+    FRAMES
+        .lock()
+        .as_mut()
+        .map_or(keel_core::frame::MAX_REFERENCES, |a| {
+            a.set_reference_limit(limit)
+        })
+}
+
 /// Drops a reference; the frame is freed when the last one goes.
 pub(crate) fn release(frame: Frame) -> Result<bool, FrameError> {
     FRAMES
@@ -326,6 +337,30 @@ pub fn free_frames() -> usize {
 /// Reference count of a frame (0 if not allocated).
 pub(crate) fn references(frame: Frame) -> u16 {
     FRAMES.lock().as_ref().map_or(0, |a| a.references(frame))
+}
+
+/// Copies `bytes` (at most one frame) to the start of allocated frame
+/// `to`; the rest of the frame is left as it is.
+// Only the page-fault path (private file mappings) calls this, and it
+// exists only for the kernel target, so a host build sees no caller.
+#[cfg_attr(not(target_os = "none"), expect(dead_code))]
+pub(crate) fn fill_frame(to: Frame, bytes: &[u8]) -> Result<(), FrameError> {
+    if bytes.len() > FRAME_SIZE as usize {
+        return Err(FrameError::NotAllocated);
+    }
+    let guard = FRAMES.lock();
+    let allocator = guard.as_ref().ok_or(FrameError::NotAllocated)?;
+    if allocator.references(to) == 0 {
+        return Err(FrameError::NotAllocated);
+    }
+    // SAFETY: `to` is allocated (checked under the lock) and mapped
+    // read-write in the direct map, 4096 bytes long; `bytes` is at most
+    // that long (checked above) and, being a shared borrow of memory the
+    // caller owns, cannot overlap a frame only the allocator hands out.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), frame_pointer(to), bytes.len());
+    }
+    Ok(())
 }
 
 /// Copies the contents of allocated frame `from` into allocated frame `to`.

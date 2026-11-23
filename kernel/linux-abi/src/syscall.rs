@@ -16,7 +16,7 @@ use keel_core::errno::Errno;
 
 use keel_core::handle::{Handle, Refusal, Rights};
 use keel_core::vfs::{Device, Kind, PATH_MAX};
-use keel_core::vm::{PAGE, Placement, Prot, USER_END, VmError};
+use keel_core::vm::{Backing, PAGE, Placement, Prot, USER_END, VmError};
 use keel_hal::sched::{self, SegmentBase};
 use keel_hal::sync::IrqMutex;
 use keel_hal::syscall::SyscallArgs;
@@ -32,6 +32,7 @@ use crate::process::{self, Object, OpenFile, Process, file_rights};
 pub mod nr {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
     pub const POLL: u64 = 7;
@@ -42,8 +43,19 @@ pub mod nr {
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
+    pub const PREAD64: u64 = 17;
     pub const WRITEV: u64 = 20;
+    pub const GETPID: u64 = 39;
+    pub const CLONE: u64 = 56;
+    pub const FORK: u64 = 57;
+    pub const KILL: u64 = 62;
+    pub const GETTID: u64 = 186;
+    pub const FUTEX: u64 = 202;
+    pub const EXECVE: u64 = 59;
+    pub const WAIT4: u64 = 61;
+    pub const GETPPID: u64 = 110;
     pub const EXIT: u64 = 60;
+    pub const FCNTL: u64 = 72;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
@@ -61,6 +73,7 @@ type SysResult = Result<u64, Errno>;
 /// Registers the handler and the exit hook. Call once at boot.
 pub fn init() {
     keel_hal::syscall::set_handler(handle);
+    keel_hal::vm::set_file_reader(read_mapped_page);
     sched::set_exit_hook(process::on_thread_exit);
 }
 
@@ -91,6 +104,29 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::FSTAT as usize] = Some(|p, a| fstat(p, a[0] as u32 as i32, a[1]));
     t[nr::POLL as usize] = Some(|p, a| poll(p, a[0], a[1] as u32, a[2] as u32 as i32));
     t[nr::OPENAT as usize] = Some(|p, a| openat(p, a[0] as u32 as i32, a[1], a[2], a[3]));
+    // open(2) is openat(AT_FDCWD, ...), as Linux's sys_open (`fs/open.c`),
+    // which also sets O_LARGEFILE on 64-bit (no effect here).
+    t[nr::OPEN as usize] = Some(|p, a| openat(p, AT_FDCWD, a[0], a[1] | O_LARGEFILE, a[2]));
+    t[nr::PREAD64 as usize] = Some(|p, a| pread64(p, a[0] as u32 as i32, a[1], a[2], a[3]));
+    t[nr::FCNTL as usize] = Some(|p, a| fcntl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
+    t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
+    t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
+    t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
+    t[nr::GETTID as usize] =
+        Some(|p, _| process::with_current_thread(p, |t| u64::from(t.tid)).ok_or(Errno::ESRCH));
+    t[nr::KILL as usize] = Some(|p, a| process::kill(p, a[0] as u32 as i32, a[1] as u32 as i32));
+    t[nr::FUTEX as usize] = Some(|p, a| {
+        let space = p.lock().space()?.id();
+        crate::futex::futex(
+            space,
+            a[0],
+            a[1] as u32,
+            a[2] as u32,
+            a[3],
+            a[4],
+            a[5] as u32,
+        )
+    });
     t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
     t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
     t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
@@ -102,6 +138,7 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::IOCTL as usize] = Some(|p, a| ioctl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
     t[nr::ARCH_PRCTL as usize] = Some(|_, a| arch_prctl(a[0], a[1]));
     t[nr::SET_TID_ADDRESS as usize] = Some(|p, a| Ok(set_tid_address(p, a[0])));
+    t[nr::GETPID as usize] = Some(|p, _| Ok(u64::from(p.lock().pid())));
     t[nr::CLOCK_GETTIME as usize] = Some(|_, a| clock_gettime(a[0] as u32 as u64, a[1]));
     t[nr::GETRANDOM as usize] = Some(|_, a| getrandom(a[0], a[1], a[2] as u32 as u64));
     t
@@ -178,17 +215,33 @@ pub fn reserve_refusals() -> u64 {
 /// which already does this for user page faults). Exempt: `close` and
 /// `munmap` free memory, so a program can recover; `brk` never returns an
 /// error (it reports the old break), and its mapping is checked by the
-/// same cap as any other.
+/// same cap as any other. `getpid` allocates nothing and getpid(2) says it
+/// is "always successful".
 fn may_run_on_reserve(number: u64) -> bool {
-    matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK)
+    matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK | nr::GETPID)
 }
 
 fn dispatch(call: &SyscallArgs) -> i64 {
     let a = call.args;
     let number = call.number;
     let result: SysResult = match number {
-        nr::EXIT | nr::EXIT_GROUP => sched::exit_with((a[0] & 0xff) as i64),
+        // exit ends the calling thread; exit_group the whole process.
+        nr::EXIT => sched::exit_with((a[0] & 0xff) as i64),
+        nr::EXIT_GROUP => match process::current() {
+            Some(p) => process::exit_group(p, (a[0] & 0xff) as i64),
+            None => sched::exit_with((a[0] & 0xff) as i64),
+        },
+        nr::CLONE => match process::current() {
+            Some(p) => clone(&p, &call.frame, a),
+            None => unimplemented(number, &a),
+        },
         // Outside the table: it also needs the caller's stack pointer.
+        // fork needs the caller's registers, which the table's handlers
+        // do not get.
+        nr::FORK => match process::current() {
+            Some(p) => process::fork(&p, &call.frame),
+            None => unimplemented(number, &a),
+        },
         nr::SIGALTSTACK => match process::current() {
             Some(p) => sigaltstack(&p, a[0], a[1], call.user_rsp),
             None => unimplemented(number, &a),
@@ -264,7 +317,8 @@ fn vm_error(error: AsError) -> Errno {
         AsError::Vm(VmError::Invalid) => Errno::EINVAL,
         AsError::Vm(VmError::NoMemory) | AsError::OutOfMemory => Errno::ENOMEM,
         AsError::Vm(VmError::Exists) => Errno::EEXIST,
-        AsError::Vm(VmError::WriteExec) => Errno::EACCES,
+        AsError::Vm(VmError::WriteExec | VmError::NotExecutable) => Errno::EACCES,
+        AsError::Vm(VmError::BadOffset) => Errno::EINVAL,
     }
 }
 
@@ -297,11 +351,17 @@ fn file(
 /// Copies a NUL-terminated path from user memory, one page at a time so a
 /// string ending just before an unmapped page is still read.
 fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
+    user_string(address, PATH_MAX, Errno::ENAMETOOLONG)
+}
+
+/// A NUL-terminated string from user memory, read a page at a time. With
+/// its NUL it must fit in `max` bytes, else `too_long`.
+fn user_string(address: u64, max: usize, too_long: Errno) -> Result<Vec<u8>, Errno> {
     let mut path = Vec::new();
     let mut at = address;
     loop {
         let room = (PAGE - at % PAGE) as usize;
-        let take = room.min(PATH_MAX - path.len());
+        let take = room.min(max - path.len());
         let mut buf = [0u8; PAGE as usize];
         copy_from_user(&mut buf[..take], at).map_err(fault)?;
         if let Some(end) = buf[..take].iter().position(|&b| b == 0) {
@@ -309,15 +369,230 @@ fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
             return Ok(path);
         }
         path.extend_from_slice(&buf[..take]);
-        if path.len() >= PATH_MAX {
-            return Err(Errno::ENAMETOOLONG);
+        if path.len() >= max {
+            return Err(too_long);
         }
         at = at.checked_add(take as u64).ok_or(Errno::EFAULT)?;
     }
 }
 
 fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult {
+    read_at(p, fd, buf, count, None)
+}
+
+/// wait4(2) (P3-T3). As Linux's kernel_wait4 (`kernel/exit.c` at v6.12):
+/// options other than WNOHANG, WUNTRACED, WCONTINUED, __WNOTHREAD,
+/// __WCLONE and __WALL are EINVAL; INT_MIN is ESRCH. -1 waits for any
+/// child. Keel has no process groups yet and every process of a
+/// compartment would be in one, so 0 (the caller's group) is any child,
+/// and another negative pgid finds none (ECHILD). No child matching:
+/// ECHILD. WNOHANG with none exited returns 0. Stopped and continued
+/// children do not exist until signals do, so WUNTRACED and WCONTINUED
+/// change nothing. The status is written if `status` is not NULL; a
+/// `rusage` is written as all zero (no accounting yet).
+fn wait4(
+    p: &Arc<IrqMutex<Process>>,
+    pid: i32,
+    status: u64,
+    options: u32,
+    rusage: u64,
+) -> SysResult {
+    const WNOHANG: u32 = 1;
+    const KNOWN: u32 = 1 | 2 | 8 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    /// sizeof(struct rusage) on x86-64.
+    const RUSAGE_SIZE: usize = 144;
+    if options & !KNOWN != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let which = match pid {
+        i32::MIN => return Err(Errno::ESRCH),
+        -1 | 0 => process::WaitFor::Any,
+        pid if pid > 0 => process::WaitFor::Pid(pid as u32),
+        _ => return Err(Errno::ECHILD),
+    };
+    let Some((child, wait_status)) = process::wait(p, which, options & WNOHANG == 0)? else {
+        return Ok(0);
+    };
+    // Like Linux, the child is already reaped when a copy-out fails.
+    if status != 0 {
+        copy_to_user(status, &wait_status.to_le_bytes()).map_err(fault)?;
+    }
+    if rusage != 0 {
+        copy_to_user(rusage, &[0u8; RUSAGE_SIZE]).map_err(fault)?;
+    }
+    Ok(u64::from(child))
+}
+
+/// Longest argument or environment string, its NUL included: Linux's
+/// MAX_ARG_STRLEN, 32 pages (`include/uapi/linux/binfmts.h`).
+const MAX_ARG_STRLEN: usize = 32 * PAGE as usize;
+
+/// The strings of a NULL-terminated array of string pointers in user
+/// memory (execve's argv or envp). A NULL array is empty, as on Linux.
+/// The pointers (8 bytes each) and the strings together must fit the
+/// initial-stack limit (`exec::ARG_LIMIT`), else E2BIG, checked as they
+/// are read, so a huge array is refused without being read in full.
+fn user_strings(array: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
+    let mut strings = Vec::new();
+    if array == 0 {
+        return Ok(strings);
+    }
+    loop {
+        let at = array
+            .checked_add(strings.len() as u64 * 8)
+            .ok_or(Errno::EFAULT)?;
+        let mut pointer = [0u8; 8];
+        copy_from_user(&mut pointer, at).map_err(fault)?;
+        let pointer = u64::from_le_bytes(pointer);
+        if pointer == 0 {
+            return Ok(strings);
+        }
+        let string = user_string(pointer, MAX_ARG_STRLEN, Errno::E2BIG)?;
+        *budget = budget
+            .checked_sub(string.len() + 1 + 8)
+            .ok_or(Errno::E2BIG)?;
+        strings.push(string);
+    }
+}
+
+/// execve(2) (P3-T3): replaces the calling process's program. Everything
+/// that can fail is done first, leaving the process as it was: reading
+/// the path and the argument and environment strings, finding the file
+/// (from the process's root and working directory, so a compartment can
+/// only run what is in its tree), loading it and its interpreter into a
+/// new address space (`exec::load_in`, ADR 0015), and charging that
+/// space to the compartment's memory budget. Then, as Linux's
+/// begin_new_exec (`fs/exec.c` at v6.12): the new address space and
+/// program break, close-on-exec handles closed, caught signals reset and
+/// the alternate stack dropped (the blocked mask is kept), FS/GS bases and
+/// FPU state reset (`sched::exec_current`). The call "returns" into the
+/// new program.
+///
+/// As Linux: an empty argv gets "" as argv[0] (`do_execveat_common`,
+/// since 5.18); a string longer than MAX_ARG_STRLEN, or arguments that do
+/// not fit the stack, are E2BIG; a file that is not a regular file is
+/// EACCES; an unusable program ENOEXEC and an unusable interpreter
+/// ELIBBAD. Mode bits grant nothing (SR-6), so no execute bit is checked.
+fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysResult {
+    let path = user_path(path)?;
+    let mut budget = crate::exec::ARG_LIMIT;
+    let mut args = user_strings(argv, &mut budget)?;
+    let env = user_strings(envp, &mut budget)?;
+    if args.is_empty() {
+        args.push(Vec::new());
+    }
+    let (root, cwd, compartment) = {
+        let process = p.lock();
+        (
+            process.root,
+            process.cwd,
+            process.member.compartment().clone(),
+        )
+    };
+    let file = fs::with(|fs| {
+        let ino = fs.lookup(root, cwd, &path)?;
+        if fs.kind(ino)? != Kind::File {
+            return Err(Errno::EACCES);
+        }
+        fs.contents(ino)
+    })?;
+    let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+    let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    let loaded = crate::exec::load_in(root, &file, &path, &args, &env).map_err(|e| e.errno())?;
+    loaded
+        .space
+        .attach_budget(compartment.memory().clone())
+        .map_err(|_| Errno::ENOMEM)?;
+
+    // No failure past this point: the old program is gone. Its other
+    // threads end (Linux's de_thread); they leave as they exit.
+    process::end_other_threads(p);
+    let (old_space, closed) = {
+        let mut process = p.lock();
+        let old = process.space.replace(loaded.space.clone());
+        process.brk_start = loaded.brk_start;
+        process.brk = loaded.brk_start;
+        if let Some(t) = process.threads.get_mut(&sched::current().0) {
+            t.clear_child_tid = 0;
+        }
+        process.signals.reset_for_exec();
+        (old, process.handles.take_close_on_exec())
+    };
+    // Closed outside the process lock, as close(2) does.
+    drop(closed);
+    // The thread switches to the new space here; only then may the old
+    // one (still the CPU's until now) be dropped.
+    let switched = sched::exec_current(loaded.space, loaded.entry, loaded.rsp);
+    drop(old_space);
+    if switched.is_err() {
+        // Past the point of no return there is nothing to return to: as
+        // Linux's bprm_execve (force_fatal_sig(SIGSEGV), `fs/exec.c`), the
+        // process ends as if by SIGSEGV. Asked, not done here: the return
+        // path ends the thread after this call's references are dropped.
+        p.lock().killed_by.get_or_insert(11);
+        sched::request_exit(sched::current(), 128 + 11);
+    }
+    Ok(0)
+}
+
+/// fcntl(2), the descriptor flags only (more commands as the trace needs
+/// them). As Linux's do_fcntl (`fs/fcntl.c` at v6.12): F_GETFD returns
+/// FD_CLOEXEC if set; F_SETFD sets it from `arg & FD_CLOEXEC`; any other
+/// command is EINVAL. musl's open() calls F_SETFD after O_CLOEXEC
+/// (`src/fcntl/open.c`). No rights needed: the flag belongs to the
+/// caller's own handle table.
+fn fcntl(p: &Arc<IrqMutex<Process>>, fd: i32, cmd: u32, arg: u64) -> SysResult {
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
+    const FD_CLOEXEC: u64 = 1;
+    let mut process = p.lock();
+    match cmd {
+        F_GETFD => Ok(if process.handles.close_on_exec(fd)? {
+            FD_CLOEXEC
+        } else {
+            0
+        }),
+        F_SETFD => {
+            // `argi = (int)arg` in Linux: only the low 32 bits count.
+            process
+                .handles
+                .set_close_on_exec(fd, (arg as u32 as u64) & FD_CLOEXEC != 0)?;
+            Ok(0)
+        }
+        _ => {
+            // Still checks the descriptor first, as Linux's fdget does.
+            process.handles.rights(fd)?;
+            Err(Errno::EINVAL)
+        }
+    }
+}
+
+/// pread64(2): reads at `offset` without moving the file position
+/// ("The file offset is not changed", pread(2)). As Linux's ksys_pread64
+/// (`fs/read_write.c` at v6.12): a negative offset is EINVAL, a missing
+/// descriptor EBADF, and a file opened non-seekable ESPIPE. Of Keel's
+/// files only the console is: tty_open calls nonseekable_open
+/// (`drivers/tty/tty_io.c`), while /dev/null, /dev/zero and /dev/urandom
+/// keep FMODE_PREAD.
+fn pread64(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64, offset: u64) -> SysResult {
+    if (offset as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    read_at(p, fd, buf, count, Some(offset))
+}
+
+/// read(2) from the file position, or pread64(2) from `at`.
+fn read_at(
+    p: &Arc<IrqMutex<Process>>,
+    fd: i32,
+    buf: u64,
+    count: u64,
+    at: Option<u64>,
+) -> SysResult {
     let file = file(p, fd, Rights::READ)?;
+    if at.is_some() && file.lock().kind == Kind::Device(Device::Console) {
+        return Err(Errno::ESPIPE);
+    }
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
     let mut done = 0usize;
@@ -327,8 +602,14 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
         let n = match kind {
             Kind::File => {
                 let mut f = file.lock();
-                let n = fs::with(|fs| fs.read(f.node, f.offset, &mut chunk[..want]))?;
-                f.offset += n as u64;
+                let from = match at {
+                    Some(at) => at.saturating_add(done as u64),
+                    None => f.offset,
+                };
+                let n = fs::with(|fs| fs.read(f.node, from, &mut chunk[..want]))?;
+                if at.is_none() {
+                    f.offset += n as u64;
+                }
                 n
             }
             Kind::Directory => return Err(Errno::EISDIR),
@@ -361,7 +642,19 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
 }
 
 /// Writes `count` bytes from user memory at `buf` to an open file.
-fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
+/// The tmpfs quota of the process's compartment, if it has one (P3-S4).
+fn quota_of(p: &Arc<IrqMutex<Process>>) -> Option<Arc<keel_core::compartment::Quota>> {
+    p.lock().member.compartment().tmpfs().cloned()
+}
+
+/// Writes user memory to an open file. File growth is charged to `quota`
+/// (the writer's compartment), as `vfs::Fs::write_as` decides.
+fn write_to(
+    file: &Arc<IrqMutex<OpenFile>>,
+    buf: u64,
+    count: u64,
+    quota: Option<&Arc<keel_core::compartment::Quota>>,
+) -> SysResult {
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
     let mut done = 0usize;
@@ -393,7 +686,7 @@ fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
                     let (node, append, offset) = (f.node, f.append, f.offset);
                     let result = fs::with(|fs| {
                         let at = if append { fs.stat(node)?.size } else { offset };
-                        let n = fs.write(node, at, &chunk[..want])?;
+                        let n = fs.write_as(node, at, &chunk[..want], quota)?;
                         Ok((n, at + n as u64))
                     });
                     match result {
@@ -420,11 +713,12 @@ fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
 
 fn write(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult {
     let file = file(p, fd, Rights::WRITE)?;
-    write_to(&file, buf, count)
+    write_to(&file, buf, count, quota_of(p).as_ref())
 }
 
 fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResult {
     let file = file(p, fd, Rights::WRITE)?;
+    let quota = quota_of(p);
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);
     }
@@ -453,7 +747,7 @@ fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResul
     let mut done = 0u64;
     for (base, len) in vectors {
         let len = len.min(MAX_RW_COUNT - done);
-        match write_to(&file, base, len) {
+        match write_to(&file, base, len, quota.as_ref()) {
             Ok(n) => {
                 done += n;
                 if n < len {
@@ -516,6 +810,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
     };
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);
+    let quota = quota_of(p);
     let node = fs::with(|fs| {
         let node = match fs.lookup(root, base, &path) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(Errno::EEXIST),
@@ -523,7 +818,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
             Err(Errno::ENOENT) if flags & O_CREAT != 0 => {
                 let (dir, name) = fs.lookup_parent(root, base, &path)?;
                 // umask 022 until umask(2) exists.
-                fs.create_file(dir, name, (mode as u32) & 0o7777 & !0o022)?
+                fs.create_file_as(dir, name, (mode as u32) & 0o7777 & !0o022, quota.as_ref())?
             }
             Err(error) => return Err(error),
         };
@@ -535,7 +830,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
             return Err(Errno::ENOTDIR);
         }
         if kind == Kind::File && write && flags & O_TRUNC != 0 {
-            fs.set_len(node, 0)?;
+            fs.set_len_as(node, 0, quota.as_ref())?;
         }
         Ok((node, kind))
     })?;
@@ -595,16 +890,51 @@ fn mmap(
         // Shared mappings arrive with fork and file mappings (Phase 3).
         return Err(Errno::EINVAL);
     }
+    // A private file mapping (P3-T7). The handle must allow reading, and
+    // mapping executable if PROT_EXEC is asked for; whether it allows
+    // MAP_EXEC is recorded, so mprotect cannot add PROT_EXEC later
+    // without it (EACCES, as mprotect(2) for a file that may not be
+    // executed). Regular files only: /dev/zero maps as anonymous memory,
+    // as on Linux, and anything else is ENODEV ("The underlying filesystem
+    // of the specified file does not support memory mapping", mmap(2)).
+    //
+    // Errors as mmap(2): no handle EBADF; a handle not open for reading
+    // EACCES ("a file mapping was requested, but fd is not open for
+    // reading"); PROT_EXEC without MAP_EXEC EPERM (as for "a filesystem
+    // that was mounted no-exec").
+    let mut backing = None;
     if flags & MAP_ANONYMOUS == 0 {
-        // File mappings arrive with P3-T7; check the handle first so a bad
-        // descriptor still reports EBADF, then refuse.
-        let needs = if prot.exec {
-            Rights::READ | Rights::MAP_EXEC
-        } else {
-            Rights::READ
+        let open = file(p, fd, Rights::NONE)?;
+        let (may_read, may_exec) = {
+            let process = p.lock();
+            (
+                process.handles.check(fd, Rights::READ).is_ok(),
+                process.handles.check(fd, Rights::MAP_EXEC).is_ok(),
+            )
         };
-        file(p, fd, needs)?;
-        return Err(Errno::ENODEV);
+        if !may_read || (prot.exec && !may_exec) {
+            RIGHTS_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return Err(if may_read {
+                Errno::EPERM
+            } else {
+                Errno::EACCES
+            });
+        }
+        let (kind, node) = {
+            let f = open.lock();
+            (f.kind, f.node)
+        };
+        match kind {
+            Kind::File => {
+                backing = Some(Backing {
+                    object: u64::from(node),
+                    offset,
+                    may_exec,
+                });
+            }
+            Kind::Device(Device::Zero) => {}
+            _ => return Err(Errno::ENODEV),
+        }
     }
     let placement = if flags & MAP_FIXED_NOREPLACE != 0 {
         Placement::FixedNoReplace(address)
@@ -615,8 +945,28 @@ fn mmap(
             hint: address & !(PAGE - 1),
         }
     };
-    let space = p.lock().space.clone();
-    space.map(placement, length, prot).map_err(vm_error)
+    let space = p.lock().space()?;
+    match backing {
+        Some(backing) => space.map_file(placement, length, prot, backing),
+        None => space.map(placement, length, prot),
+    }
+    .map_err(vm_error)
+}
+
+/// The `FileReader` for private file mappings: one page of the file at
+/// `object` (an inode) from `offset`. `None` at or past the end of the
+/// file (SIGBUS on Linux). Runs in the page-fault path, so it allocates
+/// nothing; it takes only the filesystem lock.
+fn read_mapped_page(object: u64, offset: u64, page: &mut [u8; 4096]) -> Option<usize> {
+    let ino = keel_core::vfs::Ino::try_from(object).ok()?;
+    fs::with(|fs| {
+        if offset >= fs.stat(ino)?.size {
+            return Ok(None);
+        }
+        fs.read(ino, offset, page).map(Some)
+    })
+    .ok()
+    .flatten()
 }
 
 fn munmap(p: &Arc<IrqMutex<Process>>, address: u64, length: u64) -> SysResult {
@@ -624,7 +974,7 @@ fn munmap(p: &Arc<IrqMutex<Process>>, address: u64, length: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let length = page_length(length).map_err(|_| Errno::EINVAL)?;
-    let space = p.lock().space.clone();
+    let space = p.lock().space()?;
     space.unmap(address, length).map_err(vm_error).map(|_| 0)
 }
 
@@ -637,7 +987,7 @@ fn mprotect(p: &Arc<IrqMutex<Process>>, address: u64, length: u64, protection: u
         return Ok(0);
     }
     let length = page_length(length)?;
-    let space = p.lock().space.clone();
+    let space = p.lock().space()?;
     space
         .protect(address, length, prot)
         .map_err(vm_error)
@@ -649,7 +999,10 @@ fn mprotect(p: &Arc<IrqMutex<Process>>, address: u64, length: u64, protection: u
 fn brk(p: &Arc<IrqMutex<Process>>, requested: u64) -> u64 {
     let (space, start, current) = {
         let process = p.lock();
-        (process.space.clone(), process.brk_start, process.brk)
+        (process.space(), process.brk_start, process.brk)
+    };
+    let Ok(space) = space else {
+        return current;
     };
     if requested < start || requested >= USER_END {
         return current;
@@ -712,11 +1065,58 @@ fn arch_prctl(code: u64, address: u64) -> SysResult {
     Ok(0)
 }
 
+/// set_tid_address(2): the calling thread's clear_child_tid; returns its
+/// TID (Linux's task_pid_vnr, `kernel/fork.c`).
 fn set_tid_address(p: &Arc<IrqMutex<Process>>, address: u64) -> u64 {
-    let mut process = p.lock();
-    process.clear_child_tid = address;
-    // One thread per process: its TID is the PID.
-    u64::from(process.pid)
+    process::with_current_thread(p, |t| {
+        t.clear_child_tid = address;
+        u64::from(t.tid)
+    })
+    .unwrap_or(0)
+}
+
+/// clone(2), x86-64 argument order (flags, stack, parent_tid, child_tid,
+/// tls: `kernel/fork.c`, no CLONE_BACKWARDS on x86-64). As copy_process:
+/// CLONE_THREAD needs CLONE_SIGHAND and CLONE_SIGHAND needs CLONE_VM
+/// (EINVAL). Without CLONE_VM it is fork (the exit signal in the low byte
+/// is ignored: nothing is delivered yet), with the child on `stack` if
+/// given. With CLONE_VM: a thread, if the flags are within the set
+/// `process::clone_thread` supports; anything else (vfork's CLONE_VFORK,
+/// CLONE_VM without CLONE_THREAD, namespaces, ...) is EINVAL for now.
+fn clone(
+    p: &Arc<IrqMutex<Process>>,
+    frame: &keel_hal::arch::x86_64::idt::TrapFrame,
+    a: [u64; 6],
+) -> SysResult {
+    use process::clone_flags::*;
+    let (flags, stack, parent_tid, child_tid, tls) = (a[0] & 0xffff_ffff, a[1], a[2], a[3], a[4]);
+    let flags = flags & !CSIGNAL;
+    if (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
+        || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_VM == 0 {
+        if flags & !CLONE_DETACHED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut registers = *frame;
+        if stack != 0 {
+            registers.rsp = stack;
+        }
+        return process::fork(p, &registers);
+    }
+    const THREAD: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    const OPTIONAL: u64 = CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID
+        | CLONE_DETACHED;
+    if flags & THREAD != THREAD || flags & !(THREAD | OPTIONAL) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    process::clone_thread(p, frame, flags, stack, parent_tid, child_tid, tls)
 }
 
 fn clock_gettime(clock: u64, buf: u64) -> SysResult {

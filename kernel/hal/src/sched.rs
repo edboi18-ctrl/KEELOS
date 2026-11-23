@@ -54,12 +54,27 @@ struct Thread {
     fpu: FpuState,
     /// The user address space, for threads that run user code.
     space: Option<Arc<AddressSpace>>,
-    /// First user-mode RIP, RSP and RDI, consumed by `user_thread_start`.
-    user_entry: Option<(u64, u64, u64)>,
+    /// How the thread first enters user mode, consumed by
+    /// `user_thread_start`.
+    user_entry: Option<UserEntry>,
     /// User FS and GS base addresses (arch_prctl), loaded into the MSRs
     /// whenever this thread is switched in. The kernel never uses FS or GS
     /// itself (ADR 0005), so these need no saving on kernel entry.
     user_bases: [u64; 2],
+    /// Set by `exec_current` during a system call: the new program's RIP
+    /// and RSP, which the system-call return path puts in the frame.
+    pending_exec: Option<(u64, u64)>,
+    /// Set by `request_exit`: the thread ends with this status the next
+    /// time it would return to user mode, and stops blocking meanwhile.
+    exit_request: Option<i64>,
+}
+
+/// A user thread's first entry to user mode.
+enum UserEntry {
+    /// A new program: RIP, RSP and RDI, every other register 0.
+    Start(u64, u64, u64),
+    /// A copy of another thread's user registers (fork).
+    Frame(Box<crate::arch::x86_64::idt::TrapFrame>),
 }
 
 /// How a user thread's last exception looked, for tests and diagnostics.
@@ -75,15 +90,24 @@ pub struct UserFault {
     pub handler_rflags: u64,
 }
 
-/// Exit status and last user fault of threads that have exited.
-static EXITED: IrqMutex<BTreeMap<u64, (i64, Option<UserFault>)>> = IrqMutex::new(BTreeMap::new());
+/// Exit status and last user fault of threads that have exited, and the
+/// order they exited in (the oldest is dropped first).
+static EXITED: IrqMutex<Exited> = IrqMutex::new(Exited {
+    by_id: BTreeMap::new(),
+    order: VecDeque::new(),
+});
+
+struct Exited {
+    by_id: BTreeMap<u64, (i64, Option<UserFault>)>,
+    order: VecDeque<u64>,
+}
 /// How many exit statuses `EXITED` keeps. Callers read a status right
 /// after the thread ends (`join`), long before 1024 more threads exit.
 const EXITED_LIMIT: usize = 1024;
 
 /// Number of exit statuses held (for tests).
 pub fn exited_count() -> usize {
-    EXITED.lock().len()
+    EXITED.lock().by_id.len()
 }
 static FAULTS: IrqMutex<BTreeMap<u64, UserFault>> = IrqMutex::new(BTreeMap::new());
 
@@ -131,6 +155,8 @@ pub fn init() -> Result<(), SchedError> {
         space: None,
         user_entry: None,
         user_bases: [0; 2],
+        pending_exec: None,
+        exit_request: None,
     });
     let mut sched = Scheduler {
         threads: BTreeMap::new(),
@@ -215,6 +241,8 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         space: None,
         user_entry: None,
         user_bases: [0; 2],
+        pending_exec: None,
+        exit_request: None,
     }))
 }
 
@@ -236,7 +264,7 @@ pub fn spawn_user(
     };
     let mut thread = new_thread(name, user_thread_start, id)?;
     thread.space = Some(space);
-    thread.user_entry = Some((rip, rsp, argument));
+    thread.user_entry = Some(UserEntry::Start(rip, rsp, argument));
     let mut guard = SCHED.lock();
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
@@ -255,9 +283,57 @@ fn user_thread_start() {
         })
     };
     match entry {
-        Some((rip, rsp, argument)) => entry::enter_user(rip, rsp, argument),
+        Some(UserEntry::Start(rip, rsp, argument)) => entry::enter_user(rip, rsp, argument),
+        Some(UserEntry::Frame(frame)) => entry::enter_user_frame(*frame),
         None => exit_with(-1),
     }
+}
+
+/// Starts a thread that continues the running user thread (fork): in
+/// `space`, with `frame` as its user registers, and the running thread's
+/// FS/GS bases and FPU/SSE/AVX state. The FPU registers hold the running
+/// thread's own state during a system call (the kernel uses no FPU or SSE
+/// registers), so they are saved into the new thread's area here.
+///
+/// `fs_base` replaces the copied FS base (clone with CLONE_SETTLS); the
+/// caller checks it is a user address.
+pub fn spawn_user_copy(
+    name: &'static str,
+    space: Arc<AddressSpace>,
+    frame: crate::arch::x86_64::idt::TrapFrame,
+    fs_base: Option<u64>,
+) -> Result<ThreadId, SchedError> {
+    if fs_base.is_some_and(|base| base >= keel_core::vm::USER_END) {
+        return Err(SchedError::NotInitialised);
+    }
+    let bases = {
+        let guard = SCHED.lock();
+        let sched = guard.as_ref().ok_or(SchedError::NotInitialised)?;
+        sched
+            .threads
+            .get(&sched.current)
+            .map_or([0; 2], |t| t.user_bases)
+    };
+    let id = {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
+        let id = sched.next_id;
+        sched.next_id += 1;
+        id
+    };
+    let mut thread = new_thread(name, user_thread_start, id)?;
+    thread.fpu.save();
+    thread.space = Some(space);
+    thread.user_bases = bases;
+    if let Some(base) = fs_base {
+        thread.user_bases[SegmentBase::Fs as usize] = base;
+    }
+    thread.user_entry = Some(UserEntry::Frame(Box::new(frame)));
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
+    sched.threads.insert(id, thread);
+    sched.ready.push_back(id);
+    Ok(ThreadId(id))
 }
 
 /// Records the user fault that is about to end the current thread.
@@ -268,7 +344,7 @@ pub fn record_user_fault(fault: UserFault) {
 
 /// Exit status of an exited thread, with its last user fault, if known.
 pub fn exit_status(id: ThreadId) -> Option<(i64, Option<UserFault>)> {
-    EXITED.lock().get(&id.0).copied()
+    EXITED.lock().by_id.get(&id.0).copied()
 }
 
 /// Starts a new kernel thread running `entry`. It is scheduled after the
@@ -375,6 +451,19 @@ pub fn set_ibpb_on_switch(enabled: bool) {
     IBPB_ON_SWITCH.store(enabled, Ordering::Relaxed);
 }
 
+/// Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
+/// different user address space is about to run, so branch predictions
+/// trained by one program cannot steer another. Called on every context
+/// switch and when execve gives a thread a new program.
+fn barrier_if_new_space(space: &AddressSpace) {
+    if note_user_space(space) && IBPB_ON_SWITCH.load(Ordering::Relaxed) {
+        // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
+        // enabled only after `set_ibpb_on_switch` checked CPUID for it.
+        // Writing it has no effect on memory.
+        unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
+    }
+}
+
 /// Makes `space` the running thread's address space and switches to it;
 /// returns the previous one. The scheduler restores a thread's recorded
 /// space whenever it runs again, so a temporary switch made this way
@@ -408,10 +497,14 @@ pub(crate) fn swap_space(space: Option<Arc<AddressSpace>>) -> Option<Arc<Address
 
 /// Called with the thread's ID whenever a thread exits, before it stops
 /// running (process teardown in `linux-abi`).
-static EXIT_HOOK: IrqMutex<Option<fn(ThreadId)>> = IrqMutex::new(None);
+static EXIT_HOOK: IrqMutex<Option<ExitHook>> = IrqMutex::new(None);
+
+/// The exit hook: the thread, its exit status, and the user fault that
+/// ended it, if one did.
+pub type ExitHook = fn(ThreadId, i64, Option<UserFault>);
 
 /// Registers the exit hook. Call once at boot.
-pub fn set_exit_hook(hook: fn(ThreadId)) {
+pub fn set_exit_hook(hook: ExitHook) {
     *EXIT_HOOK.lock() = Some(hook);
 }
 
@@ -471,6 +564,92 @@ pub fn user_base(which: SegmentBase) -> u64 {
         .map_or(0, |t| t.user_bases[which as usize])
 }
 
+/// Replaces the running thread's program (execve): from now on it runs in
+/// `space`, and when the current system call returns it enters user mode
+/// at `rip` with stack pointer `rsp` and every other register cleared.
+/// The user FS and GS bases are reset to 0, as Linux's elf_common_init
+/// (ELF_PLAT_INIT, `arch/x86/include/asm/elf.h` at v6.12) does, and the
+/// FPU/SSE/AVX state to its initial values (x87 control word 037FH, MXCSR
+/// 1F80H), as flush_thread's fpu_flush_thread (`arch/x86/kernel/process.c`). The old
+/// address space is dropped here, after the switch, unless something else
+/// still holds it. Only for a thread that runs user code.
+pub fn exec_current(space: Arc<AddressSpace>, rip: u64, rsp: u64) -> Result<(), BaseError> {
+    let fresh = FpuState::new().ok_or(BaseError::NotUserThread)?;
+    if SCHED
+        .lock()
+        .as_ref()
+        .and_then(|s| s.threads.get(&s.current))
+        .is_none_or(|t| t.space.is_none())
+    {
+        return Err(BaseError::NotUserThread);
+    }
+    barrier_if_new_space(&space);
+    let old = swap_space(Some(space));
+    set_user_base(SegmentBase::Fs, 0)?;
+    set_user_base(SegmentBase::Gs, 0)?;
+    {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().ok_or(BaseError::NotUserThread)?;
+        let current = sched.current;
+        let thread = sched
+            .threads
+            .get_mut(&current)
+            .ok_or(BaseError::NotUserThread)?;
+        // The CPU's registers belong to this thread now (it is running):
+        // load the initial state, and keep the same values as its saved
+        // area for the next switch.
+        fresh.restore();
+        thread.fpu = fresh;
+        thread.pending_exec = Some((rip, rsp));
+    }
+    drop(old);
+    Ok(())
+}
+
+/// Asks thread `id` to end with `status` (exit_group, kill). It ends the
+/// next time it would return to user mode: at once if it is running user
+/// code (the next timer interrupt), or when its current system call
+/// returns. A thread blocked or sleeping is made ready, and
+/// `WaitQueue::wait_until` returns early for it, so a blocked system call
+/// ends too. The first request wins. Returns whether the thread exists
+/// and has not exited.
+pub fn request_exit(id: ThreadId, status: i64) -> bool {
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else {
+        return false;
+    };
+    let Some(thread) = sched.threads.get_mut(&id.0) else {
+        return false;
+    };
+    if thread.state == State::Exited {
+        return false;
+    }
+    thread.exit_request.get_or_insert(status);
+    if matches!(thread.state, State::Blocked | State::Sleeping { .. }) {
+        thread.state = State::Ready;
+        sched.ready.push_back(id.0);
+    }
+    true
+}
+
+/// The status the running thread was asked to end with, if any.
+pub fn exit_requested() -> Option<i64> {
+    SCHED
+        .lock()
+        .as_ref()
+        .and_then(|s| s.threads.get(&s.current))
+        .and_then(|t| t.exit_request)
+}
+
+/// The entry point and stack `exec_current` left for the running thread,
+/// taken (so they are used once).
+pub(crate) fn take_pending_exec() -> Option<(u64, u64)> {
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let current = sched.current;
+    sched.threads.get_mut(&current)?.pending_exec.take()
+}
+
 /// Ends the running thread.
 pub fn exit() -> ! {
     exit_with(0)
@@ -479,19 +658,28 @@ pub fn exit() -> ! {
 /// Ends the running thread with an exit status.
 pub fn exit_with(status: i64) -> ! {
     let id = current().0;
+    let fault = FAULTS.lock().remove(&id);
     let hook = *EXIT_HOOK.lock();
     if let Some(hook) = hook {
-        hook(ThreadId(id));
+        hook(ThreadId(id), status, fault);
     }
-    let fault = FAULTS.lock().remove(&id);
     {
         // Keep the most recent statuses only (audit 2, A7.2): one entry per
-        // exited thread for ever would grow without bound. Thread ids only
-        // increase, so the first entry is the oldest.
+        // exited thread for ever would grow without bound. The oldest to
+        // exit goes first. Not the smallest id: a parent's id is smaller
+        // than its children's, and after 1024 children had exited, the
+        // parent's own status was dropped as soon as it was stored (found
+        // by `exec.hostile_executables` with 3000 runs).
         let mut exited = EXITED.lock();
-        exited.insert(id, (status, fault));
-        while exited.len() > EXITED_LIMIT {
-            exited.pop_first();
+        exited.by_id.insert(id, (status, fault));
+        exited.order.push_back(id);
+        while exited.by_id.len() > EXITED_LIMIT {
+            match exited.order.pop_front() {
+                Some(oldest) => {
+                    exited.by_id.remove(&oldest);
+                }
+                None => break,
+            }
         }
     }
     schedule(State::Exited);
@@ -608,17 +796,8 @@ fn schedule(next_state: State) {
     let stack_top = next.stack.as_ref().map_or(0, |s| s.top);
     entry::set_current(kernel_cr3, user_cr3, stack_top);
     crate::vm::set_current(next.space.clone());
-    // Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
-    // different user address space is about to run, so branch predictions
-    // trained by one process cannot steer another.
-    if let Some(space) = next.space.as_ref()
-        && note_user_space(space)
-        && IBPB_ON_SWITCH.load(Ordering::Relaxed)
-    {
-        // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
-        // enabled only after `set_ibpb_on_switch` checked CPUID for it.
-        // Writing it has no effect on memory.
-        unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
+    if let Some(space) = next.space.as_ref() {
+        barrier_if_new_space(space);
     }
     if next.space.is_some() {
         // SAFETY: both values were checked to be user (hence canonical)
@@ -711,11 +890,17 @@ impl WaitQueue {
     }
 
     /// Blocks until `condition` returns true.
-    pub fn wait_until(&self, mut condition: impl FnMut() -> bool) {
+    /// Blocks until `condition` returns true, and returns true; or returns
+    /// false early if the running thread has been asked to exit
+    /// (`request_exit`), so its system call can end.
+    pub fn wait_until(&self, mut condition: impl FnMut() -> bool) -> bool {
         loop {
             let mut waiters = self.waiters.lock();
             if condition() {
-                return;
+                return true;
+            }
+            if exit_requested().is_some() {
+                return false;
             }
             let me = SCHED.lock().as_ref().map_or(0, |s| s.current);
             waiters.push_back(me);

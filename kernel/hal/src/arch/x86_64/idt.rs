@@ -347,6 +347,13 @@ pub(crate) extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
     } else {
         dispatch_kernel(frame);
     }
+    // A thread asked to end (exit_group, kill) ends here, instead of
+    // returning to user mode.
+    if frame.cs & 3 == 3
+        && let Some(status) = crate::sched::exit_requested()
+    {
+        crate::sched::exit_with(status);
+    }
     if frame.cs & 3 == 3 && !super::entry::prepare_user_return(frame) {
         panic!("returning to user mode without a user address space");
     }

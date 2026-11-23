@@ -1,12 +1,22 @@
-//! Program loading (P1-T11): builds a new address space from a static ELF
-//! executable and its initial stack. No `unsafe`: it uses only the
-//! checked interfaces of `keel_hal::vm` and the parsers in `keel_core`.
+//! Program loading (P1-T11, P3-T2): builds a new address space from an ELF
+//! executable, its interpreter (`PT_INTERP`, the dynamic linker) if it
+//! names one, and the initial stack. No `unsafe`: it uses only the checked
+//! interfaces of `keel_hal::vm` and the parsers in `keel_core`.
+//!
+//! An interpreter is loaded as Linux's `load_elf_interp` does
+//! (`fs/binfmt_elf.c` at v6.12): it is a separate position-independent
+//! image, placed by the mmap allocator (below the randomized mmap base),
+//! and the program starts at the interpreter's entry point. AT_BASE is the
+//! interpreter's load address and AT_ENTRY the program's entry, so the
+//! dynamic linker can find and run the program.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use keel_core::elf::{self, ElfError, Kind};
+use keel_core::elf::{self, ElfError, Image, Kind};
+use keel_core::errno::Errno;
 use keel_core::exec::{self as stack, ExecError};
+use keel_core::vfs::{Ino, ROOT};
 use keel_core::vm::{PAGE, Placement, Prot, USER_END};
 use keel_hal::random::{self, Quality};
 use keel_hal::vm::{AddressSpace, AsError, copy_to_user, with_address_space};
@@ -53,6 +63,28 @@ pub enum LoadError {
     Memory(AsError),
     /// Copying into the new address space failed.
     Copy,
+    /// The interpreter could not be read (not found, not a regular file).
+    Interpreter(Errno),
+    /// The interpreter is not a usable ELF image (ELIBBAD, as Linux).
+    BadInterpreter(ElfError),
+}
+
+impl LoadError {
+    /// The errno execve(2) reports, as Linux's load_elf_binary
+    /// (`fs/binfmt_elf.c` at v6.12): ENOEXEC for a program that is not a
+    /// usable ELF executable, ELIBBAD for such an interpreter ("Accessing
+    /// a corrupted shared library"), the lookup's error for a missing one,
+    /// E2BIG for arguments that do not fit, ENOMEM otherwise.
+    pub fn errno(self) -> Errno {
+        match self {
+            LoadError::Elf(_) => Errno::ENOEXEC,
+            LoadError::BadInterpreter(_) => Errno::ELIBBAD,
+            LoadError::Interpreter(errno) => errno,
+            LoadError::Stack(ExecError::TooLarge) => Errno::E2BIG,
+            LoadError::Stack(_) => Errno::EINVAL,
+            LoadError::Memory(_) | LoadError::Copy => Errno::ENOMEM,
+        }
+    }
 }
 
 impl From<ElfError> for LoadError {
@@ -85,11 +117,69 @@ pub struct Loaded {
     /// The randomized stack top and mmap base chosen for this program.
     pub stack_top: u64,
     pub mmap_top: u64,
+    /// Where the interpreter was loaded (AT_BASE), if there is one.
+    pub interpreter_base: Option<u64>,
 }
 
-/// Loads `file` into a new address space. On error nothing is left
-/// behind: the half-built address space is dropped with all its frames.
+/// `AT_CLKTCK`: Linux reports CLOCKS_PER_SEC, which is USER_HZ, 100
+/// (`include/asm-generic/param.h`).
+const CLOCKS_PER_SEC: u64 = 100;
+
+/// Copies `image`'s segments from `file` into `space`, moved by `bias`,
+/// each with its own protection.
+fn map_image(
+    space: &Arc<AddressSpace>,
+    image: &Image,
+    file: &[u8],
+    bias: u64,
+) -> Result<(), LoadError> {
+    for segment in &image.segments {
+        let start = segment.page_start() + bias;
+        let length = segment.page_end() - segment.page_start();
+        space.map(Placement::Fixed(start), length, Prot::READ_WRITE)?;
+        // Bounds were checked by the parser: offset + size <= file length.
+        let from = segment.file_offset as usize;
+        let bytes = &file[from..from + segment.file_size as usize];
+        // The rest of each page (before vaddr, and from file_size to
+        // mem_size: .bss) stays zero, because frames are zeroed when they
+        // are allocated (SR-18).
+        with_address_space(space, || copy_to_user(segment.vaddr + bias, bytes))
+            .map_err(|_| LoadError::Copy)?;
+        space.protect(start, length, segment.prot)?;
+    }
+    Ok(())
+}
+
+/// Reads the interpreter at `path`, resolved from `root` (the process's
+/// root: a compartment's program finds its dynamic linker in its own
+/// tree). Only a regular file: anything else is EACCES, as execve(2) for
+/// "the file or a script interpreter is not a regular file".
+fn read_interpreter(root: Ino, path: &[u8]) -> Result<Arc<Vec<u8>>, LoadError> {
+    crate::fs::with(|fs| {
+        let ino = fs.lookup(root, root, path)?;
+        if fs.kind(ino)? != keel_core::vfs::Kind::File {
+            return Err(Errno::EACCES);
+        }
+        fs.contents(ino)
+    })
+    .map_err(LoadError::Interpreter)
+}
+
+/// Loads `file` into a new address space, finding any interpreter from the
+/// filesystem root. On error nothing is left behind: the half-built
+/// address space is dropped with all its frames.
 pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<Loaded, LoadError> {
+    load_in(ROOT, file, path, argv, envp)
+}
+
+/// [`load`], with the interpreter looked up beneath `root`.
+pub fn load_in(
+    root: Ino,
+    file: &[u8],
+    path: &[u8],
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<Loaded, LoadError> {
     let image = elf::parse(file)?;
     let bias = match image.kind {
         Kind::Fixed => {
@@ -103,20 +193,7 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
     };
 
     let space = AddressSpace::new()?;
-    for segment in &image.segments {
-        let start = segment.page_start() + bias;
-        let length = segment.page_end() - segment.page_start();
-        space.map(Placement::Fixed(start), length, Prot::READ_WRITE)?;
-        // Bounds were checked by the parser: offset + size <= file length.
-        let from = segment.file_offset as usize;
-        let bytes = &file[from..from + segment.file_size as usize];
-        // The rest of each page (before vaddr, and from file_size to
-        // mem_size: .bss) stays zero, because frames are zeroed when they
-        // are allocated (SR-18).
-        with_address_space(&space, || copy_to_user(segment.vaddr + bias, bytes))
-            .map_err(|_| LoadError::Copy)?;
-        space.protect(start, length, segment.prot)?;
-    }
+    map_image(&space, &image, file, bias)?;
 
     let stack_top = STACK_TOP - random::below(STACK_RANDOM_PAGES) * PAGE;
     space.map(
@@ -127,21 +204,67 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
     let lowest_stack = STACK_TOP - STACK_RANDOM_PAGES * PAGE - STACK_SIZE;
     let mmap_top = lowest_stack - MMAP_GAP - random::below(MMAP_RANDOM_PAGES) * PAGE;
     space.set_mmap_top(mmap_top)?;
+
+    // The interpreter: a position-independent image with no interpreter of
+    // its own (stricter than Linux, which also takes ET_EXEC and ignores a
+    // PT_INTERP in it). Its whole span is reserved first, PROT_NONE, where
+    // the mmap allocator puts it; the segments then replace their parts,
+    // and the gaps between them stay reserved and inaccessible.
+    let interpreter = match image.interpreter(file) {
+        None => None,
+        Some(interp_path) => {
+            let interp_file = read_interpreter(root, interp_path)?;
+            let interp = elf::parse(&interp_file).map_err(LoadError::BadInterpreter)?;
+            if interp.interpreter.is_some() {
+                return Err(LoadError::BadInterpreter(ElfError::Interpreter));
+            }
+            if interp.kind != Kind::Relocatable {
+                return Err(LoadError::BadInterpreter(ElfError::BadInterpreter));
+            }
+            let (first, last) = interp.span();
+            let base = space.map(Placement::Anywhere { hint: 0 }, last - first, Prot::NONE)?;
+            let interp_bias = interp
+                .bias_for_base(base)
+                .map_err(LoadError::BadInterpreter)?;
+            map_image(&space, &interp, &interp_file, interp_bias)?;
+            Some((interp.entry + interp_bias, interp_bias))
+        }
+    };
+    let entry = match interpreter {
+        Some((interp_entry, _)) => interp_entry,
+        None => image.entry + bias,
+    };
+
     let mut random_bytes = [0u8; 16];
     let quality = random::fill(&mut random_bytes);
+    // The entries Linux's create_elf_tables writes (`fs/binfmt_elf.c`),
+    // in its order, except AT_SYSINFO_EHDR (no vDSO), AT_MINSIGSTKSZ,
+    // AT_HWCAP2, AT_PLATFORM and the rseq entries, none of which musl
+    // reads. AT_HWCAP is ELF_HWCAP, CPUID leaf 1 EDX
+    // (`arch/x86/include/asm/elf.h`). User and group IDs are 0: Keel has
+    // no users (SR-6), so AT_SECURE is 0 too.
+    let hwcap = u64::from(keel_hal::arch::x86_64::cpu::cpuid(1, 0).3);
     let mut auxv: Vec<(u64, u64)> = Vec::new();
+    auxv.extend([
+        (stack::AT_HWCAP, hwcap),
+        (stack::AT_PAGESZ, PAGE),
+        (stack::AT_CLKTCK, CLOCKS_PER_SEC),
+    ]);
     if let Some(phdr) = image.phdr_vaddr {
         auxv.push((stack::AT_PHDR, phdr + bias));
     }
     auxv.extend([
         (stack::AT_PHENT, elf::PHDR_SIZE as u64),
         (stack::AT_PHNUM, u64::from(image.phnum)),
-        (stack::AT_PAGESZ, PAGE),
-        // No interpreter: AT_BASE is 0, as Linux reports for static
-        // executables.
-        (stack::AT_BASE, 0),
+        // The interpreter's load address; 0 without one, as Linux reports
+        // for static executables.
+        (stack::AT_BASE, interpreter.map_or(0, |(_, base)| base)),
         (stack::AT_FLAGS, 0),
         (stack::AT_ENTRY, image.entry + bias),
+        (stack::AT_UID, 0),
+        (stack::AT_EUID, 0),
+        (stack::AT_GID, 0),
+        (stack::AT_EGID, 0),
         (stack::AT_SECURE, 0),
     ]);
     let initial =
@@ -151,7 +274,8 @@ pub fn load(file: &[u8], path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<
 
     Ok(Loaded {
         space,
-        entry: image.entry + bias,
+        entry,
+        interpreter_base: interpreter.map(|(_, base)| base),
         rsp: initial.rsp,
         random: quality,
         brk_start: image.span().1 + bias + random::below(BRK_RANDOM_BYTES / PAGE) * PAGE,
