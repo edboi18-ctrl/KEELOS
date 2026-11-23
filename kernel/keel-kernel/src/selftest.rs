@@ -1915,6 +1915,85 @@ fn phase3(t: &mut Runner) {
     phase3_execve(t);
     phase3_fork(t);
     phase3_shared_frame_limit(t);
+    phase3_hostile_executables(t);
+    phase3_exit_status_order(t);
+}
+
+/// The scheduler keeps the last 1024 exit statuses. A thread whose 1100
+/// children exited before it still has its own status afterwards: the
+/// oldest exit is dropped, not the smallest thread id (the parent's).
+fn phase3_exit_status_order(t: &mut Runner) {
+    fn child() {}
+    fn parent() {
+        let mut children = alloc::vec::Vec::new();
+        for _ in 0..1100 {
+            match sched::spawn("short", child) {
+                Ok(id) => children.push(id),
+                Err(_) => sched::exit_with(1),
+            }
+            if children.len() == 64 {
+                children.drain(..).for_each(join);
+            }
+        }
+        children.into_iter().for_each(join);
+        sched::exit_with(42);
+    }
+    let status = sched::spawn("parent", parent).ok().and_then(|id| {
+        join(id);
+        sched::exit_status(id)
+    });
+    t.check(
+        "sched.exit_status_order",
+        status == Some((42, None)),
+        "a thread's exit status survives 1100 children exiting before it (the oldest status is dropped first, not the smallest thread id)",
+    );
+    if status != Some((42, None)) {
+        kprintln!("  parent status: {status:?}");
+    }
+}
+
+/// Phase 2 audit item 5: execve makes the ELF parser and loader attack
+/// surface. user/tests/badexec has 400 randomly damaged executables run
+/// by forked children, in a compartment with process, memory and tmpfs
+/// limits. The kernel must not panic, and every process slot and user
+/// frame must come back.
+fn phase3_hostile_executables(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs};
+
+    const PROGRAM: &[u8] = b"/test/badexec";
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"hostile", 0o755)
+    });
+    let limits = Limits {
+        processes: 8,
+        memory_frames: 8192,
+        tmpfs_bytes: 1 << 20,
+        tmpfs_nodes: 64,
+    };
+    let (Ok(_), Ok(c)) = (made, compartment::create(b"/comp/hostile", limits)) else {
+        t.check(
+            "exec.hostile_executables",
+            false,
+            "creating the compartment",
+        );
+        return;
+    };
+    let status = run_in(&c, PROGRAM, &[PROGRAM, b"20261123", b"400"]);
+    let ok = status == Some((0, None)) && c.processes() == 0 && c.memory().used() == 0;
+    t.check(
+        "exec.hostile_executables",
+        ok,
+        "400 randomly damaged executables, each run by a forked child in a limited compartment: refused or run, never a kernel panic; every slot and frame back (the summary line is on serial)",
+    );
+    if !ok {
+        kprintln!(
+            "  badexec: {status:?}; processes left {}, memory left {}",
+            c.processes(),
+            c.memory().used()
+        );
+    }
 }
 
 /// Phase 2 audit item 4: a frame's reference count can fill up from user

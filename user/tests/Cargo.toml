@@ -110,3 +110,8 @@ bench = false
 name = "forkprobe"
 test = false
 bench = false
+
+[[bin]]
+name = "badexec"
+test = false
+bench = false

@@ -62,8 +62,8 @@ program now chooses which file is loaded.
    - one thread per process, so the other-threads part of
      `begin_new_exec` has nothing to do yet;
    - the system-call fuzzer never calls `execve`, since a random success
-     would end its run. Hostile executables get their own test (audit
-     item 5).
+     would end its run. Hostile executables get their own test:
+     `exec.hostile_executables` (audit item 5).
 
 ## Evidence
 

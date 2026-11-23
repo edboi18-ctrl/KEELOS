@@ -225,6 +225,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/badexec",
+        binary: "badexec",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
         path: "test/nap",
         binary: "nap",
         args: &["10"],

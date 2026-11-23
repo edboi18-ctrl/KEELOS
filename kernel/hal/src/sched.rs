@@ -87,15 +87,24 @@ pub struct UserFault {
     pub handler_rflags: u64,
 }
 
-/// Exit status and last user fault of threads that have exited.
-static EXITED: IrqMutex<BTreeMap<u64, (i64, Option<UserFault>)>> = IrqMutex::new(BTreeMap::new());
+/// Exit status and last user fault of threads that have exited, and the
+/// order they exited in (the oldest is dropped first).
+static EXITED: IrqMutex<Exited> = IrqMutex::new(Exited {
+    by_id: BTreeMap::new(),
+    order: VecDeque::new(),
+});
+
+struct Exited {
+    by_id: BTreeMap<u64, (i64, Option<UserFault>)>,
+    order: VecDeque<u64>,
+}
 /// How many exit statuses `EXITED` keeps. Callers read a status right
 /// after the thread ends (`join`), long before 1024 more threads exit.
 const EXITED_LIMIT: usize = 1024;
 
 /// Number of exit statuses held (for tests).
 pub fn exited_count() -> usize {
-    EXITED.lock().len()
+    EXITED.lock().by_id.len()
 }
 static FAULTS: IrqMutex<BTreeMap<u64, UserFault>> = IrqMutex::new(BTreeMap::new());
 
@@ -320,7 +329,7 @@ pub fn record_user_fault(fault: UserFault) {
 
 /// Exit status of an exited thread, with its last user fault, if known.
 pub fn exit_status(id: ThreadId) -> Option<(i64, Option<UserFault>)> {
-    EXITED.lock().get(&id.0).copied()
+    EXITED.lock().by_id.get(&id.0).copied()
 }
 
 /// Starts a new kernel thread running `entry`. It is scheduled after the
@@ -606,12 +615,21 @@ pub fn exit_with(status: i64) -> ! {
     }
     {
         // Keep the most recent statuses only (audit 2, A7.2): one entry per
-        // exited thread for ever would grow without bound. Thread ids only
-        // increase, so the first entry is the oldest.
+        // exited thread for ever would grow without bound. The oldest to
+        // exit goes first. Not the smallest id: a parent's id is smaller
+        // than its children's, and after 1024 children had exited, the
+        // parent's own status was dropped as soon as it was stored (found
+        // by `exec.hostile_executables` with 3000 runs).
         let mut exited = EXITED.lock();
-        exited.insert(id, (status, fault));
-        while exited.len() > EXITED_LIMIT {
-            exited.pop_first();
+        exited.by_id.insert(id, (status, fault));
+        exited.order.push_back(id);
+        while exited.by_id.len() > EXITED_LIMIT {
+            match exited.order.pop_front() {
+                Some(oldest) => {
+                    exited.by_id.remove(&oldest);
+                }
+                None => break,
+            }
         }
     }
     schedule(State::Exited);
