@@ -105,3 +105,8 @@ bench = false
 name = "execprobe"
 test = false
 bench = false
+
+[[bin]]
+name = "forkprobe"
+test = false
+bench = false

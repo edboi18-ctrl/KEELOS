@@ -43,17 +43,22 @@ impl Rng {
 
 /// Linux x86-64 numbers of the calls Keel implements (docs/syscalls.md),
 /// chosen most of the time so the fuzzer gets past the ENOSYS check.
-const IMPLEMENTED: [u64; 23] = [
-    0, 1, 2, 3, 5, 7, 9, 10, 11, 12, 13, 14, 16, 17, 20, 39, 72, 131, 158, 218, 228, 257, 318,
+const IMPLEMENTED: [u64; 25] = [
+    0, 1, 2, 3, 5, 7, 9, 10, 11, 12, 13, 14, 16, 17, 20, 39, 61, 72, 110, 131, 158, 218, 228, 257,
+    318,
 ];
 const NR_POLL: u64 = 7;
 const NR_OPENAT: u64 = 257;
 /// exit and exit_group end the run early; they are made once, at the end.
 /// execve would too, if a random path ever named a program: it is never
-/// made here (hostile executables have their own test).
+/// made here (hostile executables have their own test). Nor are clone,
+/// fork and vfork: every child would go on fuzzing and forking, without
+/// limit in the system compartment, until the fuzzer runs inside a
+/// compartment with a process limit (P3-S8); fork has its own tests.
 const NR_EXIT: u64 = 60;
 const NR_EXIT_GROUP: u64 = 231;
 const NR_EXECVE: u64 = 59;
+const NEVER: [u64; 6] = [56, 57, 58, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP];
 
 /// Size of the scratch region whose address the fuzzer hands out.
 const SCRATCH: u64 = 64 * 1024;
@@ -161,11 +166,7 @@ impl State {
             7 | 8 => (r >> 8) % 600,
             _ => self.rng.next_u64(),
         };
-        if number == NR_EXIT || number == NR_EXIT_GROUP || number == NR_EXECVE {
-            1
-        } else {
-            number
-        }
+        if NEVER.contains(&number) { 1 } else { number }
     }
 }
 

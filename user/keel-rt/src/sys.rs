@@ -31,7 +31,10 @@ pub mod nr {
     pub const FCNTL: u64 = 72;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
+    pub const FORK: u64 = 57;
     pub const EXECVE: u64 = 59;
+    pub const WAIT4: u64 = 61;
+    pub const GETPPID: u64 = 110;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
@@ -149,6 +152,33 @@ pub fn openat(dirfd: i32, path: &CStr, flags: u64, mode: u64) -> i64 {
 
 pub fn openat_from(path: Hostile, flags: u64) -> i64 {
     call6(nr::OPENAT, [AT_FDCWD as u64, path.0, flags, 0, 0, 0])
+}
+
+/// fork(2): the child's PID in the parent, 0 in the child, or -errno.
+/// The child continues with a copy of this program's memory and state,
+/// so nothing in Rust's model is affected: each process has its own.
+pub fn fork() -> i64 {
+    call3(nr::FORK, 0, 0, 0)
+}
+
+/// wait4(2) with the status written to `status` and no rusage.
+pub fn wait4(pid: i32, status: &mut i32, options: u32) -> i64 {
+    call6(
+        nr::WAIT4,
+        [
+            pid as u32 as u64,
+            status as *mut i32 as u64,
+            u64::from(options),
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// getppid(2).
+pub fn getppid() -> i64 {
+    call3(nr::GETPPID, 0, 0, 0)
 }
 
 /// execve(2) of `path` with these arguments (`None`: a NULL argv) and

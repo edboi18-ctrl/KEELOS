@@ -9,10 +9,12 @@
 pub enum Errno {
     EPERM = 1,
     ENOENT = 2,
+    ESRCH = 3,
     EIO = 5,
     E2BIG = 7,
     ENOEXEC = 8,
     EBADF = 9,
+    ECHILD = 10,
     EAGAIN = 11,
     ENOMEM = 12,
     EACCES = 13,

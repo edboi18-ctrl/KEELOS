@@ -20,6 +20,9 @@ pub struct SyscallArgs {
     pub args: [u64; 6],
     /// The caller's user stack pointer (sigaltstack(2) checks it).
     pub user_rsp: u64,
+    /// All of the caller's user registers as they came in (fork copies
+    /// them into the child).
+    pub frame: TrapFrame,
 }
 
 /// The registered system-call handler: arguments in, RAX out.
@@ -40,6 +43,7 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ],
         user_rsp: frame.rsp,
+        frame: *frame,
     };
     // Copy the handler out so the lock is not held during the call, which
     // may block or switch threads.

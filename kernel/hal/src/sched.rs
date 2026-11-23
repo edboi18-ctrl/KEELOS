@@ -54,8 +54,9 @@ struct Thread {
     fpu: FpuState,
     /// The user address space, for threads that run user code.
     space: Option<Arc<AddressSpace>>,
-    /// First user-mode RIP, RSP and RDI, consumed by `user_thread_start`.
-    user_entry: Option<(u64, u64, u64)>,
+    /// How the thread first enters user mode, consumed by
+    /// `user_thread_start`.
+    user_entry: Option<UserEntry>,
     /// User FS and GS base addresses (arch_prctl), loaded into the MSRs
     /// whenever this thread is switched in. The kernel never uses FS or GS
     /// itself (ADR 0005), so these need no saving on kernel entry.
@@ -63,6 +64,14 @@ struct Thread {
     /// Set by `exec_current` during a system call: the new program's RIP
     /// and RSP, which the system-call return path puts in the frame.
     pending_exec: Option<(u64, u64)>,
+}
+
+/// A user thread's first entry to user mode.
+enum UserEntry {
+    /// A new program: RIP, RSP and RDI, every other register 0.
+    Start(u64, u64, u64),
+    /// A copy of another thread's user registers (fork).
+    Frame(Box<crate::arch::x86_64::idt::TrapFrame>),
 }
 
 /// How a user thread's last exception looked, for tests and diagnostics.
@@ -241,7 +250,7 @@ pub fn spawn_user(
     };
     let mut thread = new_thread(name, user_thread_start, id)?;
     thread.space = Some(space);
-    thread.user_entry = Some((rip, rsp, argument));
+    thread.user_entry = Some(UserEntry::Start(rip, rsp, argument));
     let mut guard = SCHED.lock();
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
@@ -260,9 +269,47 @@ fn user_thread_start() {
         })
     };
     match entry {
-        Some((rip, rsp, argument)) => entry::enter_user(rip, rsp, argument),
+        Some(UserEntry::Start(rip, rsp, argument)) => entry::enter_user(rip, rsp, argument),
+        Some(UserEntry::Frame(frame)) => entry::enter_user_frame(*frame),
         None => exit_with(-1),
     }
+}
+
+/// Starts a thread that continues the running user thread (fork): in
+/// `space`, with `frame` as its user registers, and the running thread's
+/// FS/GS bases and FPU/SSE/AVX state. The FPU registers hold the running
+/// thread's own state during a system call (the kernel uses no FPU or SSE
+/// registers), so they are saved into the new thread's area here.
+pub fn spawn_user_copy(
+    name: &'static str,
+    space: Arc<AddressSpace>,
+    frame: crate::arch::x86_64::idt::TrapFrame,
+) -> Result<ThreadId, SchedError> {
+    let bases = {
+        let guard = SCHED.lock();
+        let sched = guard.as_ref().ok_or(SchedError::NotInitialised)?;
+        sched
+            .threads
+            .get(&sched.current)
+            .map_or([0; 2], |t| t.user_bases)
+    };
+    let id = {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
+        let id = sched.next_id;
+        sched.next_id += 1;
+        id
+    };
+    let mut thread = new_thread(name, user_thread_start, id)?;
+    thread.fpu.save();
+    thread.space = Some(space);
+    thread.user_bases = bases;
+    thread.user_entry = Some(UserEntry::Frame(Box::new(frame)));
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
+    sched.threads.insert(id, thread);
+    sched.ready.push_back(id);
+    Ok(ThreadId(id))
 }
 
 /// Records the user fault that is about to end the current thread.
@@ -426,10 +473,14 @@ pub(crate) fn swap_space(space: Option<Arc<AddressSpace>>) -> Option<Arc<Address
 
 /// Called with the thread's ID whenever a thread exits, before it stops
 /// running (process teardown in `linux-abi`).
-static EXIT_HOOK: IrqMutex<Option<fn(ThreadId)>> = IrqMutex::new(None);
+static EXIT_HOOK: IrqMutex<Option<ExitHook>> = IrqMutex::new(None);
+
+/// The exit hook: the thread, its exit status, and the user fault that
+/// ended it, if one did.
+pub type ExitHook = fn(ThreadId, i64, Option<UserFault>);
 
 /// Registers the exit hook. Call once at boot.
-pub fn set_exit_hook(hook: fn(ThreadId)) {
+pub fn set_exit_hook(hook: ExitHook) {
     *EXIT_HOOK.lock() = Some(hook);
 }
 
@@ -548,11 +599,11 @@ pub fn exit() -> ! {
 /// Ends the running thread with an exit status.
 pub fn exit_with(status: i64) -> ! {
     let id = current().0;
+    let fault = FAULTS.lock().remove(&id);
     let hook = *EXIT_HOOK.lock();
     if let Some(hook) = hook {
-        hook(ThreadId(id));
+        hook(ThreadId(id), status, fault);
     }
-    let fault = FAULTS.lock().remove(&id);
     {
         // Keep the most recent statuses only (audit 2, A7.2): one entry per
         // exited thread for ever would grow without bound. Thread ids only

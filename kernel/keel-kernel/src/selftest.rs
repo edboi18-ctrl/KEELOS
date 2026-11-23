@@ -1344,6 +1344,7 @@ pub fn phase1_robustness(t: &mut Runner) {
             number: 0x1_0000_0000 + number * 7919,
             args: [0; 6],
             user_rsp: 0,
+            frame: keel_hal::arch::x86_64::idt::TrapFrame::default(),
         };
         let _ = keel_linux_abi::syscall::handle(&call);
     }
@@ -1912,6 +1913,88 @@ fn phase3(t: &mut Runner) {
     phase3_dynamic(t);
     phase3_file_mappings(t);
     phase3_execve(t);
+    phase3_fork(t);
+}
+
+/// P3-T3: fork and wait4, and a fork bomb against a compartment's process
+/// limit (security acceptance P3 item 3).
+fn phase3_fork(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs, process};
+
+    const PROGRAM: &[u8] = b"/test/forkprobe";
+    // Frames outside the kernel heap. The heap may keep a few more pages
+    // after a run: the scheduler keeps the exit statuses of the last 1024
+    // threads (audit 2, A7.2), and this run ends 22, so that table grows
+    // until it is full. Every other frame must come back.
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let (frames, processes) = (outside_heap(), process::count());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = status == Some((0, None)) && frames_after == frames && processes_after == processes;
+    t.check(
+        "exec.fork_wait",
+        ok,
+        "fork gives the child a copy-on-write copy and shared open files; wait4 reaps exits (status code << 8), faults (signal 11) and twenty zombies, with WNOHANG, ECHILD and EINVAL as Linux; no frame or process is left over",
+    );
+    if !ok {
+        kprintln!(
+            "  forkprobe: {status:?}; frames outside the heap {frames} -> {frames_after}; processes {processes} -> {processes_after}"
+        );
+    }
+
+    // The bomb: a compartment of 8 processes. The program forks until
+    // EAGAIN and exits with the number of children it got (7), while a
+    // program in another compartment runs normally.
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"bomb", 0o755)?;
+        fs.create_dir(comp, b"bystander", 0o755)
+    });
+    let limits = Limits {
+        processes: 8,
+        ..Limits::UNLIMITED
+    };
+    let (Ok(_), Ok(bomb), Ok(bystander)) = (
+        made,
+        compartment::create(b"/comp/bomb", limits),
+        compartment::create(b"/comp/bystander", Limits::UNLIMITED),
+    ) else {
+        t.check(
+            "compartment.fork_bomb",
+            false,
+            "creating the bomb compartments",
+        );
+        return;
+    };
+    let started = fs::read_file(PROGRAM).ok().and_then(|file| {
+        let loaded =
+            keel_linux_abi::exec::load_in(bomb.root(), &file, PROGRAM, &[PROGRAM, b"bomb"], &[])
+                .ok()?;
+        keel_linux_abi::process::spawn_in(&bomb, "bomb", &loaded).ok()
+    });
+    const NAP: &[u8] = b"/test/nap";
+    let other = run_in(&bystander, NAP, &[NAP, b"10"]);
+    let bombed = started.and_then(|s| {
+        join(s.thread);
+        sched::exit_status(s.thread)
+    });
+    let ok = bombed == Some((7, None))
+        && other == Some((0, None))
+        && bomb.processes() == 0
+        && bomb.memory().used() == 0;
+    t.check(
+        "compartment.fork_bomb",
+        ok,
+        "a fork bomb in a compartment of 8 processes gets 7 children and then EAGAIN; zombies keep their slots until reaped; all reaped, every slot and frame back; a program in another compartment runs meanwhile",
+    );
+    if !ok {
+        kprintln!(
+            "  bomb: {bombed:?}; bystander {other:?}; processes left {}, memory left {}",
+            bomb.processes(),
+            bomb.memory().used()
+        );
+    }
 }
 
 /// P3-T3: execve. user/tests/execprobe runs itself three times; it passes

@@ -46,7 +46,10 @@ pub mod nr {
     pub const PREAD64: u64 = 17;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
+    pub const FORK: u64 = 57;
     pub const EXECVE: u64 = 59;
+    pub const WAIT4: u64 = 61;
+    pub const GETPPID: u64 = 110;
     pub const EXIT: u64 = 60;
     pub const FCNTL: u64 = 72;
     pub const SIGALTSTACK: u64 = 131;
@@ -103,6 +106,8 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::PREAD64 as usize] = Some(|p, a| pread64(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     t[nr::FCNTL as usize] = Some(|p, a| fcntl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
     t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
+    t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
+    t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
     t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
     t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
     t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
@@ -203,6 +208,12 @@ fn dispatch(call: &SyscallArgs) -> i64 {
     let result: SysResult = match number {
         nr::EXIT | nr::EXIT_GROUP => sched::exit_with((a[0] & 0xff) as i64),
         // Outside the table: it also needs the caller's stack pointer.
+        // fork needs the caller's registers, which the table's handlers
+        // do not get.
+        nr::FORK => match process::current() {
+            Some(p) => process::fork(&p, &call.frame),
+            None => unimplemented(number, &a),
+        },
         nr::SIGALTSTACK => match process::current() {
             Some(p) => sigaltstack(&p, a[0], a[1], call.user_rsp),
             None => unimplemented(number, &a),
@@ -341,6 +352,49 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
     read_at(p, fd, buf, count, None)
 }
 
+/// wait4(2) (P3-T3). As Linux's kernel_wait4 (`kernel/exit.c` at v6.12):
+/// options other than WNOHANG, WUNTRACED, WCONTINUED, __WNOTHREAD,
+/// __WCLONE and __WALL are EINVAL; INT_MIN is ESRCH. -1 waits for any
+/// child. Keel has no process groups yet and every process of a
+/// compartment would be in one, so 0 (the caller's group) is any child,
+/// and another negative pgid finds none (ECHILD). No child matching:
+/// ECHILD. WNOHANG with none exited returns 0. Stopped and continued
+/// children do not exist until signals do, so WUNTRACED and WCONTINUED
+/// change nothing. The status is written if `status` is not NULL; a
+/// `rusage` is written as all zero (no accounting yet).
+fn wait4(
+    p: &Arc<IrqMutex<Process>>,
+    pid: i32,
+    status: u64,
+    options: u32,
+    rusage: u64,
+) -> SysResult {
+    const WNOHANG: u32 = 1;
+    const KNOWN: u32 = 1 | 2 | 8 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    /// sizeof(struct rusage) on x86-64.
+    const RUSAGE_SIZE: usize = 144;
+    if options & !KNOWN != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let which = match pid {
+        i32::MIN => return Err(Errno::ESRCH),
+        -1 | 0 => process::WaitFor::Any,
+        pid if pid > 0 => process::WaitFor::Pid(pid as u32),
+        _ => return Err(Errno::ECHILD),
+    };
+    let Some((child, wait_status)) = process::wait(p, which, options & WNOHANG == 0)? else {
+        return Ok(0);
+    };
+    // Like Linux, the child is already reaped when a copy-out fails.
+    if status != 0 {
+        copy_to_user(status, &wait_status.to_le_bytes()).map_err(fault)?;
+    }
+    if rusage != 0 {
+        copy_to_user(rusage, &[0u8; RUSAGE_SIZE]).map_err(fault)?;
+    }
+    Ok(u64::from(child))
+}
+
 /// Longest argument or environment string, its NUL included: Linux's
 /// MAX_ARG_STRLEN, 32 pages (`include/uapi/linux/binfmts.h`).
 const MAX_ARG_STRLEN: usize = 32 * PAGE as usize;
@@ -425,7 +479,7 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
     // No failure past this point: the old program is gone.
     let (old_space, closed) = {
         let mut process = p.lock();
-        let old = core::mem::replace(&mut process.space, loaded.space.clone());
+        let old = process.space.replace(loaded.space.clone());
         process.brk_start = loaded.brk_start;
         process.brk = loaded.brk_start;
         process.clear_child_tid = 0;
@@ -857,7 +911,7 @@ fn mmap(
             hint: address & !(PAGE - 1),
         }
     };
-    let space = p.lock().space.clone();
+    let space = p.lock().space()?;
     match backing {
         Some(backing) => space.map_file(placement, length, prot, backing),
         None => space.map(placement, length, prot),
@@ -886,7 +940,7 @@ fn munmap(p: &Arc<IrqMutex<Process>>, address: u64, length: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let length = page_length(length).map_err(|_| Errno::EINVAL)?;
-    let space = p.lock().space.clone();
+    let space = p.lock().space()?;
     space.unmap(address, length).map_err(vm_error).map(|_| 0)
 }
 
@@ -899,7 +953,7 @@ fn mprotect(p: &Arc<IrqMutex<Process>>, address: u64, length: u64, protection: u
         return Ok(0);
     }
     let length = page_length(length)?;
-    let space = p.lock().space.clone();
+    let space = p.lock().space()?;
     space
         .protect(address, length, prot)
         .map_err(vm_error)
@@ -911,7 +965,10 @@ fn mprotect(p: &Arc<IrqMutex<Process>>, address: u64, length: u64, protection: u
 fn brk(p: &Arc<IrqMutex<Process>>, requested: u64) -> u64 {
     let (space, start, current) = {
         let process = p.lock();
-        (process.space.clone(), process.brk_start, process.brk)
+        (process.space(), process.brk_start, process.brk)
+    };
+    let Ok(space) = space else {
+        return current;
     };
     if requested < start || requested >= USER_END {
         return current;

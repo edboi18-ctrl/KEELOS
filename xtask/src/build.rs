@@ -217,6 +217,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/forkprobe",
+        binary: "forkprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/nap",
         binary: "nap",
         args: &["10"],

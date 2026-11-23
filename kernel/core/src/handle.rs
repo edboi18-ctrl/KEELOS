@@ -83,8 +83,12 @@ pub struct Handle<T> {
     pub close_on_exec: bool,
 }
 
-/// The table. Indices are Linux file descriptors.
-#[derive(Debug)]
+/// The table. Indices are Linux file descriptors. Cloning it copies every
+/// handle with its rights and close-on-exec flag (fork); the objects are
+/// cloned too, so for shared objects (an `Arc`) both tables refer to the
+/// same ones, as fork(2)'s duplicated descriptors refer to the same open
+/// file descriptions.
+#[derive(Clone, Debug)]
 pub struct HandleTable<T> {
     slots: Vec<Option<Handle<T>>>,
     limit: usize,
@@ -328,5 +332,31 @@ mod tests {
         assert_eq!(table.get(gone, Rights::NONE), Err(Errno::EBADF));
         // The freed number is used again.
         assert_eq!(table.insert(handle(3, false)), Ok(gone));
+    }
+
+    #[test]
+    fn a_cloned_table_shares_its_objects_and_keeps_rights_and_flags() {
+        use alloc::sync::Arc;
+        let mut table: HandleTable<Arc<u8>> = HandleTable::new(4);
+        let object = Arc::new(7u8);
+        let fd = table
+            .insert(Handle {
+                object: object.clone(),
+                rights: Rights::READ,
+                close_on_exec: true,
+            })
+            .unwrap();
+        let copy = table.clone();
+        let shared = copy.get(fd, Rights::READ).unwrap();
+        assert!(
+            Arc::ptr_eq(shared, &object),
+            "the same object, as fork's descriptors"
+        );
+        assert_eq!(copy.close_on_exec(fd), Ok(true));
+        assert_eq!(
+            copy.get(fd, Rights::WRITE),
+            Err(Errno::EBADF),
+            "rights are copied, not widened"
+        );
     }
 }

@@ -478,13 +478,20 @@ pub fn prepare_user_return(frame: &mut TrapFrame) -> bool {
 /// stack, and `argument` in RDI. Never returns; later entries to the kernel come back through
 /// the entry code on this thread's kernel stack.
 pub fn enter_user(rip: u64, rsp: u64, argument: u64) -> ! {
-    let mut frame = TrapFrame {
+    enter_user_frame(TrapFrame {
         rip,
         rsp,
         rdi: argument,
         rflags: RFLAGS_FIXED,
         ..TrapFrame::default()
-    };
+    })
+}
+
+/// Enters user mode for the first time with every register from `frame`
+/// (a forked thread starts with a copy of its parent's). The selectors,
+/// RFLAGS, RIP, RSP and CR3 are made safe by `prepare_user_return`, as on
+/// every return to user mode.
+pub fn enter_user_frame(mut frame: TrapFrame) -> ! {
     let _ = cpu::disable_interrupts();
     if !prepare_user_return(&mut frame) {
         panic!("enter_user on a thread without an address space");

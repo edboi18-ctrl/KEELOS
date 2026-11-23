@@ -39,7 +39,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 29 | `shutdown` | 1 | 0 | 1 | missing |  |
 | 30 | `poll` | 1 | 0 | 1 | partial | `syscalls.conformance` |
 | 31 | `pipe` | 17 | 0 | 17 | missing |  |
-| 32 | `fork` | 25 | 0 | 25 | missing |  |
+| 32 | `fork` | 25 | 0 | 25 | complete | `exec.fork_wait`, `compartment.fork_bomb` |
 | 33 | `setsid` | 10 | 0 | 10 | missing |  |
 | 34 | `unlink` | 9 | 1 | 9 | missing |  |
 | 35 | `socket` | 8 | 0 | 8 | missing |  |
@@ -51,7 +51,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 41 | `dup2` | 22 | 0 | 22 | missing |  |
 | 42 | `write` | 28591 | 0 | 28754 | partial | `syscalls.conformance` |
 | 43 | `exit_group` | 27 | 0 |  | partial | `syscalls.conformance` |
-| 44 | `wait4` | 13 | 0 | 13 | missing |  |
+| 44 | `wait4` | 13 | 0 | 13 | partial (no process groups) | `exec.fork_wait` |
 | 45 | `setsockopt` | 22 | 0 | 22 | missing |  |
 | 46 | `connect` | 1 | 0 | 1 | missing |  |
 | 47 | `fchdir` | 75 | 0 | 75 | missing |  |
