@@ -145,13 +145,19 @@ pub fn newfstatat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, flags: u32) -
         return Err(Errno::EINVAL);
     }
     let path = path_arg(path)?;
-    let node = node_at(
-        p,
-        dirfd,
-        &path,
-        flags & AT_SYMLINK_NOFOLLOW == 0,
-        flags & AT_EMPTY_PATH != 0,
-    )?;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    if let Some(hit) = crate::procfs::lookup(p, &path, follow) {
+        return match hit? {
+            crate::procfs::Hit::Node(node) => {
+                let b =
+                    crate::abi::stat_bytes_on(&crate::procfs::stat(node), crate::abi::PROCFS_DEV);
+                copy_to_user(buf, &b).map_err(fault)?;
+                Ok(0)
+            }
+            crate::procfs::Hit::Real(ino) => put_stat(ino, buf),
+        };
+    }
+    let node = node_at(p, dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)?;
     put_stat(node, buf)
 }
 
@@ -517,8 +523,16 @@ pub fn readlinkat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, size: i32) ->
         return Err(Errno::EINVAL);
     }
     let path = user_path(path)?;
-    let node = node_at(p, dirfd, &path, false, false)?;
-    let target = fs::with(|fs| fs.readlink(node))?;
+    let target = match crate::procfs::lookup(p, &path, false) {
+        Some(hit) => match hit? {
+            crate::procfs::Hit::Node(node) => crate::procfs::readlink(p, node)?,
+            crate::procfs::Hit::Real(_) => return Err(Errno::EINVAL),
+        },
+        None => {
+            let node = node_at(p, dirfd, &path, false, false)?;
+            fs::with(|fs| fs.readlink(node))?
+        }
+    };
     let n = target.len().min(size as usize);
     copy_to_user(buf, &target[..n]).map_err(fault)?;
     Ok(n as u64)
@@ -633,14 +647,17 @@ pub fn faccessat2(p: &ProcessRef, dirfd: i32, path: u64, mode: u32, flags: u32) 
         return Err(Errno::EINVAL);
     }
     let path = path_arg(path)?;
-    let node = node_at(
-        p,
-        dirfd,
-        &path,
-        flags & AT_SYMLINK_NOFOLLOW == 0,
-        flags & AT_EMPTY_PATH != 0,
-    )?;
-    let stat = fs::with(|fs| fs.stat(node))?;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let stat = match crate::procfs::lookup(p, &path, follow) {
+        Some(hit) => match hit? {
+            crate::procfs::Hit::Node(node) => crate::procfs::stat(node),
+            crate::procfs::Hit::Real(ino) => fs::with(|fs| fs.stat(ino))?,
+        },
+        None => {
+            let node = node_at(p, dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)?;
+            fs::with(|fs| fs.stat(node))?
+        }
+    };
     if mode & X_OK != 0 && stat.mode & vfs::S_IFMT != vfs::S_IFDIR && stat.mode & 0o111 == 0 {
         return Err(Errno::EACCES);
     }
@@ -1092,8 +1109,16 @@ fn statfs_bytes(p: &ProcessRef) -> Result<[u8; 120], Errno> {
 /// statfs(2): the filesystem holding the path (there is one).
 pub fn statfs(p: &ProcessRef, path: u64, buf: u64) -> SysResult {
     let path = user_path(path)?;
-    node_at(p, AT_FDCWD, &path, true, false)?;
-    let b = statfs_bytes(p)?;
+    let b = match crate::procfs::lookup(p, &path, true) {
+        Some(hit) => match hit? {
+            crate::procfs::Hit::Node(_) => crate::procfs::statfs_bytes(),
+            crate::procfs::Hit::Real(_) => statfs_bytes(p)?,
+        },
+        None => {
+            node_at(p, AT_FDCWD, &path, true, false)?;
+            statfs_bytes(p)?
+        }
+    };
     copy_to_user(buf, &b).map_err(fault)?;
     Ok(0)
 }

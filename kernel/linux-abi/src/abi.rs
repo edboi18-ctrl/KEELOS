@@ -126,11 +126,20 @@ pub const TMPFS_DEV: (u32, u32) = (0, 1);
 /// blocks of whole pages for a regular file, as tmpfs allocates them
 /// (`BLOCKS_PER_PAGE`, `mm/shmem.c`), and 0 for anything else.
 pub fn stat_bytes(stat: &Stat) -> [u8; 144] {
+    stat_bytes_on(stat, TMPFS_DEV)
+}
+
+/// Device number reported for procfs nodes: another anonymous device
+/// (major 0), as procfs is its own superblock on Linux. 0:2 is arbitrary.
+pub const PROCFS_DEV: (u32, u32) = (0, 2);
+
+/// [`stat_bytes`] for a node on device `dev`.
+pub fn stat_bytes_on(stat: &Stat, dev: (u32, u32)) -> [u8; 144] {
     let mut out = [0u8; 144];
     let put = |out: &mut [u8; 144], at: usize, value: u64| {
         out[at..at + 8].copy_from_slice(&value.to_le_bytes());
     };
-    put(&mut out, 0, encode_dev(TMPFS_DEV.0, TMPFS_DEV.1));
+    put(&mut out, 0, encode_dev(dev.0, dev.1));
     put(&mut out, 8, stat.ino + 1); // inode 0 is "none" to most tools
     put(&mut out, 16, u64::from(stat.nlink));
     out[24..28].copy_from_slice(&stat.mode.to_le_bytes());

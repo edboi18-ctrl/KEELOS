@@ -79,6 +79,10 @@ impl Archive {
         for (inode, (name, contents)) in (1u32..).zip(&self.members) {
             let (mode, nlink, data): (u32, u32, &[u8]) = match contents {
                 None => (S_IFDIR | 0o755, 2, &[]),
+                // Programs and libraries (ELF, by their magic) are 0755, as
+                // installed on Linux, so access(X_OK) and stat report them
+                // executable; everything else 0644.
+                Some(data) if data.starts_with(b"\x7fELF") => (S_IFREG | 0o755, 1, data),
                 Some(data) => (S_IFREG | 0o644, 1, data),
             };
             write_member(&mut out, name, inode, mode, nlink, data)?;

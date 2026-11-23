@@ -743,6 +743,34 @@ impl Fs {
         self.add(dir, name, node)
     }
 
+    /// A file no directory names, holding `data`, already pinned once (by
+    /// the open file description the caller makes for it): a procfs
+    /// file's contents as of its open (ADR 0024). It goes when unpinned.
+    /// Its bytes count against the filesystem's cap (ENOSPC) but no
+    /// compartment's quota: a process holds at most its handle limit of
+    /// them, and each is a few kilobytes.
+    pub fn create_detached(&mut self, data: Vec<u8>, permissions: u32) -> Result<Ino, Errno> {
+        if self
+            .bytes_used
+            .checked_add(data.len())
+            .is_none_or(|t| t > self.byte_limit)
+        {
+            return Err(Errno::ENOSPC);
+        }
+        self.bytes_used += data.len();
+        let mut node = Node::new(
+            Contents::File(Arc::new(data)),
+            permissions,
+            None,
+            self.now(),
+        );
+        node.pins = 1;
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.nodes.insert(ino, node);
+        Ok(ino)
+    }
+
     /// A symbolic link's target (readlink(2)): EINVAL if `ino` is not one.
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
         match &self.node(ino)?.contents {
@@ -1980,5 +2008,21 @@ mod tests {
             Err(Errno::ENOENT),
             "not beneath the root"
         );
+    }
+
+    #[test]
+    fn a_detached_file_lives_while_pinned() {
+        let mut fs = Fs::new(16);
+        let f = fs.create_detached(b"processor".to_vec(), 0o444).unwrap();
+        let mut buf = [0u8; 9];
+        assert_eq!((fs.read(f, 0, &mut buf), &buf), (Ok(9), b"processor"));
+        assert_eq!(fs.bytes_used(), 9);
+        assert_eq!(
+            fs.create_detached(alloc::vec![0; 8], 0o444),
+            Err(Errno::ENOSPC)
+        );
+        fs.unpin(f);
+        assert_eq!(fs.stat(f), Err(Errno::ENOENT));
+        assert_eq!(fs.bytes_used(), 0);
     }
 }

@@ -21,6 +21,7 @@ pub mod keyboard;
 pub mod lock;
 pub mod paging;
 pub mod poll;
+pub mod procfs;
 pub mod rng;
 pub mod signal;
 pub mod tty;

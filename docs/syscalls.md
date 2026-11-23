@@ -101,6 +101,7 @@ addresses.
 | 131 | `sigaltstack` | Complete | none (own thread) | Linux's rules: an unknown mode EINVAL; a stack below MINSIGSTKSZ (2048) ENOMEM; a change while the caller's stack pointer is on the alternate stack EPERM (never with SS_AUTODISARM); SS_DISABLE clears pointer and size; an unchanged request succeeds before the size check. The old stack reports SS_DISABLE, SS_ONSTACK or 0, as Linux's `sas_ss_flags`. Per thread; a new thread sharing memory starts without one, as clone(2); handlers with SA_ONSTACK run on it (ADR 0020). |
 | 137 | `statfs` | Complete | none (a path from the root) | ADR 0023. tmpfs's answer (`shmem_statfs`): TMPFS_MAGIC, 4096-byte blocks, totals and free counts from the filesystem's caps or the compartment's quota where smaller, NAME_MAX 255, ST_VALID. |
 | 138 | `fstatfs` | Complete | none on the handle | ADR 0023. As statfs. |
+| 157 | `prctl` | Partial: PR_SET_NAME, PR_GET_NAME | none (own thread) | ADR 0024. PR_SET_NAME takes up to 15 bytes, to a NUL; PR_GET_NAME writes 16, NUL-padded; the name is the thread's `comm`. Other options EINVAL (the default branch; PR_SET_PTRACER is Yama's). |
 | 158 | `arch_prctl` | ARCH_SET_FS/GS, ARCH_GET_FS/GS | none (own thread) | Bases must be user addresses (EPERM otherwise), so the MSR write cannot fault and no segment can point into the kernel. The kernel never uses FS or GS (ADR 0005). Other codes EINVAL. |
 | 186 | `gettid` | Complete | none | The calling thread's TID (the PID for a process's first thread). |
 | 188-199 | `setxattr`, `lsetxattr`, `fsetxattr`, `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr`, `flistxattr`, `removexattr`, `lremovexattr`, `fremovexattr` | Checks only: tmpfs keeps no extended attributes | none | ADR 0023. EOPNOTSUPP, as a filesystem without xattr support, after Linux's checks in its order (`fs/xattr.c`): get and list check the path or descriptor first, then get the name; set its flags (EINVAL), the name, the size (E2BIG past 64 KiB), then the path; remove the name, then the path. An empty name or one past 255 bytes ERANGE. |
@@ -166,3 +167,23 @@ flags); SIGTRAP for #DB and #BP. A handler that is installed and not
 blocked runs with the fault in its frame (`trapno`, `err`, `cr2`);
 otherwise the process ends with that signal (wait status the signal;
 thread exit status 128 + the signal).
+
+## procfs
+
+ADR 0024. Paths under `/proc` (absolute, after lexical `.`/`..`) are
+procfs's, over whatever the process tree holds there, and show only the
+caller's compartment's processes:
+
+| Path | Kind | Contents |
+| --- | --- | --- |
+| `/proc` | directory 0555 | |
+| `/proc/self`, `/proc/thread-self` | links | the PID; `<pid>/task/<tid>` |
+| `/proc/<pid>`, `/proc/<pid>/task`, `/proc/<pid>/task/<tid>` | directories 0555 | |
+| `/proc/<pid>/exe` (also under a task) | link | the program's path; followed by stat and open |
+| `/proc/<pid>/comm`, `/proc/<pid>/task/<tid>/comm` | file 0644 | the thread's name and a newline; a write renames a thread of the caller's process |
+| `/proc/cpuinfo` | file 0444 | Linux's x86 format from CPUID (without microcode, cache size, synthesized flags and bugs) |
+| `/proc/net`, `/proc/net/dev` | directory; file 0444 | the header lines (no interfaces yet) |
+
+Files open as snapshots taken at the open. Directories cannot be opened
+yet (EACCES). statfs reports PROC_SUPER_MAGIC.
+

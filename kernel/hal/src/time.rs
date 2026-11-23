@@ -62,6 +62,11 @@ fn hpet_wait(nanos: u64) {
     }
 }
 
+/// The TSC frequency calibrated at `init`, in Hz (0 before then).
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
 /// Nanoseconds since `init`, from the HPET.
 pub fn hpet_nanos() -> u64 {
     let ticks = hpet_counter().wrapping_sub(HPET_START.load(Ordering::Relaxed));

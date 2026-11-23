@@ -39,6 +39,20 @@ pub struct OpenFile {
     /// O_NONBLOCK, O_DIRECT, O_NOATIME, O_LARGEFILE, which open always
     /// sets on 64-bit: `force_o_largefile`). `append` mirrors O_APPEND.
     pub status: u64,
+    /// For `/proc/<pid>/[task/<tid>/]comm` (ADR 0024): the thread a write
+    /// names, if the opener may name it (a thread of its own process, as
+    /// Linux's `comm_write` requires; else writes are EINVAL).
+    pub comm: Option<CommTarget>,
+}
+
+/// The thread a `comm` file renames.
+#[derive(Debug)]
+pub struct CommTarget {
+    pub process: Weak<IrqMutex<Process>>,
+    /// The scheduler thread ID (the key of `Process::threads`).
+    pub thread: u64,
+    /// Whether writes are allowed (the opener's own process).
+    pub own: bool,
 }
 
 impl Drop for OpenFile {
@@ -96,6 +110,9 @@ pub struct Process {
     /// Lookups never leave `root`: the compartment's root (SR-4).
     pub root: Ino,
     pub cwd: Ino,
+    /// The program's path from the process root, as `/proc/<pid>/exe`
+    /// reads (ADR 0024).
+    pub exe: Vec<u8>,
     /// The file mode creation mask (umask(2)); 022 for a process the
     /// kernel starts, as Linux's init_fs. fork and execve keep it.
     pub umask: u32,
@@ -143,6 +160,18 @@ pub struct ThreadInfo {
     /// `cr2` in the thread for the next signal frame's `trapno`, `err` and
     /// `cr2`.
     pub trap: Trap,
+    /// Its name (`comm`, at most 15 bytes: TASK_COMM_LEN 16 with the
+    /// NUL), as `/proc/<pid>/task/<tid>/comm` and prctl PR_GET_NAME give
+    /// it: the program's base name at spawn and execve, the creator's for
+    /// a new thread or a forked child.
+    pub comm: Vec<u8>,
+}
+
+/// A thread name from a path: its last component, cut to 15 bytes
+/// (`__set_task_comm(me, kbasename(bprm->filename))`, `fs/exec.c`).
+pub fn comm_of(path: &[u8]) -> Vec<u8> {
+    let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    base[..base.len().min(15)].to_vec()
 }
 
 /// `thread.trap_nr`, `thread.error_code` and `thread.cr2`.
@@ -154,13 +183,14 @@ pub struct Trap {
 }
 
 impl ThreadInfo {
-    fn first(tid: u32, signals: ThreadSignals) -> ThreadInfo {
+    fn first(tid: u32, signals: ThreadSignals, comm: Vec<u8>) -> ThreadInfo {
         ThreadInfo {
             tid,
             _slot: None,
             clear_child_tid: 0,
             signals,
             trap: Trap::default(),
+            comm,
         }
     }
 }
@@ -236,6 +266,7 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
             // As the kernel opens the console for init: O_LARGEFILE, read
             // or write as the descriptor is.
             status: crate::abi::O_LARGEFILE | if write { crate::abi::O_WRONLY } else { 0 },
+            comm: None,
         };
         handles.insert(Handle {
             object: Object::File(Arc::new(IrqMutex::new(file))),
@@ -283,6 +314,7 @@ pub fn spawn_in(
         cwd: root,
         umask: 0o022,
         lock_owner: new_lock_owner(),
+        exe: loaded.path.clone(),
         signals: SignalState::new(),
         pending: Pending::new(),
         parent: None,
@@ -296,9 +328,10 @@ pub fn spawn_in(
     let thread = sched::spawn_user(name, loaded.space.clone(), loaded.entry, loaded.rsp, 0)
         .map_err(|_| Errno::ENOMEM)?;
     let mut process = process;
-    process
-        .threads
-        .insert(thread.0, ThreadInfo::first(pid, ThreadSignals::new()));
+    process.threads.insert(
+        thread.0,
+        ThreadInfo::first(pid, ThreadSignals::new(), comm_of(&loaded.path)),
+    );
     processes.insert(thread.0, Arc::new(IrqMutex::new(process)));
     Ok(Spawned { pid, thread })
 }
@@ -320,7 +353,20 @@ pub fn current() -> Option<Arc<IrqMutex<Process>>> {
 /// copy), its clear_child_tid is not inherited and it has no children of
 /// its own.
 pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno> {
-    let (compartment, space, handles, signals, thread_signals, brk_start, brk, root, cwd, umask) = {
+    let (
+        compartment,
+        space,
+        handles,
+        signals,
+        thread_signals,
+        brk_start,
+        brk,
+        root,
+        cwd,
+        umask,
+        exe,
+        comm,
+    ) = {
         let process = p.lock();
         (
             process.member.compartment().clone(),
@@ -336,6 +382,11 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
             process.root,
             process.cwd,
             process.umask,
+            process.exe.clone(),
+            process
+                .threads
+                .get(&sched::current().0)
+                .map_or_else(Vec::new, |t| t.comm.clone()),
         )
     };
     let member = compartment.admit()?;
@@ -354,6 +405,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         cwd,
         umask,
         lock_owner: new_lock_owner(),
+        exe,
         signals,
         pending: Pending::new(),
         parent: Some(Arc::downgrade(p)),
@@ -373,7 +425,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
     child
         .lock()
         .threads
-        .insert(thread.0, ThreadInfo::first(pid, thread_signals));
+        .insert(thread.0, ThreadInfo::first(pid, thread_signals, comm));
     processes.insert(thread.0, child.clone());
     p.lock().children.push(Child {
         process: child,
@@ -430,15 +482,14 @@ pub fn clone_thread(
     } else {
         None
     };
-    let (compartment, space, signals) = {
+    let (compartment, space, signals, comm) = {
         let process = p.lock();
+        let me = process.threads.get(&sched::current().0);
         (
             process.member.compartment().clone(),
             process.space()?,
-            process
-                .threads
-                .get(&sched::current().0)
-                .map_or_else(ThreadSignals::new, |t| t.signals.for_child(true)),
+            me.map_or_else(ThreadSignals::new, |t| t.signals.for_child(true)),
+            me.map_or_else(Vec::new, |t| t.comm.clone()),
         )
     };
     let member = compartment.admit()?;
@@ -471,6 +522,7 @@ pub fn clone_thread(
             },
             signals,
             trap: Trap::default(),
+            comm,
         },
     );
     processes.insert(thread.0, p.clone());

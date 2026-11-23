@@ -119,6 +119,9 @@ pub struct Loaded {
     pub mmap_top: u64,
     /// Where the interpreter was loaded (AT_BASE), if there is one.
     pub interpreter_base: Option<u64>,
+    /// The program's path as given to the loader (`/proc/<pid>/exe` and
+    /// the first thread's name come from it; ADR 0024).
+    pub path: Vec<u8>,
 }
 
 /// `AT_CLKTCK`: Linux reports CLOCKS_PER_SEC, which is USER_HZ, 100
@@ -276,6 +279,7 @@ pub fn load_in(
         space,
         entry,
         interpreter_base: interpreter.map(|(_, base)| base),
+        path: path.to_vec(),
         rsp: initial.rsp,
         random: quality,
         brk_start: image.span().1 + bias + random::below(BRK_RANDOM_BYTES / PAGE) * PAGE,

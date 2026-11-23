@@ -26,7 +26,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 16 | `getuid` | 24 | 0 | 24 | missing |  |
 | 17 | `lseek` | 188 | 0 | 188 | complete | `exec.filesystem` |
 | 18 | `munmap` | 1999 | 11 | 2001 | partial | `syscalls.conformance` |
-| 19 | `prctl` | 33 | 0 | 33 | missing |  |
+| 19 | `prctl` | 33 | 0 | 33 | partial (PR_SET_NAME, PR_GET_NAME) | `exec.procfs` |
 | 20 | `prlimit64` | 71 | 0 | 71 | missing |  |
 | 21 | `userfaultfd` | 11 | 11 | 11 | missing |  |
 | 22 | `chdir` | 4 | 0 | 4 | complete | `exec.filesystem` |

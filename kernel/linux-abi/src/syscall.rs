@@ -201,6 +201,8 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
             f::pwritev_user(p, a[0] as u32 as i32, a[1], a[2], at, a[5] as u32)
         });
         t[137] = Some(|p, a| f::statfs(p, a[0], a[1]));
+        // prctl (157): thread names (ADR 0024).
+        t[157] = Some(|p, a| crate::procfs::prctl(p, a[0], a[1]));
         t[138] = Some(|p, a| f::fstatfs(p, a[0] as u32 as i32, a[1]));
         {
             use f::{XattrCall as C, XattrTarget as T};
@@ -661,6 +663,19 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
     let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
     let loaded = crate::exec::load_in(root, &file, &path, &args, &env).map_err(|e| e.errno())?;
+    // /proc/<pid>/exe: the program's path from the root. A relative path
+    // is taken from the working directory; symbolic links in it are not
+    // resolved, where Linux reports the file's own path (ADR 0024).
+    let exe_path = if path.first() == Some(&b'/') {
+        path.clone()
+    } else {
+        let mut full = fs::with(|fs| fs.path_of(root, cwd)).unwrap_or_else(|_| b"/".to_vec());
+        if full.last() != Some(&b'/') {
+            full.push(b'/');
+        }
+        full.extend_from_slice(&path);
+        full
+    };
     loaded
         .space
         .attach_budget(compartment.memory().clone())
@@ -676,7 +691,11 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
         process.brk = loaded.brk_start;
         if let Some(t) = process.threads.get_mut(&sched::current().0) {
             t.clear_child_tid = 0;
+            // begin_new_exec: the thread is named after the file, as
+            // given (`kbasename(bprm->filename)`).
+            t.comm = process::comm_of(&path);
         }
+        process.exe = exe_path.clone();
         process.signals.reset_for_exec();
         if let Some(t) = process.threads.get_mut(&sched::current().0) {
             t.signals.reset_for_exec();
@@ -885,6 +904,12 @@ pub(crate) fn write_at(
         }
         let written = {
             let mut f = file.lock();
+            if let Some(target) = &f.comm {
+                // /proc/.../comm renames a thread (ADR 0024).
+                // comm_write takes the first bytes and reports the whole
+                // count as written.
+                return crate::procfs::write_comm(target, &chunk[..want]).map(|_| count as u64);
+            }
             match f.kind {
                 Kind::File => {
                     let append = append.unwrap_or(f.append);
@@ -999,6 +1024,9 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         return Err(Errno::EINVAL);
     }
     let path = user_path(path)?;
+    if let Some(hit) = crate::procfs::open(p, &path, flags) {
+        return open_proc(p, hit?, flags);
+    }
     let (root, cwd) = {
         let process = p.lock();
         (process.root, process.cwd)
@@ -1078,10 +1106,52 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         // O_CLOEXEC not kept (`build_open_flags`), and O_CREAT, O_EXCL,
         // O_NOCTTY, O_TRUNC cleared after the open (`do_dentry_open`).
         status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
+        comm: None,
     };
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),
         rights: file_rights(read, write, kind),
+        close_on_exec: flags & O_CLOEXEC != 0,
+    };
+    let fd = p.lock().handles.insert(handle)?;
+    Ok(fd as u64)
+}
+
+/// openat of a `/proc` path (ADR 0024): a procfs file as a snapshot in a
+/// detached, pinned tmpfs node; a followed `exe` link as the program
+/// itself, read only (a running program is not opened for writing:
+/// ETXTBSY, as Linux's `deny_write_access`).
+fn open_proc(p: &Arc<IrqMutex<Process>>, hit: crate::procfs::Hit, flags: u64) -> SysResult {
+    let access = flags & O_ACCMODE;
+    let (read, write) = (access != O_WRONLY, access != O_RDONLY);
+    let (node, comm) = match hit {
+        crate::procfs::Hit::Node(node) => {
+            let (data, comm) = crate::procfs::contents(p, node)?;
+            let perms = node.permissions();
+            (fs::with(|fs| fs.create_detached(data, perms))?, comm)
+        }
+        crate::procfs::Hit::Real(ino) => {
+            if write {
+                return Err(Errno::ETXTBSY);
+            }
+            fs::with(|fs| {
+                fs.pin(ino);
+                Ok(())
+            })?;
+            (ino, None)
+        }
+    };
+    let open = OpenFile {
+        node,
+        kind: Kind::File,
+        offset: 0,
+        append: false,
+        status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
+        comm,
+    };
+    let handle = Handle {
+        object: Object::File(Arc::new(IrqMutex::new(open))),
+        rights: file_rights(read, write, Kind::File),
         close_on_exec: flags & O_CLOEXEC != 0,
     };
     let fd = p.lock().handles.insert(handle)?;

@@ -1922,6 +1922,7 @@ fn phase3(t: &mut Runner) {
     phase3_shared_mappings(t);
     phase3_filesystem(t);
     phase3_descriptors(t);
+    phase3_procfs(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2095,6 +2096,36 @@ fn phase3_descriptors(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  fdprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T9 (ADR 0024): user/tests/procprobe, which passes under Linux too
+/// (`host.procprobe`): /proc, /proc/self and /proc/<pid>, the exe links,
+/// comm and prctl thread names, a forked child's view, /proc/cpuinfo,
+/// /proc/net/dev and procfs's statfs. Afterwards every node, frame and
+/// process is back (the open procfs files' snapshots are freed).
+fn phase3_procfs(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/procprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.procfs",
+        ok,
+        "the traced procfs as on Linux: /proc, /proc/self and /proc/<pid>, exe links (readlink, stat, O_NOFOLLOW), thread names through comm and prctl, a forked child's view, /proc/cpuinfo, /proc/net/dev, statfs; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  procprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

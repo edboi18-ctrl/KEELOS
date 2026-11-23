@@ -469,6 +469,11 @@ pub fn rename2(old: &CStr, new: &CStr, flags: u32) -> i64 {
     )
 }
 
+/// prctl(2) with a pointer argument (PR_SET_NAME, PR_GET_NAME).
+pub fn prctl_name(option: u64, name: &mut [u8; 16]) -> i64 {
+    call6(157, [option, name.as_mut_ptr() as u64, 0, 0, 0, 0])
+}
+
 pub fn dup(fd: i32) -> i64 {
     call3(32, fd as u64, 0, 0)
 }
