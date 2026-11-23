@@ -79,6 +79,9 @@ pub fn init() -> Result<Report, InitError> {
     let entries = cpio::parse(module.data).map_err(InitError::Archive)?;
     let mut fs = Fs::new(TMPFS_LIMIT);
     fs.set_allocation_check(may_allocate);
+    fs.set_clock(now);
+    // A freed file's shared pages go with it (ADR 0021, 0022).
+    fs.set_free_hook(keel_hal::vm::shared_forget);
     let skipped = fs.unpack(ROOT, &entries).map_err(InitError::Unpack)?;
     let dev = match fs.lookup(ROOT, ROOT, b"/dev") {
         Ok(dev) => dev,
@@ -105,6 +108,32 @@ pub fn init() -> Result<Report, InitError> {
         members: entries.len(),
         skipped,
     })
+}
+
+/// Timestamps: the realtime clock, which counts from the epoch as if the
+/// machine booted at 1970-01-01 until Keel reads a real-time clock (as
+/// clock_gettime's CLOCK_REALTIME).
+fn now() -> keel_core::vfs::Timespec {
+    let nanos = keel_hal::time::monotonic_nanos();
+    keel_core::vfs::Timespec {
+        sec: (nanos / 1_000_000_000) as i64,
+        nsec: (nanos % 1_000_000_000) as u32,
+    }
+}
+
+/// The VM's object hook (ADR 0022): an address space that starts mapping
+/// a file pins it, and one that stops releases it, so a mapped file
+/// outlives its last name and descriptor, as Linux's `vm_file` reference
+/// keeps it.
+pub fn object_mapped(object: u64, mapped: bool) {
+    let _ = with(|fs| {
+        if mapped {
+            fs.pin(object);
+        } else {
+            fs.unpin(object);
+        }
+        Ok(())
+    });
 }
 
 /// Runs `f` on the filesystem. Fails with ENOENT before `init`.

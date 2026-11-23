@@ -107,6 +107,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "fsprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "execprobe"
 test = false
 bench = false

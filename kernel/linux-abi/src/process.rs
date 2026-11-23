@@ -24,13 +24,26 @@ use crate::exec::Loaded;
 pub const HANDLE_LIMIT: usize = 1024;
 
 /// An open file: the node and the file position, shared by duplicates of
-/// the handle (as Linux shares one `struct file`).
+/// the handle (as Linux shares one `struct file`). It holds its node alive
+/// (a pin, ADR 0022): whoever makes one pins the node first, under the
+/// filesystem lock, and dropping it releases the pin, so a file unlinked
+/// while open stays readable until its last description closes.
 #[derive(Debug)]
 pub struct OpenFile {
     pub node: Ino,
     pub kind: Kind,
     pub offset: u64,
     pub append: bool,
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        let node = self.node;
+        let _ = crate::fs::with(|fs| {
+            fs.unpin(node);
+            Ok(())
+        });
+    }
 }
 
 /// What a handle refers to.
@@ -78,6 +91,9 @@ pub struct Process {
     /// Lookups never leave `root`: the compartment's root (SR-4).
     pub root: Ino,
     pub cwd: Ino,
+    /// The file mode creation mask (umask(2)); 022 for a process the
+    /// kernel starts, as Linux's init_fs. fork and execve keep it.
+    pub umask: u32,
     /// Its threads, by scheduler thread id (P3-T4). The first is the one
     /// it started with, whose TID is the PID.
     pub threads: BTreeMap<u64, ThreadInfo>,
@@ -193,6 +209,10 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
     let console = crate::fs::lookup(b"/dev/console")?;
     let kind = Kind::Device(Device::Console);
     for (read, write) in [(true, false), (false, true), (false, true)] {
+        crate::fs::with(|fs| {
+            fs.pin(console);
+            Ok(())
+        })?;
         let file = OpenFile {
             node: console,
             kind,
@@ -243,6 +263,7 @@ pub fn spawn_in(
         brk: loaded.brk_start,
         root,
         cwd: root,
+        umask: 0o022,
         signals: SignalState::new(),
         pending: Pending::new(),
         parent: None,
@@ -280,7 +301,7 @@ pub fn current() -> Option<Arc<IrqMutex<Process>>> {
 /// copy), its clear_child_tid is not inherited and it has no children of
 /// its own.
 pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno> {
-    let (compartment, space, handles, signals, thread_signals, brk_start, brk, root, cwd) = {
+    let (compartment, space, handles, signals, thread_signals, brk_start, brk, root, cwd, umask) = {
         let process = p.lock();
         (
             process.member.compartment().clone(),
@@ -295,6 +316,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
             process.brk,
             process.root,
             process.cwd,
+            process.umask,
         )
     };
     let member = compartment.admit()?;
@@ -311,6 +333,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         brk,
         root,
         cwd,
+        umask,
         signals,
         pending: Pending::new(),
         parent: Some(Arc::downgrade(p)),

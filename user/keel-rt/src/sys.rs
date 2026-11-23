@@ -358,6 +358,138 @@ pub fn fstat(fd: i32, buf: &mut [u8; 144]) -> i64 {
     call3(nr::FSTAT, fd as u64, buf.as_mut_ptr() as u64, 0)
 }
 
+// Filesystem calls (P3-T8). Each lends the kernel only the buffers and
+// strings it is given. Numbers from Linux's syscall_64.tbl.
+
+/// newfstatat(2) into a 144-byte `struct stat`.
+pub fn fstatat(dirfd: i32, path: &CStr, buf: &mut [u8; 144], flags: u32) -> i64 {
+    call6(
+        262,
+        [
+            dirfd as u64,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            u64::from(flags),
+            0,
+            0,
+        ],
+    )
+}
+
+/// stat(2) and lstat(2).
+pub fn stat(path: &CStr, buf: &mut [u8; 144]) -> i64 {
+    call3(4, path.as_ptr() as u64, buf.as_mut_ptr() as u64, 0)
+}
+
+pub fn lstat(path: &CStr, buf: &mut [u8; 144]) -> i64 {
+    call3(6, path.as_ptr() as u64, buf.as_mut_ptr() as u64, 0)
+}
+
+pub fn lseek(fd: i32, offset: i64, whence: u32) -> i64 {
+    call3(8, fd as u64, offset as u64, u64::from(whence))
+}
+
+pub fn access(path: &CStr, mode: u32) -> i64 {
+    call3(21, path.as_ptr() as u64, u64::from(mode), 0)
+}
+
+pub fn getcwd(buf: &mut [u8]) -> i64 {
+    call3(79, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+}
+
+pub fn chdir(path: &CStr) -> i64 {
+    call3(80, path.as_ptr() as u64, 0, 0)
+}
+
+pub fn fchdir(fd: i32) -> i64 {
+    call3(81, fd as u64, 0, 0)
+}
+
+pub fn rename(old: &CStr, new: &CStr) -> i64 {
+    call3(82, old.as_ptr() as u64, new.as_ptr() as u64, 0)
+}
+
+pub fn mkdir(path: &CStr, mode: u32) -> i64 {
+    call3(83, path.as_ptr() as u64, u64::from(mode), 0)
+}
+
+pub fn rmdir(path: &CStr) -> i64 {
+    call3(84, path.as_ptr() as u64, 0, 0)
+}
+
+pub fn link(old: &CStr, new: &CStr) -> i64 {
+    call3(86, old.as_ptr() as u64, new.as_ptr() as u64, 0)
+}
+
+pub fn symlink(target: &CStr, path: &CStr) -> i64 {
+    call3(88, target.as_ptr() as u64, path.as_ptr() as u64, 0)
+}
+
+pub fn readlink(path: &CStr, buf: &mut [u8]) -> i64 {
+    call3(
+        89,
+        path.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
+pub fn chmod(path: &CStr, mode: u32) -> i64 {
+    call3(90, path.as_ptr() as u64, u64::from(mode), 0)
+}
+
+pub fn fchmod(fd: i32, mode: u32) -> i64 {
+    call3(91, fd as u64, u64::from(mode), 0)
+}
+
+pub fn umask(mask: u32) -> i64 {
+    call3(95, u64::from(mask), 0, 0)
+}
+
+pub fn getdents64(fd: i32, buf: &mut [u8]) -> i64 {
+    call3(217, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+pub fn unlinkat(dirfd: i32, path: &CStr, flags: u32) -> i64 {
+    call3(263, dirfd as u64, path.as_ptr() as u64, u64::from(flags))
+}
+
+/// renameat2(2) relative to the working directory.
+pub fn rename2(old: &CStr, new: &CStr, flags: u32) -> i64 {
+    call6(
+        316,
+        [
+            AT_FDCWD as u64,
+            old.as_ptr() as u64,
+            AT_FDCWD as u64,
+            new.as_ptr() as u64,
+            u64::from(flags),
+            0,
+        ],
+    )
+}
+
+/// utimensat(2) with two `struct timespec`s (or None: both now). `path`
+/// None passes NULL (the file open on `dirfd`).
+pub fn utimensat(
+    dirfd: i32,
+    path: Option<&CStr>,
+    times: Option<&[[i64; 2]; 2]>,
+    flags: u32,
+) -> i64 {
+    call6(
+        280,
+        [
+            dirfd as u64,
+            path.map_or(0, |p| p.as_ptr() as u64),
+            times.map_or(0, |t| t.as_ptr() as u64),
+            u64::from(flags),
+            0,
+            0,
+        ],
+    )
+}
+
 pub fn fstat_into(fd: i32, target: Hostile) -> i64 {
     call3(nr::FSTAT, fd as u64, target.0, 0)
 }

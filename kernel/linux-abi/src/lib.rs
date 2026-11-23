@@ -20,6 +20,8 @@ pub mod exec;
 #[cfg(target_os = "none")]
 pub mod fs;
 #[cfg(target_os = "none")]
+pub mod fscalls;
+#[cfg(target_os = "none")]
 pub mod futex;
 #[cfg(target_os = "none")]
 pub mod process;

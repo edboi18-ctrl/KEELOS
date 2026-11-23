@@ -120,22 +120,34 @@ pub const TMPFS_DEV: (u32, u32) = (0, 1);
 
 /// `struct stat` for x86-64: 144 bytes. Offsets: st_dev 0, st_ino 8,
 /// st_nlink 16, st_mode 24, st_uid 28, st_gid 32, __pad0 36, st_rdev 40,
-/// st_size 48, st_blksize 56, st_blocks 64, times 72..120, unused 120..144.
-/// Times are 0 until Keel has a real-time clock.
+/// st_size 48, st_blksize 56, st_blocks 64, st_atime 72, st_atime_nsec 80,
+/// st_mtime 88, st_mtime_nsec 96, st_ctime 104, st_ctime_nsec 112, unused
+/// 120..144 (`arch/x86/include/uapi/asm/stat.h`). st_blocks counts 512-byte
+/// blocks of whole pages for a regular file, as tmpfs allocates them
+/// (`BLOCKS_PER_PAGE`, `mm/shmem.c`), and 0 for anything else.
 pub fn stat_bytes(stat: &Stat) -> [u8; 144] {
     let mut out = [0u8; 144];
     let put = |out: &mut [u8; 144], at: usize, value: u64| {
         out[at..at + 8].copy_from_slice(&value.to_le_bytes());
     };
     put(&mut out, 0, encode_dev(TMPFS_DEV.0, TMPFS_DEV.1));
-    put(&mut out, 8, u64::from(stat.ino) + 1); // inode 0 is "none" to most tools
+    put(&mut out, 8, stat.ino + 1); // inode 0 is "none" to most tools
     put(&mut out, 16, u64::from(stat.nlink));
     out[24..28].copy_from_slice(&stat.mode.to_le_bytes());
     // uid and gid 0: stored and reported only (SR-6).
     put(&mut out, 40, encode_dev(stat.rdev.0, stat.rdev.1));
     put(&mut out, 48, stat.size);
     put(&mut out, 56, 4096);
-    put(&mut out, 64, stat.size.div_ceil(512));
+    let blocks = if stat.mode & keel_core::vfs::S_IFMT == keel_core::vfs::S_IFREG {
+        stat.size.div_ceil(4096) * 8
+    } else {
+        0
+    };
+    put(&mut out, 64, blocks);
+    for (at, t) in [(72, stat.atime), (88, stat.mtime), (104, stat.ctime)] {
+        put(&mut out, at, t.sec as u64);
+        put(&mut out, at + 8, u64::from(t.nsec));
+    }
     out
 }
 
@@ -227,6 +239,9 @@ mod tests {
             size: 1025,
             nlink: 1,
             rdev: (1, 9),
+            atime: keel_core::vfs::Timespec { sec: 11, nsec: 12 },
+            mtime: keel_core::vfs::Timespec { sec: 13, nsec: 14 },
+            ctime: keel_core::vfs::Timespec { sec: 15, nsec: 16 },
         };
         let b = stat_bytes(&s);
         let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
@@ -236,9 +251,11 @@ mod tests {
         assert_eq!(u64_at(40), 0x109);
         assert_eq!(u64_at(48), 1025);
         assert_eq!(u64_at(56), 4096);
-        assert_eq!(u64_at(64), 3);
+        assert_eq!(u64_at(64), 8, "one whole page");
         assert!(b[28..40].iter().all(|&x| x == 0), "uid, gid, padding");
-        assert!(b[72..].iter().all(|&x| x == 0), "times and unused");
+        let times: alloc::vec::Vec<u64> = (0..6).map(|i| u64_at(72 + i * 8)).collect();
+        assert_eq!(times, [11, 12, 13, 14, 15, 16]);
+        assert!(b[120..].iter().all(|&x| x == 0), "unused");
     }
 
     #[test]

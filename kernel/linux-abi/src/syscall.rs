@@ -78,6 +78,7 @@ type SysResult = Result<u64, Errno>;
 pub fn init() {
     keel_hal::syscall::set_handler(handle);
     keel_hal::vm::set_file_reader(read_mapped_page);
+    keel_hal::vm::set_object_hook(crate::fs::object_mapped);
     sched::set_exit_hook(process::on_thread_exit);
     crate::signal::init();
 }
@@ -115,6 +116,61 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::PREAD64 as usize] = Some(|p, a| pread64(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     t[nr::FCNTL as usize] = Some(|p, a| fcntl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
     t[nr::FTRUNCATE as usize] = Some(|p, a| ftruncate(p, a[0] as u32 as i32, a[1] as i64));
+    // Filesystem calls (P3-T8, ADR 0022), numbers from syscall_64.tbl.
+    // The plain forms are the *at forms with AT_FDCWD and flags 0, as
+    // Linux defines them.
+    {
+        use crate::fscalls as f;
+        t[4] = Some(|p, a| f::stat(p, a[0], a[1]));
+        t[6] = Some(|p, a| f::lstat(p, a[0], a[1]));
+        t[8] = Some(|p, a| f::lseek(p, a[0] as u32 as i32, a[1] as i64, a[2] as u32));
+        t[21] = Some(|p, a| f::faccessat2(p, AT_FDCWD, a[0], a[1] as u32, 0));
+        t[79] = Some(|p, a| f::getcwd(p, a[0], a[1]));
+        t[80] = Some(|p, a| f::chdir(p, a[0]));
+        t[81] = Some(|p, a| f::fchdir(p, a[0] as u32 as i32));
+        t[82] = Some(|p, a| f::renameat2(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0));
+        t[83] = Some(|p, a| f::mkdirat(p, AT_FDCWD, a[0], a[1] as u32));
+        t[84] = Some(|p, a| f::unlinkat(p, AT_FDCWD, a[0], f::AT_REMOVEDIR));
+        t[86] = Some(|p, a| f::linkat(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0));
+        t[87] = Some(|p, a| f::unlinkat(p, AT_FDCWD, a[0], 0));
+        t[88] = Some(|p, a| f::symlinkat(p, a[0], AT_FDCWD, a[1]));
+        t[89] = Some(|p, a| f::readlinkat(p, AT_FDCWD, a[0], a[1], a[2] as u32 as i32));
+        t[90] = Some(|p, a| f::fchmodat(p, AT_FDCWD, a[0], a[1] as u32));
+        t[91] = Some(|p, a| f::fchmod(p, a[0] as u32 as i32, a[1] as u32));
+        t[95] = Some(|p, a| f::umask(p, a[0] as u32));
+        t[217] = Some(|p, a| f::getdents64(p, a[0] as u32 as i32, a[1], a[2] as u32));
+        t[258] = Some(|p, a| f::mkdirat(p, a[0] as u32 as i32, a[1], a[2] as u32));
+        t[262] = Some(|p, a| f::newfstatat(p, a[0] as u32 as i32, a[1], a[2], a[3] as u32));
+        t[263] = Some(|p, a| f::unlinkat(p, a[0] as u32 as i32, a[1], a[2] as u32));
+        t[264] =
+            Some(|p, a| f::renameat2(p, a[0] as u32 as i32, a[1], a[2] as u32 as i32, a[3], 0));
+        t[265] = Some(|p, a| {
+            f::linkat(
+                p,
+                a[0] as u32 as i32,
+                a[1],
+                a[2] as u32 as i32,
+                a[3],
+                a[4] as u32,
+            )
+        });
+        t[266] = Some(|p, a| f::symlinkat(p, a[0], a[1] as u32 as i32, a[2]));
+        t[267] = Some(|p, a| f::readlinkat(p, a[0] as u32 as i32, a[1], a[2], a[3] as u32 as i32));
+        t[268] = Some(|p, a| f::fchmodat(p, a[0] as u32 as i32, a[1], a[2] as u32));
+        t[269] = Some(|p, a| f::faccessat2(p, a[0] as u32 as i32, a[1], a[2] as u32, 0));
+        t[280] = Some(|p, a| f::utimensat(p, a[0] as u32 as i32, a[1], a[2], a[3] as u32));
+        t[316] = Some(|p, a| {
+            f::renameat2(
+                p,
+                a[0] as u32 as i32,
+                a[1],
+                a[2] as u32 as i32,
+                a[3],
+                a[4] as u32,
+            )
+        });
+        t[439] = Some(|p, a| f::faccessat2(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3] as u32));
+    }
     t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
     t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
     t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
@@ -329,7 +385,7 @@ fn unimplemented(number: u64, a: &[u64; 6]) -> SysResult {
     Err(Errno::ENOSYS)
 }
 
-fn fault<T>(_: T) -> Errno {
+pub(crate) fn fault<T>(_: T) -> Errno {
     Errno::EFAULT
 }
 
@@ -356,7 +412,7 @@ pub fn rights_refusals() -> u64 {
 
 /// The open file behind `fd`, if the handle has `required`. Every system
 /// call that acts on a descriptor's object comes through here.
-fn file(
+pub(crate) fn file(
     p: &Arc<IrqMutex<Process>>,
     fd: i32,
     required: Rights,
@@ -373,7 +429,7 @@ fn file(
 
 /// Copies a NUL-terminated path from user memory, one page at a time so a
 /// string ending just before an unmapped page is still read.
-fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
+pub(crate) fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
     user_string(address, PATH_MAX, Errno::ENAMETOOLONG)
 }
 
@@ -632,15 +688,23 @@ fn read_at(
                     Some(at) => at.saturating_add(done as u64),
                     None => f.offset,
                 };
-                let n = fs::with(|fs| fs.read(f.node, from, &mut chunk[..want]))?;
+                let n = fs::with(|fs| {
+                    let n = fs.read(f.node, from, &mut chunk[..want])?;
+                    // file_accessed (relatime).
+                    fs.touch_atime(f.node);
+                    Ok(n)
+                })?;
                 // Stores through shared mappings are the newest data.
-                keel_hal::vm::shared_read(u64::from(f.node), from, &mut chunk[..n]);
+                keel_hal::vm::shared_read(f.node, from, &mut chunk[..n]);
                 if at.is_none() {
                     f.offset += n as u64;
                 }
                 n
             }
             Kind::Directory => return Err(Errno::EISDIR),
+            // A descriptor never names a symbolic link itself (open
+            // follows it, O_NOFOLLOW refuses it).
+            Kind::Symlink => return Err(Errno::EINVAL),
             // No lock held: a console read can wait for the keyboard.
             Kind::Device(device) => fs::device_read(device, &mut chunk[..want])?,
         };
@@ -671,7 +735,7 @@ fn read_at(
 
 /// Writes `count` bytes from user memory at `buf` to an open file.
 /// The tmpfs quota of the process's compartment, if it has one (P3-S4).
-fn quota_of(p: &Arc<IrqMutex<Process>>) -> Option<Arc<keel_core::compartment::Quota>> {
+pub(crate) fn quota_of(p: &Arc<IrqMutex<Process>>) -> Option<Arc<keel_core::compartment::Quota>> {
     p.lock().member.compartment().tmpfs().cloned()
 }
 
@@ -720,11 +784,7 @@ fn write_to(
                     match result {
                         Ok((n, end)) => {
                             // Shared mappings of the file see the write.
-                            keel_hal::vm::shared_write(
-                                u64::from(node),
-                                end - n as u64,
-                                &chunk[..n],
-                            );
+                            keel_hal::vm::shared_write(node, end - n as u64, &chunk[..n]);
                             f.offset = end;
                             n
                         }
@@ -733,6 +793,7 @@ fn write_to(
                         Err(_) => break,
                     }
                 }
+                Kind::Symlink => return Err(Errno::EINVAL),
                 Kind::Directory => return Err(Errno::EISDIR),
                 Kind::Device(device) => fs::device_write(device, &chunk[..want]),
             }
@@ -845,18 +906,30 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);
     let quota = quota_of(p);
+    let umask = crate::fscalls::umask_of(p);
+    // O_EXCL with O_CREAT, and O_NOFOLLOW, do not follow a symbolic link
+    // as the last component (open(2); `open_last_lookups`).
+    let follow = flags & O_NOFOLLOW == 0 && !(flags & O_CREAT != 0 && flags & O_EXCL != 0);
     let node = fs::with(|fs| {
-        let node = match fs.lookup(root, base, &path) {
+        let node = match fs.resolve(root, base, &path, follow) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(Errno::EEXIST),
             Ok(node) => node,
             Err(Errno::ENOENT) if flags & O_CREAT != 0 => {
+                // "name/" cannot be created as a file (EISDIR, as
+                // `open_last_lookups` for O_CREAT with a trailing slash).
+                if keel_core::vfs::has_trailing_slash(&path) {
+                    return Err(Errno::EISDIR);
+                }
                 let (dir, name) = fs.lookup_parent(root, base, &path)?;
-                // umask 022 until umask(2) exists.
-                fs.create_file_as(dir, name, (mode as u32) & 0o7777 & !0o022, quota.as_ref())?
+                fs.create_file_as(dir, name, (mode as u32) & 0o7777 & !umask, quota.as_ref())?
             }
             Err(error) => return Err(error),
         };
         let kind = fs.kind(node)?;
+        // O_NOFOLLOW on a symbolic link: ELOOP (open(2)).
+        if kind == Kind::Symlink {
+            return Err(Errno::ELOOP);
+        }
         if kind == Kind::Directory && (write || flags & O_CREAT != 0) {
             return Err(Errno::EISDIR);
         }
@@ -865,8 +938,11 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         }
         if kind == Kind::File && write && flags & O_TRUNC != 0 {
             fs.set_len_as(node, 0, quota.as_ref())?;
-            keel_hal::vm::shared_truncate(u64::from(node), 0);
+            keel_hal::vm::shared_truncate(node, 0);
         }
+        // The open file description holds the node (ADR 0022); pinned
+        // here, under the same lock as the lookup, so it cannot go between.
+        fs.pin(node);
         Ok((node, kind))
     })?;
     let (node, kind) = node;
@@ -974,7 +1050,7 @@ fn mmap(
         match kind {
             Kind::File => {
                 backing = Some(Backing {
-                    object: u64::from(node),
+                    object: node,
                     offset,
                     may_exec,
                     shared,
@@ -1045,7 +1121,7 @@ fn ftruncate(p: &Arc<IrqMutex<Process>>, fd: i32, length: i64) -> SysResult {
     }
     let quota = quota_of(p);
     fs::with(|fs| fs.set_len_as(node, length as u64, quota.as_ref()))?;
-    keel_hal::vm::shared_truncate(u64::from(node), length as u64);
+    keel_hal::vm::shared_truncate(node, length as u64);
     Ok(0)
 }
 

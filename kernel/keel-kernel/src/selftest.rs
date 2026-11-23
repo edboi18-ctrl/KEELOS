@@ -1920,6 +1920,7 @@ fn phase3(t: &mut Runner) {
     phase3_threads(t);
     phase3_signals(t);
     phase3_shared_mappings(t);
+    phase3_filesystem(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -1990,10 +1991,11 @@ fn phase3_signals(t: &mut Runner) {
 /// passes under Linux too (`host.sharemap`): MAP_SHARED stores reach the
 /// file and other mappings (in the process and across fork), write(2)
 /// reaches the mappings, read-only descriptors refuse writable shared
-/// mappings at mmap and mprotect, and ftruncate works as Linux's. Unlink
-/// does not exist yet, so the kernel then drops the shared pages of the
-/// files it left in /tmp (as deleting them will); every frame and process
-/// must come back.
+/// mappings at mmap and mprotect, and ftruncate works as Linux's. The
+/// program unlinks its file at the end; once its descriptors and
+/// mappings are gone the file is freed (ADR 0022), and its shared pages
+/// with it: nothing may be left in /tmp or the cache, and every frame and
+/// process must come back.
 fn phase3_shared_mappings(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/sharemap";
@@ -2006,24 +2008,60 @@ fn phase3_shared_mappings(t: &mut Runner) {
         let tmp = f.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/tmp")?;
         f.entries(tmp)
     })
-    .unwrap_or_default();
-    for (_, ino) in &left {
-        keel_hal::vm::shared_forget(u64::from(*ino));
-    }
+    .map(|e| e.len())
+    .unwrap_or(usize::MAX);
     let (frames_after, processes_after) = (outside_heap(), process::count());
     let ok = status == Some((0, None))
-        && cached > 0
-        && keel_hal::vm::shared_pages() == 0
+        && cached == 0
+        && left == 0
         && processes_after == processes
         && frames_after == frames;
     t.check(
         "exec.shared_mappings",
         ok,
-        "MAP_SHARED file mappings as on Linux: stores reach the file, other mappings and a forked child, write(2) reaches them, read-only descriptors refuse PROT_WRITE (mmap and mprotect), ftruncate grows, shrinks and zeroes; every frame back once the pages are dropped",
+        "MAP_SHARED file mappings as on Linux: stores reach the file, other mappings and a forked child, write(2) reaches them, read-only descriptors refuse PROT_WRITE (mmap and mprotect), ftruncate grows, shrinks and zeroes; the unlinked file and its shared pages are freed, every frame back",
     );
     if !ok {
         kprintln!(
-            "  sharemap: {status:?}; cached pages {cached}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+            "  sharemap: {status:?}; cached pages {cached}; left in /tmp {left}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T8 (ADR 0022): user/tests/fsprobe, which passes under Linux too
+/// (`host.fsprobe`): directories, symbolic and hard links, unlink of an
+/// open file, rmdir, rename (replace, exchange, no-replace and its
+/// refusals), getdents64, lseek, the working directory, chmod, umask,
+/// utimensat and access. Afterwards nothing is left in /tmp, and every
+/// node, frame and process is back.
+fn phase3_filesystem(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/fsprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let left = fs::with(|f| {
+        let tmp = f.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/tmp")?;
+        f.entries(tmp)
+    })
+    .map(|e| e.len())
+    .unwrap_or(usize::MAX);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && left == 0
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.filesystem",
+        ok,
+        "the filesystem calls as on Linux: mkdir, rmdir, unlink (an open file outlives its name), rename, link, symlink and readlink (ELOOP, O_NOFOLLOW), getdents64, lseek, getcwd/chdir/fchdir, chmod, umask, utimensat, access; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  fsprobe: {status:?}; left in /tmp {left}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }
@@ -2281,7 +2319,7 @@ fn phase3_file_mappings(t: &mut Runner) {
             let last = (size - 1) / 4096 * 4096;
             let map = |at, offset| {
                 let backing = Backing {
-                    object: u64::from(ino),
+                    object: ino,
                     offset,
                     may_exec: false,
                     shared: false,

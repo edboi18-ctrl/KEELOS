@@ -103,6 +103,47 @@ pub fn set_file_reader(reader: FileReader) {
     *FILE_READER.lock() = Some(reader);
 }
 
+/// Told when an address space starts (true) or stops (false) mapping a
+/// file, by `Backing::object`, so the owner of the files keeps a mapped
+/// file alive after its last name and handle are gone (ADR 0022). Called
+/// without any address-space lock held; it may take the filesystem lock.
+pub type ObjectHook = fn(object: u64, mapped: bool);
+
+static OBJECT_HOOK: IrqMutex<Option<ObjectHook>> = IrqMutex::new(None);
+
+pub fn set_object_hook(hook: ObjectHook) {
+    *OBJECT_HOOK.lock() = Some(hook);
+}
+
+/// Reports one operation's changes, netted per file (MAP_FIXED over a
+/// mapping of the same file removes and adds it in one operation, which
+/// must not look like an unmap): the hook sees a file only if the
+/// operation really started or stopped mapping it.
+fn report_objects(changes: alloc::vec::Vec<(u64, bool)>) {
+    if changes.is_empty() {
+        return;
+    }
+    let mut net: BTreeMap<u64, i64> = BTreeMap::new();
+    for (object, mapped) in changes {
+        *net.entry(object).or_insert(0) += if mapped { 1 } else { -1 };
+    }
+    let Some(hook) = *OBJECT_HOOK.lock() else {
+        return;
+    };
+    // Pins first, then unpins: nothing is freed that this operation also
+    // keeps.
+    for (&object, &n) in &net {
+        if n > 0 {
+            hook(object, true);
+        }
+    }
+    for (&object, &n) in &net {
+        if n < 0 {
+            hook(object, false);
+        }
+    }
+}
+
 /// The frames of file pages mapped MAP_SHARED (ADR 0021), by (file,
 /// page-aligned offset). Every shared mapping of a page maps this frame,
 /// so their stores are seen by each other; the cache holds one reference
@@ -398,6 +439,9 @@ impl AddressSpace {
         for (from, to) in replaced {
             self.unmap_pages(&mut inner, from, to);
         }
+        let changes = inner.layout.take_object_changes();
+        drop(inner);
+        report_objects(changes);
         Ok(start)
     }
 
@@ -407,6 +451,9 @@ impl AddressSpace {
         for (from, to) in inner.layout.unmap(start, length)? {
             self.unmap_pages(&mut inner, from, to);
         }
+        let changes = inner.layout.take_object_changes();
+        drop(inner);
+        report_objects(changes);
         Ok(())
     }
 
@@ -673,7 +720,9 @@ impl AddressSpace {
         let child = AddressSpace::new()?;
         let inner = self.inner.lock();
         let mut child_inner = child.inner.lock();
-        child_inner.layout = inner.layout.clone();
+        // The child gets the layout only once every page is copied: if the
+        // copy fails, the child is dropped with an empty layout, so it
+        // reports no file it never reported mapping.
         let mut leaves = alloc::vec::Vec::new();
         paging::walk(&mut DirectMapTables, self.root, |virt, t| {
             if virt < vm::USER_END && t.size == PageSize::Small {
@@ -727,7 +776,16 @@ impl AddressSpace {
             }
             child_inner.parked.insert(page, frame);
         }
+        child_inner.layout = inner.layout.clone();
+        // The copy maps the same files.
+        let objects: alloc::vec::Vec<(u64, bool)> = child_inner
+            .layout
+            .objects()
+            .map(|object| (object, true))
+            .collect();
         drop(child_inner);
+        drop(inner);
+        report_objects(objects);
         child.sync_user_view();
         Ok(child)
     }
@@ -779,6 +837,15 @@ pub fn live_address_spaces() -> u64 {
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        // Every file it maps is no longer mapped by it.
+        let objects: alloc::vec::Vec<(u64, bool)> = self
+            .inner
+            .lock()
+            .layout
+            .objects()
+            .map(|object| (object, false))
+            .collect();
+        report_objects(objects);
         let mut inner = self.inner.lock();
         for (_, frame) in core::mem::take(&mut inner.parked) {
             let _ = memory::release(frame);

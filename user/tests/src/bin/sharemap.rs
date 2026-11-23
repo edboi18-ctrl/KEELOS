@@ -87,8 +87,9 @@ fn main(_startup: &Startup) -> i32 {
     let fd = fd as i32;
     let status = checks(path, fd);
     sys::close(fd);
-    // Not on Keel yet (P3-T8); on Linux it keeps /tmp clean.
-    let _ = sys::unlink(path);
+    if sys::unlink(path) != 0 && status == 0 {
+        return 92;
+    }
     status
 }
 
@@ -219,7 +220,35 @@ fn checks(path: &core::ffi::CStr, fd: i32) -> i32 {
     }
 
     sys::close(read_only);
-    sys::write(1, b"sharemap: 28 checks passed\n");
+
+    // 8. A mapping keeps its file alive (mmap(2): "closing the file
+    //    descriptor does not unmap the region"): with its descriptor
+    //    closed and its name gone, pages first touched afterwards still
+    //    hold the file's bytes, private and shared alike.
+    let name = *b"/tmp/keel-sharemap-kept\0";
+    let Ok(kept) = core::ffi::CStr::from_bytes_until_nul(&name) else {
+        return 29;
+    };
+    let fd2 = sys::openat(AT_FDCWD, kept, O_RDWR | O_CREAT | O_EXCL, 0o600);
+    if fd2 < 0
+        || sys::ftruncate(fd2 as i32, (2 * PAGE) as i64) != 0
+        || !write_at(kept, PAGE + 5, b"kept")
+    {
+        return 29;
+    }
+    let private = Region::map_file_private(2 * PAGE, PROT_READ, fd2 as i32, 0);
+    let shared2 = Region::map_file_shared(2 * PAGE, PROT_READ, fd2 as i32, 0);
+    sys::close(fd2 as i32);
+    if sys::unlink(kept) != 0 {
+        return 30;
+    }
+    let (Ok(private), Ok(shared2)) = (private, shared2) else {
+        return 30;
+    };
+    if !holds(&private, PAGE + 5, b"kept") || !holds(&shared2, PAGE + 5, b"kept") {
+        return 31;
+    }
+    sys::write(1, b"sharemap: 31 checks passed\n");
     0
 }
 

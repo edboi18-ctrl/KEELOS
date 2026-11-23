@@ -170,6 +170,16 @@ pub struct Layout {
     search_from: u64,
     /// Cap on the number of VMAs (`MAX_MAP_COUNT`; lower in tests).
     map_limit: usize,
+    /// How many VMAs map each file (by `Backing::object`), so the owner
+    /// of the layout knows which files it maps: a mapping keeps its file
+    /// alive after the file's last name is gone (mmap(2): "closing the
+    /// file descriptor does not unmap the region"; unlink(2): the file
+    /// stays while "any process still has the file open"), as Linux's
+    /// `vm_file` reference does. ADR 0022.
+    objects: BTreeMap<u64, u32>,
+    /// Files this layout started mapping (true) or stopped mapping
+    /// (false) since the last [`Layout::take_object_changes`].
+    object_changes: Vec<(u64, bool)>,
 }
 
 impl Default for Layout {
@@ -179,6 +189,8 @@ impl Default for Layout {
             mmap_top: 0,
             search_from: 0,
             map_limit: MAX_MAP_COUNT,
+            objects: BTreeMap::new(),
+            object_changes: Vec::new(),
         }
     }
 }
@@ -222,6 +234,55 @@ impl Layout {
         self.vmas.len()
     }
 
+    /// Files this layout maps (each once).
+    pub fn objects(&self) -> impl Iterator<Item = u64> + '_ {
+        self.objects.keys().copied()
+    }
+
+    /// Files it began (true) or ceased (false) to map since the last call,
+    /// in order. One operation can report a file both ways (MAP_FIXED
+    /// over a mapping of the same file removes before it adds), so the
+    /// owner should net each operation's changes per file.
+    pub fn take_object_changes(&mut self) -> Vec<(u64, bool)> {
+        core::mem::take(&mut self.object_changes)
+    }
+
+    fn count_object(&mut self, vma: &Vma, up: bool) {
+        let Some(b) = vma.backing else {
+            return;
+        };
+        if up {
+            let n = self.objects.entry(b.object).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                self.object_changes.push((b.object, true));
+            }
+        } else if let Some(n) = self.objects.get_mut(&b.object) {
+            *n -= 1;
+            if *n == 0 {
+                self.objects.remove(&b.object);
+                self.object_changes.push((b.object, false));
+            }
+        }
+    }
+
+    /// Every VMA enters the table here, so `objects` stays exact.
+    fn insert_vma(&mut self, vma: Vma) {
+        // A new reference before the old one goes, so replacing a VMA by
+        // one of the same file never reports the file unmapped.
+        self.count_object(&vma, true);
+        if let Some(old) = self.vmas.insert(vma.start, vma) {
+            self.count_object(&old, false);
+        }
+    }
+
+    /// Every VMA leaves the table here.
+    fn remove_vma(&mut self, start: u64) -> Option<Vma> {
+        let old = self.vmas.remove(&start)?;
+        self.count_object(&old, false);
+        Some(old)
+    }
+
     /// How many existing VMAs `[start, end)` would cut in two: one for each
     /// end that falls strictly inside a VMA. Each cut adds a VMA.
     fn cuts(&self, start: u64, end: u64) -> usize {
@@ -260,14 +321,11 @@ impl Layout {
                 return;
             }
             if current.continues_with(&next) {
-                self.vmas.remove(&next.start);
-                self.vmas.insert(
-                    key,
-                    Vma {
-                        end: next.end,
-                        ..current
-                    },
-                );
+                self.remove_vma(next.start);
+                self.insert_vma(Vma {
+                    end: next.end,
+                    ..current
+                });
             } else {
                 key = next.start;
             }
@@ -391,15 +449,12 @@ impl Layout {
                 (start, Vec::new())
             }
         };
-        self.vmas.insert(
+        self.insert_vma(Vma {
             start,
-            Vma {
-                start,
-                end: start + length,
-                prot,
-                backing,
-            },
-        );
+            end: start + length,
+            prot,
+            backing,
+        });
         self.coalesce(start, start + length);
         Ok((start, replaced))
     }
@@ -409,20 +464,17 @@ impl Layout {
         if let Some(vma) = self.find(at)
             && vma.start < at
         {
-            self.vmas.insert(vma.start, Vma { end: at, ..vma });
+            self.insert_vma(Vma { end: at, ..vma });
             // The upper part maps the file from further in.
             let backing = vma.backing.map(|b| Backing {
                 offset: b.offset + (at - vma.start),
                 ..b
             });
-            self.vmas.insert(
-                at,
-                Vma {
-                    start: at,
-                    backing,
-                    ..vma
-                },
-            );
+            self.insert_vma(Vma {
+                start: at,
+                backing,
+                ..vma
+            });
         }
     }
 
@@ -444,7 +496,7 @@ impl Layout {
         let starts: Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
         Ok(starts
             .into_iter()
-            .filter_map(|s| self.vmas.remove(&s))
+            .filter_map(|s| self.remove_vma(s))
             .map(|v| (v.start, v.end))
             .collect())
     }
@@ -846,6 +898,44 @@ mod tests {
             shared: true,
             may_write,
         })
+    }
+
+    #[test]
+    fn layouts_know_which_files_they_map() {
+        let mut l = Layout::new();
+        l.map_backed(Placement::Fixed(0x10_0000), 0x4000, RO, file(7, 0, false))
+            .unwrap();
+        assert_eq!(l.take_object_changes(), alloc::vec![(7, true)]);
+        // Splitting (two VMAs of file 7) and merging change nothing.
+        l.protect(0x10_1000, 0x1000, RW).unwrap();
+        l.protect(0x10_1000, 0x1000, RO).unwrap();
+        assert_eq!(l.take_object_changes(), alloc::vec![]);
+        // Part of it unmapped: still mapped.
+        l.unmap(0x10_0000, 0x1000).unwrap();
+        assert_eq!(l.take_object_changes(), alloc::vec![]);
+        // Another file over the rest, with MAP_FIXED: 8 in, 7 out.
+        l.map_backed(Placement::Fixed(0x10_0000), 0x4000, RO, shared(8, 0, true))
+            .unwrap();
+        // MAP_FIXED removes first: the owner must net a batch's changes,
+        // or a file mapped again over itself would look unmapped between.
+        assert_eq!(l.take_object_changes(), alloc::vec![(7, false), (8, true)]);
+        assert_eq!(l.objects().collect::<Vec<_>>(), alloc::vec![8]);
+        l.map_backed(Placement::Fixed(0x10_0000), 0x4000, RO, shared(8, 0, true))
+            .unwrap();
+        assert_eq!(l.take_object_changes(), alloc::vec![(8, false), (8, true)]);
+        // Over part of it, the rest still maps the file: nothing changes.
+        l.map_backed(Placement::Fixed(0x10_0000), 0x1000, RO, shared(8, 0, true))
+            .unwrap();
+        assert_eq!(l.take_object_changes(), alloc::vec![]);
+        // A copy (fork) maps the same files.
+        let copy = l.clone();
+        assert_eq!(copy.objects().collect::<Vec<_>>(), alloc::vec![8]);
+        // Anonymous memory counts for nothing; unmapping all of 8 ends it.
+        l.map_backed(Placement::Fixed(0x20_0000), 0x1000, RW, None)
+            .unwrap();
+        l.unmap(0x10_0000, 0x4000).unwrap();
+        assert_eq!(l.take_object_changes(), alloc::vec![(8, false)]);
+        assert_eq!(l.objects().count(), 0);
     }
 
     #[test]

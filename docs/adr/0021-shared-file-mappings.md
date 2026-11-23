@@ -107,7 +107,7 @@ memory.
     right file offset, never copy-on-write;
   - shared and private mappings of one file stay apart.
 - **`exec.shared_mappings` (phase 3) and `host.sharemap`:**
-  `user/tests/sharemap` makes 28 checks, which pass under Linux and on
+  `user/tests/sharemap` makes 31 checks, which pass under Linux and on
   Keel:
   - `ftruncate` sizing a file in `/tmp`, and its EINVAL cases;
   - stores through a shared mapping seen by `pread`, and `write`s seen

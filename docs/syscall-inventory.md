@@ -14,25 +14,25 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 4 | `brk` | 53 | 0 | 53 | partial | `syscalls.conformance` |
 | 5 | `mmap` | 7825 | 187 | 7820 | partial (no shared anonymous) | `syscalls.conformance`, `exec.file_mappings`, `exec.shared_mappings` |
 | 6 | `mprotect` | 6646 | 0 | 6644 | partial | `syscalls.conformance` |
-| 7 | `readlink` | 5418 | 5000 | 5418 | missing |  |
+| 7 | `readlink` | 5418 | 5000 | 5418 | complete | `exec.filesystem` |
 | 8 | `open` | 1080 | 89 | 1077 | complete | `exec.file_mappings`, `exec.shared_library` |
 | 9 | `fcntl` | 1499 | 0 | 1493 | partial (F_GETFD, F_SETFD) | `exec.file_mappings` |
-| 10 | `fstat` | 2142 | 0 | 2142 | partial | `syscalls.conformance` |
+| 10 | `fstat` | 2142 | 0 | 2142 | complete | `syscalls.conformance`, `exec.filesystem` |
 | 11 | `read` | 65920 | 0 | 66407 | partial | `syscalls.conformance` |
 | 12 | `close` | 3296 | 57 | 3262 | partial | `syscalls.conformance` |
 | 13 | `rt_sigprocmask` | 62162 | 0 | 62419 | complete | `syscalls.conformance`, `exec.signals` |
 | 14 | `membarrier` | 19 | 12 | 19 | missing |  |
 | 15 | `rt_sigaction` | 161 | 0 | 161 | partial (no SA_RESTART) | `syscalls.conformance`, `exec.signals` |
 | 16 | `getuid` | 24 | 0 | 24 | missing |  |
-| 17 | `lseek` | 188 | 0 | 188 | missing |  |
+| 17 | `lseek` | 188 | 0 | 188 | complete | `exec.filesystem` |
 | 18 | `munmap` | 1999 | 11 | 2001 | partial | `syscalls.conformance` |
 | 19 | `prctl` | 33 | 0 | 33 | missing |  |
 | 20 | `prlimit64` | 71 | 0 | 71 | missing |  |
 | 21 | `userfaultfd` | 11 | 11 | 11 | missing |  |
-| 22 | `chdir` | 4 | 0 | 4 | missing |  |
-| 23 | `stat` | 2093 | 770 | 2104 | missing |  |
-| 24 | `mkdir` | 2 | 2 | 2 | missing |  |
-| 25 | `lstat` | 162 | 17 | 163 | missing |  |
+| 22 | `chdir` | 4 | 0 | 4 | complete | `exec.filesystem` |
+| 23 | `stat` | 2093 | 770 | 2104 | complete | `exec.filesystem` |
+| 24 | `mkdir` | 2 | 2 | 2 | complete | `exec.filesystem` |
+| 25 | `lstat` | 162 | 17 | 163 | complete | `exec.filesystem` |
 | 26 | `pipe2` | 166 | 0 | 157 | missing |  |
 | 27 | `clone` | 48 | 0 | 45 | partial (threads, fork-like) | `exec.threads`, `exec.thread_calls` |
 | 28 | `socketpair` | 11 | 0 | 11 | missing |  |
@@ -41,10 +41,10 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 31 | `pipe` | 17 | 0 | 17 | missing |  |
 | 32 | `fork` | 25 | 0 | 25 | complete | `exec.fork_wait`, `compartment.fork_bomb` |
 | 33 | `setsid` | 10 | 0 | 10 | missing |  |
-| 34 | `unlink` | 9 | 1 | 9 | missing |  |
+| 34 | `unlink` | 9 | 1 | 9 | complete | `exec.filesystem` |
 | 35 | `socket` | 8 | 0 | 8 | missing |  |
 | 36 | `bind` | 2 | 0 | 2 | missing |  |
-| 37 | `chmod` | 1 | 0 | 1 | missing |  |
+| 37 | `chmod` | 1 | 0 | 1 | complete | `exec.filesystem` |
 | 38 | `listen` | 1 | 0 | 1 | missing |  |
 | 39 | `epoll_create1` | 1 | 0 | 1 | missing |  |
 | 40 | `epoll_ctl` | 155 | 0 | 149 | missing |  |
@@ -54,7 +54,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 44 | `wait4` | 13 | 0 | 13 | partial (no process groups) | `exec.fork_wait` |
 | 45 | `setsockopt` | 22 | 0 | 22 | missing |  |
 | 46 | `connect` | 1 | 0 | 1 | missing |  |
-| 47 | `fchdir` | 75 | 0 | 75 | missing |  |
+| 47 | `fchdir` | 75 | 0 | 75 | complete | `exec.filesystem` |
 | 48 | `fstatfs` | 242 | 0 | 232 | missing |  |
 | 49 | `pread64` | 2845 | 23 | 2835 | complete | `exec.file_mappings` |
 | 50 | `pwritev2` | 3 | 0 | 3 | missing |  |
@@ -69,14 +69,14 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 59 | `gettid` | 58 | 0 | 55 | complete | `exec.thread_calls` |
 | 60 | `sched_getaffinity` | 12 | 0 | 12 | missing |  |
 | 61 | `writev` | 19573 | 0 | 19734 | partial | `syscalls.conformance` |
-| 62 | `umask` | 22 | 0 | 22 | missing |  |
-| 63 | `getcwd` | 1 | 0 | 1 | missing |  |
+| 62 | `umask` | 22 | 0 | 22 | complete | `exec.filesystem` |
+| 63 | `getcwd` | 1 | 0 | 1 | complete | `exec.filesystem` |
 | 64 | `sysinfo` | 19 | 0 | 19 | missing |  |
 | 65 | `dup` | 401 | 0 | 400 | missing |  |
 | 66 | `ioctl` | 404 | 189 | 404 | partial | `syscalls.conformance` |
 | 67 | `sched_setaffinity` | 57 | 0 | 54 | missing |  |
 | 68 | `uname` | 12 | 0 | 12 | missing |  |
-| 69 | `getdents64` | 1926 | 0 | 1926 | missing |  |
+| 69 | `getdents64` | 1926 | 0 | 1926 | complete | `exec.filesystem` |
 | 70 | `getxattr` | 276 | 276 | 276 | missing |  |
 | 71 | `fgetxattr` | 8 | 8 | 8 | missing |  |
 | 72 | `clock_getres` | 11 | 0 | 11 | missing |  |
@@ -87,14 +87,14 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 77 | `openat` | 666 | 0 | 666 | partial | `syscalls.conformance` |
 | 78 | `getrandom` | 13 | 0 | 13 | partial | `syscalls.conformance` |
 | 79 | `futex` | 528 | 29 | 585 | partial (wait, wake, requeue) | `exec.threads`, `exec.thread_calls` |
-| 80 | `access` | 4 | 4 | 4 | missing |  |
+| 80 | `access` | 4 | 4 | 4 | complete | `exec.filesystem` |
 | 81 | `exit` | 43 | 0 |  | partial | `syscalls.conformance` |
 | 82 | `sendto` | 2 | 0 | 2 | missing |  |
 | 83 | `recvfrom` | 5 | 0 | 5 | missing |  |
 | 84 | `kill` | 11 | 11 | 11 | partial (no process groups) | `exec.thread_calls`, `exec.signals` |
 | 85 | `tgkill` | 10 | 0 | 13 | complete | `exec.signals` |
 | 86 | `rt_sigreturn` | 1 | 0 | 2 | complete | `exec.signals` |
-| 87 | `rename` | 3 | 0 | 3 | missing |  |
+| 87 | `rename` | 3 | 0 | 3 | complete | `exec.filesystem` |
 
 ## `clone` flag combinations
 
