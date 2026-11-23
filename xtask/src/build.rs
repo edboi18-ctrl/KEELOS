@@ -233,6 +233,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: false,
     },
     TestProgram {
+        path: "test/threadprobe",
+        binary: "threadprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/nap",
         binary: "nap",
         args: &["10"],
@@ -327,6 +335,15 @@ pub const TEST_FIXTURES: &[TestFixture] = &[
         file: "fixtures/musl-dynamic/greet",
         hash_file: "fixtures/musl-dynamic/greet.sha256",
         stdout: Some("Hello from a musl shared library on Keel (count 3)\n"),
+        host_via: Some("lib/ld-musl-x86_64.so.1"),
+    },
+    // P3-T4: POSIX threads on musl (mutex, condition variable, TLS,
+    // join, and exit_group ending a blocked and a spinning thread).
+    TestFixture {
+        path: "test/musl-threads",
+        file: "fixtures/musl-dynamic/threads",
+        hash_file: "fixtures/musl-dynamic/threads.sha256",
+        stdout: Some("threads: 4 workers, counter 40000, results 100, thread-local values kept\n"),
         host_via: Some("lib/ld-musl-x86_64.so.1"),
     },
     TestFixture {

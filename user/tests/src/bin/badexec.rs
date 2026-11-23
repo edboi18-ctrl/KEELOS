@@ -9,7 +9,8 @@
 //! first page, and an executable second page of NOPs ending in exit(0),
 //! so a damaged entry point that still lands in it just exits. Damage:
 //! one to four of random bytes in the headers, boundary values in header
-//! fields, random bytes anywhere, and truncation. Prints a summary line.
+//! fields, random bytes anywhere, and truncation. A program that is still
+//! running after 3 s is killed. Prints a summary line.
 //! Keel only (it writes /hostile at the root of its tree).
 #![no_std]
 #![no_main]
@@ -118,7 +119,8 @@ fn write_file(bytes: &[u8]) -> bool {
 }
 
 /// Runs /hostile in a child; returns its wait status, or None if it was
-/// still running after about 3 s (left running; not waited for).
+/// still running after about 3 s (a damaged program can loop: it is
+/// killed with SIGKILL and reaped).
 fn run_child() -> Option<i32> {
     let pid = sys::fork();
     if pid == 0 {
@@ -137,6 +139,8 @@ fn run_child() -> Option<i32> {
         let mut ignored = [[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]];
         sys::poll(&mut ignored, 10);
     }
+    sys::kill(pid as i32, 9);
+    sys::wait4(pid as i32, &mut status, 0);
     None
 }
 
@@ -175,15 +179,12 @@ fn main(startup: &Startup) -> i32 {
             Some(_) => ran += 1,
             None => stuck += 1,
         }
-        if stuck > 2 {
-            break;
-        }
     }
     sys::write_number(b"badexec: refused ", refused, b"");
     sys::write_number(b", ran ", ran, b"");
     sys::write_number(b", faulted ", faulted, b"");
-    sys::write_number(b", stuck ", stuck, b"\n");
-    i32::from(stuck != 0) * 4
+    sys::write_number(b", looped and were killed ", stuck, b"\n");
+    0
 }
 
 keel_rt::main!(main);

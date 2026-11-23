@@ -31,7 +31,11 @@ pub mod nr {
     pub const FCNTL: u64 = 72;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
+    pub const CLONE: u64 = 56;
     pub const FORK: u64 = 57;
+    pub const KILL: u64 = 62;
+    pub const GETTID: u64 = 186;
+    pub const FUTEX: u64 = 202;
     pub const EXECVE: u64 = 59;
     pub const WAIT4: u64 = 61;
     pub const GETPPID: u64 = 110;
@@ -172,6 +176,83 @@ pub fn wait4(pid: i32, status: &mut i32, options: u32) -> i64 {
             0,
             0,
             0,
+        ],
+    )
+}
+
+/// kill(2).
+pub fn kill(pid: i32, signal: i32) -> i64 {
+    call3(nr::KILL, pid as u32 as u64, signal as u32 as u64, 0)
+}
+
+/// gettid(2).
+pub fn gettid() -> i64 {
+    call3(nr::GETTID, 0, 0, 0)
+}
+
+/// clone(2) with flags that are refused before anything is created (the
+/// kernel checks them first), for testing those refusals. Any other use
+/// would start a thread on this program's stack: not offered.
+pub fn clone_refused(flags: u64) -> i64 {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    let thread_without_sighand = flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0;
+    let sighand_without_vm = flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0;
+    if !(thread_without_sighand || sighand_without_vm) {
+        return -22;
+    }
+    call6(nr::CLONE, [flags, 0, 0, 0, 0, 0])
+}
+
+/// futex(2) on `word`, a u32 this program owns. `timeout` is a relative
+/// timespec (seconds, nanoseconds) for FUTEX_WAIT.
+pub fn futex(
+    word: &core::sync::atomic::AtomicU32,
+    op: u32,
+    val: u32,
+    timeout: Option<&[i64; 2]>,
+) -> i64 {
+    let timeout = timeout.map_or(0, |t| t.as_ptr() as u64);
+    call6(
+        nr::FUTEX,
+        [
+            word.as_ptr() as u64,
+            u64::from(op),
+            u64::from(val),
+            timeout,
+            0,
+            0,
+        ],
+    )
+}
+
+/// futex(2) with an address that is not 4-byte aligned (EINVAL), inside
+/// `buf`.
+pub fn futex_misaligned(buf: &[u8; 8], op: u32) -> i64 {
+    call6(
+        nr::FUTEX,
+        [buf.as_ptr() as u64 + 1, u64::from(op), 0, 0, 0, 0],
+    )
+}
+
+/// FUTEX_CMP_REQUEUE from `from` to `to` (both this program's).
+pub fn futex_cmp_requeue(
+    from: &core::sync::atomic::AtomicU32,
+    to: &core::sync::atomic::AtomicU32,
+    wake: u32,
+    requeue: u32,
+    expected: u32,
+) -> i64 {
+    call6(
+        nr::FUTEX,
+        [
+            from.as_ptr() as u64,
+            4 | 128,
+            u64::from(wake),
+            u64::from(requeue),
+            to.as_ptr() as u64,
+            u64::from(expected),
         ],
     )
 }

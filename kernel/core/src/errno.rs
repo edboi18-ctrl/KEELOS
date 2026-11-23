@@ -10,6 +10,7 @@ pub enum Errno {
     EPERM = 1,
     ENOENT = 2,
     ESRCH = 3,
+    EINTR = 4,
     EIO = 5,
     E2BIG = 7,
     ENOEXEC = 8,
@@ -34,6 +35,7 @@ pub enum Errno {
     ENOTEMPTY = 39,
     ELOOP = 40,
     ELIBBAD = 80,
+    ETIMEDOUT = 110,
 }
 
 impl Errno {

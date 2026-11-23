@@ -115,3 +115,8 @@ bench = false
 name = "badexec"
 test = false
 bench = false
+
+[[bin]]
+name = "threadprobe"
+test = false
+bench = false

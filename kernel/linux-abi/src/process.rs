@@ -78,9 +78,15 @@ pub struct Process {
     /// Lookups never leave `root`: the compartment's root (SR-4).
     pub root: Ino,
     pub cwd: Ino,
-    /// set_tid_address(2): where the TID is cleared at thread exit (used
-    /// with futexes once threads exist; stored only for now).
-    pub clear_child_tid: u64,
+    /// Its threads, by scheduler thread id (P3-T4). The first is the one
+    /// it started with, whose TID is the PID.
+    pub threads: BTreeMap<u64, ThreadInfo>,
+    /// exit_group's status, once a thread has called it: the process's
+    /// exit status, whatever its other threads end with.
+    pub group_exit: Option<i64>,
+    /// The signal that is ending it (SIGKILL, or a fault in one of its
+    /// threads), for the wait status.
+    pub killed_by: Option<i32>,
     /// Signal dispositions, blocked mask and alternate stack, recorded
     /// only until delivery arrives (P3-T6).
     pub signals: SignalState,
@@ -89,6 +95,31 @@ pub struct Process {
     pub parent: Option<Weak<IrqMutex<Process>>>,
     /// Children not yet reaped by wait4, alive or exited (zombies).
     pub children: Vec<Child>,
+}
+
+/// One thread of a process.
+pub struct ThreadInfo {
+    /// Its thread ID (gettid): the PID for the first thread, the next PID
+    /// of the compartment for one created by clone.
+    pub tid: u32,
+    /// The compartment slot of a thread created by clone, held until the
+    /// thread exits (threads count
+    /// against the process limit, as Linux counts them against
+    /// RLIMIT_NPROC). The first thread uses the process's own.
+    _slot: Option<Member>,
+    /// set_tid_address(2) and CLONE_CHILD_CLEARTID: at exit, 0 is written
+    /// there and one waiter woken (Linux's mm_release, `kernel/fork.c`).
+    pub clear_child_tid: u64,
+}
+
+impl ThreadInfo {
+    fn first(tid: u32) -> ThreadInfo {
+        ThreadInfo {
+            tid,
+            _slot: None,
+            clear_child_tid: 0,
+        }
+    }
 }
 
 /// A child, as its parent sees it. An exited child (a zombie) keeps its
@@ -105,18 +136,6 @@ pub struct Child {
 
 /// Woken whenever a process exits, for wait4.
 static CHILD_EXITS: sched::WaitQueue = sched::WaitQueue::new();
-
-/// The wait status of an exit, as Linux encodes it (`kernel/exit.c` at
-/// v6.12): `(code & 0xff) << 8` for exit(2) and exit_group(2); the signal
-/// number for death by a signal. Keel records a fault's status as 128 +
-/// the signal Linux would send (`hal::syscall::status_for`), so that is
-/// turned back into the signal.
-pub fn wait_status(status: i64, fault: Option<sched::UserFault>) -> i32 {
-    match fault {
-        Some(_) => ((status - 128) & 0x7f) as i32,
-        None => ((status & 0xff) << 8) as i32,
-    }
-}
 
 /// Processes by thread ID.
 static PROCESSES: IrqMutex<BTreeMap<u64, Arc<IrqMutex<Process>>>> = IrqMutex::new(BTreeMap::new());
@@ -206,15 +225,19 @@ pub fn spawn_in(
         brk: loaded.brk_start,
         root,
         cwd: root,
-        clear_child_tid: 0,
         signals: SignalState::new(),
         parent: None,
         children: Vec::new(),
+        threads: BTreeMap::new(),
+        group_exit: None,
+        killed_by: None,
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.
     let thread = sched::spawn_user(name, loaded.space.clone(), loaded.entry, loaded.rsp, 0)
         .map_err(|_| Errno::ENOMEM)?;
+    let mut process = process;
+    process.threads.insert(thread.0, ThreadInfo::first(pid));
     processes.insert(thread.0, Arc::new(IrqMutex::new(process)));
     Ok(Spawned { pid, thread })
 }
@@ -232,8 +255,9 @@ pub fn current() -> Option<Arc<IrqMutex<Process>>> {
 /// mask and alternate stack, program break, root and working directory.
 /// Its thread starts with the caller's registers, FS/GS bases and FPU
 /// state, except RAX = 0: fork returns 0 in the child and the child's PID
-/// in the parent. As fork(2), the child's clear_child_tid is not
-/// inherited and it has no children of its own.
+/// in the parent. As fork(2), the child has one thread (the caller's
+/// copy), its clear_child_tid is not inherited and it has no children of
+/// its own.
 pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno> {
     let (compartment, space, handles, signals, brk_start, brk, root, cwd) = {
         let process = p.lock();
@@ -262,10 +286,12 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         brk,
         root,
         cwd,
-        clear_child_tid: 0,
         signals,
         parent: Some(Arc::downgrade(p)),
         children: Vec::new(),
+        threads: BTreeMap::new(),
+        group_exit: None,
+        killed_by: None,
     }));
     let mut registers = *frame;
     registers.rax = 0;
@@ -274,7 +300,11 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
     // parent knows it.
     let mut processes = PROCESSES.lock();
     let thread =
-        sched::spawn_user_copy("fork", child_space, registers).map_err(|_| Errno::ENOMEM)?;
+        sched::spawn_user_copy("fork", child_space, registers, None).map_err(|_| Errno::ENOMEM)?;
+    child
+        .lock()
+        .threads
+        .insert(thread.0, ThreadInfo::first(pid));
     processes.insert(thread.0, child.clone());
     p.lock().children.push(Child {
         process: child,
@@ -284,26 +314,216 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
     Ok(u64::from(pid))
 }
 
-/// Exit hook: the process is gone from the running set. Its handles,
-/// address space and own children's records are dropped (closing its
-/// files; orphaned zombies give their slots back). Its parent, if it is
-/// still there, records the wait status in the child's entry and is
-/// woken; without a parent the process is dropped whole. The address
-/// space lives until the thread itself is reaped.
+/// Linux's clone flags (`include/uapi/linux/sched.h` at v6.12).
+pub mod clone_flags {
+    pub const CSIGNAL: u64 = 0xff;
+    pub const CLONE_VM: u64 = 0x100;
+    pub const CLONE_FS: u64 = 0x200;
+    pub const CLONE_FILES: u64 = 0x400;
+    pub const CLONE_SIGHAND: u64 = 0x800;
+    pub const CLONE_THREAD: u64 = 0x1_0000;
+    pub const CLONE_SYSVSEM: u64 = 0x4_0000;
+    pub const CLONE_SETTLS: u64 = 0x8_0000;
+    pub const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    pub const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    pub const CLONE_DETACHED: u64 = 0x40_0000;
+    pub const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+}
+
+/// clone(2) for a new thread in the caller's process (P3-T4): the flags
+/// musl's pthread_create passes, and the Wine trace shows
+/// (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+/// CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID |
+/// CLONE_CHILD_CLEARTID, and CLONE_DETACHED, which Linux ignores), or
+/// fewer of the optional ones. The thread takes a slot of the compartment
+/// (EAGAIN), and its TID is the compartment's next PID. It starts with the
+/// caller's registers except RAX = 0 and RSP = `stack` (if not 0), the
+/// caller's FS/GS bases (FS = `tls` with CLONE_SETTLS; outside the user
+/// half EPERM, as arch_prctl) and FPU state. CLONE_PARENT_SETTID and
+/// CLONE_CHILD_SETTID write the TID to `parent_tid` and `child_tid`
+/// (the same memory); CLONE_CHILD_CLEARTID makes `child_tid` its
+/// clear_child_tid. Returns the TID.
+pub fn clone_thread(
+    p: &Arc<IrqMutex<Process>>,
+    frame: &TrapFrame,
+    flags: u64,
+    stack: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    tls: u64,
+) -> Result<u64, Errno> {
+    use clone_flags::*;
+    let fs_base = if flags & CLONE_SETTLS != 0 {
+        if tls >= keel_core::vm::USER_END {
+            return Err(Errno::EPERM);
+        }
+        Some(tls)
+    } else {
+        None
+    };
+    let (compartment, space) = {
+        let process = p.lock();
+        (process.member.compartment().clone(), process.space()?)
+    };
+    let member = compartment.admit()?;
+    let tid = member.pid();
+    for (flag, address) in [
+        (CLONE_PARENT_SETTID, parent_tid),
+        (CLONE_CHILD_SETTID, child_tid),
+    ] {
+        if flags & flag != 0 {
+            keel_hal::vm::copy_to_user(address, &tid.to_le_bytes()).map_err(|_| Errno::EFAULT)?;
+        }
+    }
+    let mut registers = *frame;
+    registers.rax = 0;
+    if stack != 0 {
+        registers.rsp = stack;
+    }
+    let mut processes = PROCESSES.lock();
+    let thread =
+        sched::spawn_user_copy("thread", space, registers, fs_base).map_err(|_| Errno::ENOMEM)?;
+    p.lock().threads.insert(
+        thread.0,
+        ThreadInfo {
+            tid,
+            _slot: Some(member),
+            clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 {
+                child_tid
+            } else {
+                0
+            },
+        },
+    );
+    processes.insert(thread.0, p.clone());
+    Ok(u64::from(tid))
+}
+
+/// exit_group(2): the process ends with `code` (its wait status), and
+/// every other thread of it is asked to end (`sched::request_exit`). The
+/// caller ends here. It takes the process by value and drops it first: a
+/// thread that ends never unwinds, so a reference kept on its stack would
+/// keep the process (and its compartment slot) alive for ever.
+pub fn exit_group(p: Arc<IrqMutex<Process>>, code: i64) -> ! {
+    let others: Vec<u64> = {
+        let mut process = p.lock();
+        process.group_exit.get_or_insert(code);
+        let me = sched::current().0;
+        process
+            .threads
+            .keys()
+            .copied()
+            .filter(|&t| t != me)
+            .collect()
+    };
+    drop(p);
+    for thread in others {
+        sched::request_exit(ThreadId(thread), code);
+    }
+    sched::exit_with(code)
+}
+
+/// The process in the caller's compartment with PID `pid`, if it is
+/// running.
+fn find(compartment: &Arc<Compartment>, pid: u32) -> Option<Arc<IrqMutex<Process>>> {
+    PROCESSES
+        .lock()
+        .values()
+        .find(|p| {
+            let p = p.lock();
+            p.pid() == pid && Arc::ptr_eq(p.member.compartment(), compartment)
+        })
+        .cloned()
+}
+
+/// kill(2), until signals are delivered (P3-T6): signal 0 checks that the
+/// process exists, SIGKILL ends all its threads (wait status: signal 9).
+/// A PID names a process only in the caller's compartment (ESRCH
+/// otherwise). Other signals are EINVAL for now, and process groups (PID
+/// 0 or negative) ESRCH: Linux would deliver them.
+pub fn kill(p: &Arc<IrqMutex<Process>>, pid: i32, signal: i32) -> Result<u64, Errno> {
+    const SIGKILL: i32 = 9;
+    if !(0..=64).contains(&signal) {
+        return Err(Errno::EINVAL);
+    }
+    if pid <= 0 {
+        return Err(Errno::ESRCH);
+    }
+    let compartment = p.lock().member.compartment().clone();
+    let target = find(&compartment, pid as u32).ok_or(Errno::ESRCH)?;
+    match signal {
+        0 => Ok(0),
+        SIGKILL => {
+            let threads: Vec<u64> = {
+                let mut t = target.lock();
+                t.killed_by.get_or_insert(SIGKILL);
+                t.threads.keys().copied().collect()
+            };
+            for thread in threads {
+                sched::request_exit(ThreadId(thread), 128 + i64::from(SIGKILL));
+            }
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Exit hook, for every thread of a process. The thread leaves its
+/// process: its clear_child_tid gets 0 and one futex waiter is woken
+/// (only if other threads still share the memory, as Linux's mm_release),
+/// and its compartment slot is given back. A thread ended by a fault ends
+/// the whole process, as a fault's signal does on Linux. When the last
+/// thread goes, the process exits: its handles, address space and own
+/// children's records are dropped, and the wait status (the exit_group
+/// code, or the last thread's; or the signal) goes to the parent's
+/// record, if the parent is still there.
 pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFault>) {
     let Some(process) = PROCESSES.lock().remove(&thread.0) else {
         return;
     };
-    let (handles, space, children, parent) = {
+    crate::futex::forget(thread);
+    let (info, others, space) = {
+        let mut p = process.lock();
+        if fault.is_some() {
+            p.killed_by.get_or_insert(((status - 128) & 0x7f) as i32);
+        }
+        let info = p.threads.remove(&thread.0);
+        let others: Vec<u64> = p.threads.keys().copied().collect();
+        (info, others, p.space.clone())
+    };
+    if let (Some(info), Some(space)) = (&info, &space)
+        && info.clear_child_tid != 0
+        && !others.is_empty()
+    {
+        // The exiting thread is still running in this address space.
+        let _ = keel_hal::vm::copy_to_user(info.clear_child_tid, &0u32.to_le_bytes());
+        crate::futex::wake(space.id(), info.clear_child_tid, 1);
+    }
+    drop(info);
+    if !others.is_empty() {
+        if fault.is_some() {
+            for other in others {
+                sched::request_exit(ThreadId(other), status);
+            }
+        }
+        return;
+    }
+    let (handles, space, children, parent, code, signal) = {
         let mut p = process.lock();
         (
             core::mem::replace(&mut p.handles, HandleTable::new(0)),
             p.space.take(),
             core::mem::take(&mut p.children),
             p.parent.clone(),
+            p.group_exit.unwrap_or(status),
+            p.killed_by,
         )
     };
     drop((handles, space, children));
+    let wait_status = match signal {
+        Some(signal) => signal & 0x7f,
+        None => ((code & 0xff) << 8) as i32,
+    };
     if let Some(parent) = parent.as_ref().and_then(Weak::upgrade) {
         let mut parent = parent.lock();
         if let Some(child) = parent
@@ -311,10 +531,34 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
             .iter_mut()
             .find(|c| Arc::ptr_eq(&c.process, &process))
         {
-            child.status = Some(wait_status(status, fault));
+            child.status = Some(wait_status);
         }
     }
     CHILD_EXITS.wake_all();
+}
+
+/// The TID of the running thread (gettid), and its clear_child_tid slot.
+pub fn with_current_thread<R>(
+    p: &Arc<IrqMutex<Process>>,
+    f: impl FnOnce(&mut ThreadInfo) -> R,
+) -> Option<R> {
+    p.lock().threads.get_mut(&sched::current().0).map(f)
+}
+
+/// Asks every thread of `p` but the running one to end (execve replaces
+/// the program; Linux's de_thread). They leave as they exit.
+pub fn end_other_threads(p: &Arc<IrqMutex<Process>>) {
+    let me = sched::current().0;
+    let others: Vec<u64> = p
+        .lock()
+        .threads
+        .keys()
+        .copied()
+        .filter(|&t| t != me)
+        .collect();
+    for thread in others {
+        sched::request_exit(ThreadId(thread), 0);
+    }
 }
 
 /// What wait4 is waiting for: a child with this PID, or any child.

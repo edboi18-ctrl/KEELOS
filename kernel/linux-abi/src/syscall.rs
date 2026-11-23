@@ -46,7 +46,11 @@ pub mod nr {
     pub const PREAD64: u64 = 17;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
+    pub const CLONE: u64 = 56;
     pub const FORK: u64 = 57;
+    pub const KILL: u64 = 62;
+    pub const GETTID: u64 = 186;
+    pub const FUTEX: u64 = 202;
     pub const EXECVE: u64 = 59;
     pub const WAIT4: u64 = 61;
     pub const GETPPID: u64 = 110;
@@ -108,6 +112,21 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
     t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
     t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
+    t[nr::GETTID as usize] =
+        Some(|p, _| process::with_current_thread(p, |t| u64::from(t.tid)).ok_or(Errno::ESRCH));
+    t[nr::KILL as usize] = Some(|p, a| process::kill(p, a[0] as u32 as i32, a[1] as u32 as i32));
+    t[nr::FUTEX as usize] = Some(|p, a| {
+        let space = p.lock().space()?.id();
+        crate::futex::futex(
+            space,
+            a[0],
+            a[1] as u32,
+            a[2] as u32,
+            a[3],
+            a[4],
+            a[5] as u32,
+        )
+    });
     t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
     t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
     t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
@@ -206,7 +225,16 @@ fn dispatch(call: &SyscallArgs) -> i64 {
     let a = call.args;
     let number = call.number;
     let result: SysResult = match number {
-        nr::EXIT | nr::EXIT_GROUP => sched::exit_with((a[0] & 0xff) as i64),
+        // exit ends the calling thread; exit_group the whole process.
+        nr::EXIT => sched::exit_with((a[0] & 0xff) as i64),
+        nr::EXIT_GROUP => match process::current() {
+            Some(p) => process::exit_group(p, (a[0] & 0xff) as i64),
+            None => sched::exit_with((a[0] & 0xff) as i64),
+        },
+        nr::CLONE => match process::current() {
+            Some(p) => clone(&p, &call.frame, a),
+            None => unimplemented(number, &a),
+        },
         // Outside the table: it also needs the caller's stack pointer.
         // fork needs the caller's registers, which the table's handlers
         // do not get.
@@ -476,13 +504,17 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
         .attach_budget(compartment.memory().clone())
         .map_err(|_| Errno::ENOMEM)?;
 
-    // No failure past this point: the old program is gone.
+    // No failure past this point: the old program is gone. Its other
+    // threads end (Linux's de_thread); they leave as they exit.
+    process::end_other_threads(p);
     let (old_space, closed) = {
         let mut process = p.lock();
         let old = process.space.replace(loaded.space.clone());
         process.brk_start = loaded.brk_start;
         process.brk = loaded.brk_start;
-        process.clear_child_tid = 0;
+        if let Some(t) = process.threads.get_mut(&sched::current().0) {
+            t.clear_child_tid = 0;
+        }
         process.signals.reset_for_exec();
         (old, process.handles.take_close_on_exec())
     };
@@ -495,8 +527,10 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
     if switched.is_err() {
         // Past the point of no return there is nothing to return to: as
         // Linux's bprm_execve (force_fatal_sig(SIGSEGV), `fs/exec.c`), the
-        // thread ends as if by SIGSEGV.
-        sched::exit_with(128 + 11);
+        // process ends as if by SIGSEGV. Asked, not done here: the return
+        // path ends the thread after this call's references are dropped.
+        p.lock().killed_by.get_or_insert(11);
+        sched::request_exit(sched::current(), 128 + 11);
     }
     Ok(0)
 }
@@ -1031,11 +1065,58 @@ fn arch_prctl(code: u64, address: u64) -> SysResult {
     Ok(0)
 }
 
+/// set_tid_address(2): the calling thread's clear_child_tid; returns its
+/// TID (Linux's task_pid_vnr, `kernel/fork.c`).
 fn set_tid_address(p: &Arc<IrqMutex<Process>>, address: u64) -> u64 {
-    let mut process = p.lock();
-    process.clear_child_tid = address;
-    // One thread per process: its TID is the PID.
-    u64::from(process.pid())
+    process::with_current_thread(p, |t| {
+        t.clear_child_tid = address;
+        u64::from(t.tid)
+    })
+    .unwrap_or(0)
+}
+
+/// clone(2), x86-64 argument order (flags, stack, parent_tid, child_tid,
+/// tls: `kernel/fork.c`, no CLONE_BACKWARDS on x86-64). As copy_process:
+/// CLONE_THREAD needs CLONE_SIGHAND and CLONE_SIGHAND needs CLONE_VM
+/// (EINVAL). Without CLONE_VM it is fork (the exit signal in the low byte
+/// is ignored: nothing is delivered yet), with the child on `stack` if
+/// given. With CLONE_VM: a thread, if the flags are within the set
+/// `process::clone_thread` supports; anything else (vfork's CLONE_VFORK,
+/// CLONE_VM without CLONE_THREAD, namespaces, ...) is EINVAL for now.
+fn clone(
+    p: &Arc<IrqMutex<Process>>,
+    frame: &keel_hal::arch::x86_64::idt::TrapFrame,
+    a: [u64; 6],
+) -> SysResult {
+    use process::clone_flags::*;
+    let (flags, stack, parent_tid, child_tid, tls) = (a[0] & 0xffff_ffff, a[1], a[2], a[3], a[4]);
+    let flags = flags & !CSIGNAL;
+    if (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
+        || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_VM == 0 {
+        if flags & !CLONE_DETACHED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut registers = *frame;
+        if stack != 0 {
+            registers.rsp = stack;
+        }
+        return process::fork(p, &registers);
+    }
+    const THREAD: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    const OPTIONAL: u64 = CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID
+        | CLONE_DETACHED;
+    if flags & THREAD != THREAD || flags & !(THREAD | OPTIONAL) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    process::clone_thread(p, frame, flags, stack, parent_tid, child_tid, tls)
 }
 
 fn clock_gettime(clock: u64, buf: u64) -> SysResult {

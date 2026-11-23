@@ -1917,6 +1917,44 @@ fn phase3(t: &mut Runner) {
     phase3_shared_frame_limit(t);
     phase3_hostile_executables(t);
     phase3_exit_status_order(t);
+    phase3_threads(t);
+    const THREAD_PROBE: &[u8] = b"/test/threadprobe";
+    let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
+    t.check(
+        "exec.thread_calls",
+        status == Some((0, None)),
+        "clone flag refusals, gettid, kill (0, ESRCH, SIGKILL ending a waiting child) and futex errors (EAGAIN, EINVAL, ETIMEDOUT, ENOSYS) as Linux",
+    );
+    if status != Some((0, None)) {
+        kprintln!("  threadprobe: {status:?}");
+    }
+}
+
+/// P3-T4: POSIX threads on musl (fixtures/musl-dynamic/threads): clone
+/// with musl's thread flags, futex contention, condition variables, TLS,
+/// pthread_join, and exit_group ending a thread blocked in a futex wait and
+/// one spinning in user mode. Its line is checked on serial.
+fn phase3_threads(t: &mut Runner) {
+    use keel_linux_abi::process;
+    const PROGRAM: &[u8] = b"/test/musl-threads";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let (frames, processes) = (outside_heap(), process::count());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    // The two left-behind threads end at exit_group; give them a moment
+    // to be scheduled and reaped.
+    sched::sleep_ms(50);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = status == Some((0, None)) && processes_after == processes && frames_after == frames;
+    t.check(
+        "exec.threads",
+        ok,
+        "POSIX threads on musl: 4 workers contend on a mutex, wait on a condition variable, keep thread-local values and are joined; exit_group ends a blocked and a spinning thread; nothing left over",
+    );
+    if !ok {
+        kprintln!(
+            "  threads: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
 }
 
 /// The scheduler keeps the last 1024 exit statuses. A thread whose 1100
@@ -2109,9 +2147,12 @@ fn phase3_fork(t: &mut Runner) {
 /// under Linux too (`host.execprobe`).
 fn phase3_execve(t: &mut Runner) {
     const PROGRAM: &[u8] = b"/test/execprobe";
-    let before = memory::free_frames();
+    // Frames outside the kernel heap, which may keep a page for the
+    // tables a run grows (as in exec.fork_wait).
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let before = outside_heap();
     let status = run_test_program(PROGRAM, &[PROGRAM]);
-    let after = memory::free_frames();
+    let after = outside_heap();
     let ok = status == Some((0, None)) && after == before;
     t.check(
         "exec.execve",
@@ -2119,7 +2160,7 @@ fn phase3_execve(t: &mut Runner) {
         "execve replaces the program: refusals as Linux (ENOENT, EACCES, EFAULT), an empty argv arrives as [\"\"], close-on-exec handles closed and others kept, caught signals reset, ignored ones and the blocked mask kept, the FS base cleared; no frame is lost across three programs",
     );
     if !ok {
-        kprintln!("  execprobe: {status:?}, free frames {before} -> {after}");
+        kprintln!("  execprobe: {status:?}, frames outside the heap {before} -> {after}");
     }
 }
 

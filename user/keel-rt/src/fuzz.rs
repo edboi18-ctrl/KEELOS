@@ -43,9 +43,9 @@ impl Rng {
 
 /// Linux x86-64 numbers of the calls Keel implements (docs/syscalls.md),
 /// chosen most of the time so the fuzzer gets past the ENOSYS check.
-const IMPLEMENTED: [u64; 25] = [
-    0, 1, 2, 3, 5, 7, 9, 10, 11, 12, 13, 14, 16, 17, 20, 39, 61, 72, 110, 131, 158, 218, 228, 257,
-    318,
+const IMPLEMENTED: [u64; 26] = [
+    0, 1, 2, 3, 5, 7, 9, 10, 11, 12, 13, 14, 16, 17, 20, 39, 61, 72, 110, 131, 158, 186, 218, 228,
+    257, 318,
 ];
 const NR_POLL: u64 = 7;
 const NR_OPENAT: u64 = 257;
@@ -54,11 +54,14 @@ const NR_OPENAT: u64 = 257;
 /// made here (hostile executables have their own test). Nor are clone,
 /// fork and vfork: every child would go on fuzzing and forking, without
 /// limit in the system compartment, until the fuzzer runs inside a
-/// compartment with a process limit (P3-S8); fork has its own tests.
+/// compartment with a process limit (P3-S8); fork has its own tests. Nor
+/// kill (a random SIGKILL could end the fuzzer itself) or futex (a
+/// FUTEX_WAIT whose value happens to match would block for ever, which the
+/// harness counts as a hung run); both have their own tests.
 const NR_EXIT: u64 = 60;
 const NR_EXIT_GROUP: u64 = 231;
 const NR_EXECVE: u64 = 59;
-const NEVER: [u64; 6] = [56, 57, 58, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP];
+const NEVER: [u64; 8] = [56, 57, 58, NR_EXECVE, 62, NR_EXIT, 202, NR_EXIT_GROUP];
 
 /// Size of the scratch region whose address the fuzzer hands out.
 const SCRATCH: u64 = 64 * 1024;

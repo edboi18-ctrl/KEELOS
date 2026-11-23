@@ -46,6 +46,9 @@ These were built on 2026-11-23 and committed:
   with no rpath.
 - `libkeelgreet.so`: SHA-256
   `a0e3d47cfd52cd5a8d679a707c3ec77b54004909308dacd1d723f919f4f88ec3`.
+- `threads` (P3-T4, musl pthreads; see the comments in `threads.c`):
+  SHA-256
+  `5f9a6dba8d4a4bd87868874b984f1ae605dd4a97ab4ab2d0845ba0b7d5206f57`.
 
 Two more builds with `--no-cache` gave the same hashes and the same
 `packages.txt`. Adding `greet` changed neither `hello` nor the dynamic

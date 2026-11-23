@@ -64,6 +64,9 @@ struct Thread {
     /// Set by `exec_current` during a system call: the new program's RIP
     /// and RSP, which the system-call return path puts in the frame.
     pending_exec: Option<(u64, u64)>,
+    /// Set by `request_exit`: the thread ends with this status the next
+    /// time it would return to user mode, and stops blocking meanwhile.
+    exit_request: Option<i64>,
 }
 
 /// A user thread's first entry to user mode.
@@ -153,6 +156,7 @@ pub fn init() -> Result<(), SchedError> {
         user_entry: None,
         user_bases: [0; 2],
         pending_exec: None,
+        exit_request: None,
     });
     let mut sched = Scheduler {
         threads: BTreeMap::new(),
@@ -238,6 +242,7 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         user_entry: None,
         user_bases: [0; 2],
         pending_exec: None,
+        exit_request: None,
     }))
 }
 
@@ -289,11 +294,18 @@ fn user_thread_start() {
 /// FS/GS bases and FPU/SSE/AVX state. The FPU registers hold the running
 /// thread's own state during a system call (the kernel uses no FPU or SSE
 /// registers), so they are saved into the new thread's area here.
+///
+/// `fs_base` replaces the copied FS base (clone with CLONE_SETTLS); the
+/// caller checks it is a user address.
 pub fn spawn_user_copy(
     name: &'static str,
     space: Arc<AddressSpace>,
     frame: crate::arch::x86_64::idt::TrapFrame,
+    fs_base: Option<u64>,
 ) -> Result<ThreadId, SchedError> {
+    if fs_base.is_some_and(|base| base >= keel_core::vm::USER_END) {
+        return Err(SchedError::NotInitialised);
+    }
     let bases = {
         let guard = SCHED.lock();
         let sched = guard.as_ref().ok_or(SchedError::NotInitialised)?;
@@ -313,6 +325,9 @@ pub fn spawn_user_copy(
     thread.fpu.save();
     thread.space = Some(space);
     thread.user_bases = bases;
+    if let Some(base) = fs_base {
+        thread.user_bases[SegmentBase::Fs as usize] = base;
+    }
     thread.user_entry = Some(UserEntry::Frame(Box::new(frame)));
     let mut guard = SCHED.lock();
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
@@ -591,6 +606,41 @@ pub fn exec_current(space: Arc<AddressSpace>, rip: u64, rsp: u64) -> Result<(), 
     Ok(())
 }
 
+/// Asks thread `id` to end with `status` (exit_group, kill). It ends the
+/// next time it would return to user mode: at once if it is running user
+/// code (the next timer interrupt), or when its current system call
+/// returns. A thread blocked or sleeping is made ready, and
+/// `WaitQueue::wait_until` returns early for it, so a blocked system call
+/// ends too. The first request wins. Returns whether the thread exists
+/// and has not exited.
+pub fn request_exit(id: ThreadId, status: i64) -> bool {
+    let mut guard = SCHED.lock();
+    let Some(sched) = guard.as_mut() else {
+        return false;
+    };
+    let Some(thread) = sched.threads.get_mut(&id.0) else {
+        return false;
+    };
+    if thread.state == State::Exited {
+        return false;
+    }
+    thread.exit_request.get_or_insert(status);
+    if matches!(thread.state, State::Blocked | State::Sleeping { .. }) {
+        thread.state = State::Ready;
+        sched.ready.push_back(id.0);
+    }
+    true
+}
+
+/// The status the running thread was asked to end with, if any.
+pub fn exit_requested() -> Option<i64> {
+    SCHED
+        .lock()
+        .as_ref()
+        .and_then(|s| s.threads.get(&s.current))
+        .and_then(|t| t.exit_request)
+}
+
 /// The entry point and stack `exec_current` left for the running thread,
 /// taken (so they are used once).
 pub(crate) fn take_pending_exec() -> Option<(u64, u64)> {
@@ -840,11 +890,17 @@ impl WaitQueue {
     }
 
     /// Blocks until `condition` returns true.
-    pub fn wait_until(&self, mut condition: impl FnMut() -> bool) {
+    /// Blocks until `condition` returns true, and returns true; or returns
+    /// false early if the running thread has been asked to exit
+    /// (`request_exit`), so its system call can end.
+    pub fn wait_until(&self, mut condition: impl FnMut() -> bool) -> bool {
         loop {
             let mut waiters = self.waiters.lock();
             if condition() {
-                return;
+                return true;
+            }
+            if exit_requested().is_some() {
+                return false;
             }
             let me = SCHED.lock().as_ref().map_or(0, |s| s.current);
             waiters.push_back(me);

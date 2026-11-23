@@ -34,7 +34,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 24 | `mkdir` | 2 | 2 | 2 | missing |  |
 | 25 | `lstat` | 162 | 17 | 163 | missing |  |
 | 26 | `pipe2` | 166 | 0 | 157 | missing |  |
-| 27 | `clone` | 48 | 0 | 45 | missing |  |
+| 27 | `clone` | 48 | 0 | 45 | partial (threads, fork-like) | `exec.threads`, `exec.thread_calls` |
 | 28 | `socketpair` | 11 | 0 | 11 | missing |  |
 | 29 | `shutdown` | 1 | 0 | 1 | missing |  |
 | 30 | `poll` | 1 | 0 | 1 | partial | `syscalls.conformance` |
@@ -66,7 +66,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 56 | `sendmsg` | 829 | 0 | 820 | missing |  |
 | 57 | `recvmsg` | 833 | 4 | 822 | missing |  |
 | 58 | `sigaltstack` | 58 | 0 | 55 | partial | `syscalls.conformance` |
-| 59 | `gettid` | 58 | 0 | 55 | missing |  |
+| 59 | `gettid` | 58 | 0 | 55 | complete | `exec.thread_calls` |
 | 60 | `sched_getaffinity` | 12 | 0 | 12 | missing |  |
 | 61 | `writev` | 19573 | 0 | 19734 | partial | `syscalls.conformance` |
 | 62 | `umask` | 22 | 0 | 22 | missing |  |
@@ -86,12 +86,12 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 76 | `select` | 69 | 0 | 43 | missing |  |
 | 77 | `openat` | 666 | 0 | 666 | partial | `syscalls.conformance` |
 | 78 | `getrandom` | 13 | 0 | 13 | partial | `syscalls.conformance` |
-| 79 | `futex` | 528 | 29 | 585 | missing |  |
+| 79 | `futex` | 528 | 29 | 585 | partial (wait, wake, requeue) | `exec.threads`, `exec.thread_calls` |
 | 80 | `access` | 4 | 4 | 4 | missing |  |
 | 81 | `exit` | 43 | 0 |  | partial | `syscalls.conformance` |
 | 82 | `sendto` | 2 | 0 | 2 | missing |  |
 | 83 | `recvfrom` | 5 | 0 | 5 | missing |  |
-| 84 | `kill` | 11 | 11 | 11 | missing |  |
+| 84 | `kill` | 11 | 11 | 11 | partial (0, SIGKILL) | `exec.thread_calls` |
 | 85 | `tgkill` | 10 | 0 | 13 | missing |  |
 | 86 | `rt_sigreturn` | 1 | 0 | 2 | missing |  |
 | 87 | `rename` | 3 | 0 | 3 | missing |  |
