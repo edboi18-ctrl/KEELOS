@@ -1821,7 +1821,10 @@ fn phase3(t: &mut Runner) {
         }
         Ok(())
     });
-    let limits = Limits { processes: 4 };
+    let limits = Limits {
+        processes: 4,
+        memory_frames: usize::MAX,
+    };
     let (Ok(()), Ok(a), Ok(b)) = (
         made,
         compartment::create(b"/comp/a", limits),
@@ -1870,7 +1873,13 @@ fn phase3(t: &mut Runner) {
     // P3-S4: a compartment's process limit. One slot: a second process
     // is refused with EAGAIN while the first lives, and admitted after.
     const NAP: &[u8] = b"/test/nap";
-    let one = compartment::create(b"/comp/c", Limits { processes: 1 });
+    let one = compartment::create(
+        b"/comp/c",
+        Limits {
+            processes: 1,
+            memory_frames: usize::MAX,
+        },
+    );
     let limited = one.as_ref().ok().and_then(|c| {
         let file = fs::read_file(NAP).ok()?;
         let load = || keel_linux_abi::exec::load(&file, NAP, &[NAP, b"300"], &[]).ok();
@@ -1896,6 +1905,101 @@ fn phase3(t: &mut Runner) {
         limited.filter(|r| *r != (Some(Errno::EAGAIN), Some((0, None)), Some((0, None)), 0))
     {
         kprintln!("  process limit: {result:?}");
+    }
+    phase3_memory_limit(t);
+}
+
+/// P3-S4 memory, and security acceptance P3 item 3 for memory: a program
+/// that touches more than its compartment's memory limit is ended by the
+/// fault at the limit; every frame comes back; the kernel and another
+/// compartment carry on.
+fn phase3_memory_limit(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::errno::Errno;
+    use keel_linux_abi::compartment;
+
+    const HOG: &[u8] = b"/test/hog";
+    const NAP: &[u8] = b"/test/nap";
+    // 17 MiB. Not a multiple of 512: hog needs a new page table every 512
+    // pages, so with a limit on that boundary a fault that ignored the
+    // limit would still stop exactly at it (the next table is refused).
+    const LIMIT: usize = 4352;
+    let made = keel_linux_abi::fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"hog", 0o755)?;
+        fs.create_dir(comp, b"calm", 0o755)
+    });
+    let limited = |frames| {
+        compartment::create(
+            b"/comp/hog",
+            Limits {
+                processes: 4,
+                memory_frames: frames,
+            },
+        )
+    };
+    let (Ok(_), Ok(hog)) = (made, limited(LIMIT)) else {
+        t.check(
+            "compartment.memory_limit",
+            false,
+            "creating the hog compartment",
+        );
+        return;
+    };
+    let free_before = memory::free_frames();
+    // 64 MiB of touches against a 17 MiB limit.
+    let status = run_in(&hog, HOG, &[HOG, b"64"]);
+    let used_after = hog.memory().used();
+    let free_after = memory::free_frames();
+    // Within the limit the same program finishes.
+    let small = run_in(&hog, HOG, &[HOG, b"8"]);
+    let calm = compartment::create(b"/comp/calm", Limits::UNLIMITED);
+    let other = calm.ok().and_then(|c| run_in(&c, NAP, &[NAP, b"10"]));
+    // hog touches pages in order from 1 TiB (its BASE): the fault address
+    // says how many it touched. Every touched page and every table is
+    // charged, so that is at most the limit, and the image, stack and
+    // tables take only a few dozen frames, so it is close to the limit.
+    const BASE: u64 = 1 << 40;
+    let touched = match status {
+        Some((_, Some(fault))) if fault.vector == 14 && fault.address >= BASE => {
+            Some(((fault.address - BASE) / 4096) as usize)
+        }
+        _ => None,
+    };
+    let killed = matches!(touched, Some(pages) if pages <= LIMIT && pages + 64 >= LIMIT);
+    let ok = killed
+        && used_after == 0
+        && free_after == free_before
+        && small == Some((0, None))
+        && other == Some((0, None));
+    t.check(
+        "compartment.memory_limit",
+        ok,
+        "touching 64 MiB in a compartment limited to 17 MiB ends the program at the limit (its fault address is within the limit, near it); all its frames come back; 8 MiB fits; another compartment runs normally",
+    );
+    if !ok {
+        kprintln!(
+            "  hog: {status:?}, {touched:?} pages touched, budget after {used_after}, free frames {free_before} -> {free_after}; 8 MiB: {small:?}; other compartment: {other:?}"
+        );
+    }
+
+    // What the loader populated counts too: a limit below it refuses the
+    // process at spawn, with ENOMEM, before it runs.
+    let tiny = limited(2).ok().and_then(|c| {
+        let file = keel_linux_abi::fs::read_file(HOG).ok()?;
+        let loaded = keel_linux_abi::exec::load(&file, HOG, &[HOG], &[]).ok()?;
+        let charged = loaded.space.charged_frames();
+        let refused = keel_linux_abi::process::spawn_in(&c, "hog", &loaded).err();
+        Some((charged, refused, c.memory().used(), c.processes()))
+    });
+    let refused = matches!(tiny, Some((charged, Some(Errno::ENOMEM), 0, 0)) if charged > 2);
+    t.check(
+        "compartment.memory_limit_at_spawn",
+        refused,
+        "a program whose loaded image already exceeds its compartment's memory limit is refused at spawn with ENOMEM, charging nothing",
+    );
+    if !refused {
+        kprintln!("  tiny limit: {tiny:?}");
     }
 }
 

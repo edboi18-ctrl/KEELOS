@@ -15,7 +15,7 @@
 //! soft resource limit ... was reached").
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::errno::Errno;
 use crate::vfs::Ino;
@@ -26,19 +26,71 @@ use crate::vfs::Ino;
 /// (PID_MAX_LIMIT)". So a PID always fits `pid_t`.
 pub const PID_MAX: u32 = 1 << 22;
 
-/// What a compartment may use. Later limits (memory, tmpfs bytes and
-/// nodes, handles) join this as their accounting lands.
+/// What a compartment may use. Later limits (tmpfs bytes and nodes) join
+/// this as their accounting lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Processes alive at once.
     pub processes: u32,
+    /// 4 KiB frames of user memory: pages its processes have touched and
+    /// their user page tables (see [`Budget`]).
+    pub memory_frames: usize,
 }
 
 impl Limits {
     /// No limit beyond the kernel's own (the system compartment).
     pub const UNLIMITED: Limits = Limits {
         processes: u32::MAX,
+        memory_frames: usize::MAX,
     };
+}
+
+/// A count with a ceiling, shared by everything charged to it. Charging
+/// succeeds only if it keeps the count at or below the limit, and is
+/// checked and done in one atomic step, so concurrent charges cannot pass
+/// the limit together.
+#[derive(Debug)]
+pub struct Budget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl Budget {
+    pub fn new(limit: usize) -> Budget {
+        Budget {
+            used: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// Adds `n` if that keeps the count within the limit.
+    #[must_use]
+    pub fn try_charge(&self, n: usize) -> bool {
+        self.used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(n).filter(|&total| total <= self.limit)
+            })
+            .is_ok()
+    }
+
+    /// Gives back `n` charged earlier. Never goes below zero: a mismatch is
+    /// a kernel bug, and saturating keeps it from turning into a huge
+    /// allowance.
+    pub fn uncharge(&self, n: usize) {
+        let _ = self
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(n))
+            });
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 /// A compartment.
@@ -53,6 +105,8 @@ pub struct Compartment {
     /// can start at most `PID_MAX - 1` processes in its lifetime (PIDs
     /// 1 to `PID_MAX - 1`).
     next_pid: AtomicU32,
+    /// User memory of all its processes, in frames.
+    memory: Arc<Budget>,
 }
 
 impl Compartment {
@@ -64,6 +118,7 @@ impl Compartment {
             limits,
             processes: AtomicU32::new(0),
             next_pid: AtomicU32::new(1),
+            memory: Arc::new(Budget::new(limits.memory_frames)),
         }
     }
 
@@ -78,6 +133,11 @@ impl Compartment {
 
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// The user-memory budget its processes' address spaces charge.
+    pub fn memory(&self) -> &Arc<Budget> {
+        &self.memory
     }
 
     /// Processes alive in it now.
@@ -145,7 +205,14 @@ mod tests {
     use crate::vfs::ROOT;
 
     fn compartment(processes: u32) -> Arc<Compartment> {
-        Arc::new(Compartment::new(1, ROOT, Limits { processes }))
+        Arc::new(Compartment::new(
+            1,
+            ROOT,
+            Limits {
+                processes,
+                memory_frames: usize::MAX,
+            },
+        ))
     }
 
     #[test]
@@ -181,6 +248,34 @@ mod tests {
         assert_eq!(c.admit().unwrap().pid(), PID_MAX - 1);
         assert_eq!(c.admit().unwrap_err(), Errno::EAGAIN);
         assert_eq!(c.processes(), 0, "the refused admission gave its slot back");
+    }
+
+    #[test]
+    fn a_budget_charges_up_to_its_limit_exactly() {
+        let b = Budget::new(10);
+        assert!(b.try_charge(4));
+        assert!(b.try_charge(6));
+        assert!(!b.try_charge(1), "11 > 10");
+        assert_eq!(b.used(), 10, "a refused charge adds nothing");
+        b.uncharge(3);
+        assert!(b.try_charge(3));
+        let huge = Budget::new(usize::MAX);
+        assert!(huge.try_charge(usize::MAX));
+        assert!(!huge.try_charge(1), "overflow is refused, not wrapped");
+        b.uncharge(100);
+        assert_eq!(b.used(), 0, "uncharging never goes below zero");
+    }
+
+    #[test]
+    fn concurrent_charges_never_pass_the_limit() {
+        let b = Budget::new(1000);
+        let granted: usize = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| (0..200).filter(|_| b.try_charge(1)).count()))
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).sum()
+        });
+        assert_eq!((granted, b.used()), (1000, 1000));
     }
 
     #[test]

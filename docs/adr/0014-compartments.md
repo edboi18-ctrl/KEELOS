@@ -40,12 +40,34 @@ compartment to set that root.
    `PID_MAX_LIMIT` (proc_sys_kernel(5)). They are not reused yet: a
    compartment can start at most 2^22 − 1 processes in its lifetime, until
    `wait4` and reaping arrive (P3-T3).
-4. **Limits are per compartment.** The first is the number of live
-   processes. At the limit a new process is refused with `EAGAIN`, as
-   fork(2) is at `RLIMIT_NPROC`. The counter goes up before the process is
-   created and only from a value below the limit, so concurrent creations
-   cannot pass it. Memory, tmpfs bytes and nodes, and handles move to
-   per-compartment accounting in the next steps of P3-S4.
+4. **Limits are per compartment.**
+   - **Processes.** The number alive at once. At the limit a new process
+     is refused with `EAGAIN`, as fork(2) is at `RLIMIT_NPROC`. The
+     counter goes up before the process is created and only from a value
+     below the limit, so concurrent creations cannot pass it.
+   - **Memory, in 4 KiB frames.** Each address space counts the user
+     frames it holds: present pages, pages parked by `PROT_NONE`, and its
+     user page tables. That covers every place user memory is allocated
+     (`hal::vm`: demand-zero faults, page tables, `duplicate`, parked
+     pages). A page shared copy-on-write counts in every space that maps
+     it, so sharing overcounts, never undercounts. Replacing a shared page
+     with a private copy keeps the space's count the same.
+   - **Charging.** It happens under the space's lock, against the
+     compartment's `Budget`, in one atomic check-and-add.
+   - **Attaching.** At spawn the space is attached to the budget, which
+     charges what the loader already populated. If that does not fit,
+     the process is refused with `ENOMEM` before it runs.
+   - **At the limit.** A page fault that cannot be charged is treated
+     like one that cannot be resolved for lack of memory. A user access
+     ends the thread; a kernel copy returns `EFAULT`. That is how
+     "killed cleanly at its limit" (security acceptance P3, item 3) works
+     for memory. Linux would OOM-kill instead, inside the cgroup.
+   - **Teardown** gives every frame back.
+   - **Not counted:** the two top-level tables of each space, kernel
+     stacks, and handles. Each is bounded per process, and processes are
+     bounded per compartment.
+   - **tmpfs bytes and nodes** are still global, the remaining part of
+     Phase 2 audit item 1. They need an owner on each node, and come next.
 5. **The system compartment** (ID 0, root `/`, no limits beyond the
    kernel's own) holds the programs the kernel itself starts at boot and
    in tests. `process::spawn` puts a program there, and
@@ -92,6 +114,28 @@ per compartment from the start:
   `nap` is refused with `EAGAIN` while the first lives, and admitted after
   it exits. With the limit check removed, the second is admitted and the
   test fails.
+- `compartment.memory_limit`: `user/tests/hog` touches 64 MiB, page by
+  page from a fixed address, in a compartment limited to 4,352 frames
+  (17 MiB).
+  - It is ended by a page fault, and the fault address shows it touched
+    at most the limit and within 64 pages of it.
+  - Afterwards the budget is back at 0 and the free frame count back at
+    its value before.
+  - 8 MiB in the same compartment runs to exit 0, and a program in
+    another compartment runs normally.
+  - Mutations:
+    - A fault that ignores a refused charge runs to page 4,608, the next
+      page-table boundary, and fails the test. The limit is chosen off a
+      512-page boundary for that reason: at 4,096 the refused page table
+      would have stopped it exactly at the limit anyway.
+    - Teardown that keeps the charge leaves 4,352 used and fails.
+- `compartment.memory_limit_at_spawn`: a limit of 2 frames refuses the
+  loaded `hog` (10 frames already populated) at spawn with `ENOMEM`,
+  charging nothing. With attaching that charges nothing, it is admitted
+  and the test fails.
+- Host tests for `Budget`: exact limit, no overflow, no underflow, and
+  16 threads making 3,200 charges against a limit of 1,000 get exactly
+  1,000.
 
 ## Consequences
 

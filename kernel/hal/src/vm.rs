@@ -18,6 +18,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use keel_core::compartment::Budget;
 use keel_core::frame::Frame;
 use keel_core::paging::{self, Flags, PageSize, TableAccess};
 use keel_core::vm::{self, FaultAction, Layout, Placement, Prot, VmError};
@@ -33,16 +34,55 @@ use crate::sync::IrqMutex;
 /// (`memory::allocate_zeroed_user`): a program touching one page in each
 /// of many 2 MiB or 1 GiB regions makes the kernel allocate a table per
 /// page, and those frames must not come out of the kernel's reserve either
-/// (F-0011).
-struct UserTables(DirectMapTables);
+/// (F-0011). Each table is also charged to the address space's account,
+/// so it counts against its compartment's memory limit (P3-S4).
+struct UserTables<'a>(DirectMapTables, &'a mut Account);
 
-impl TableAccess for UserTables {
+impl TableAccess for UserTables<'_> {
     fn allocate_table(&mut self) -> Option<Frame> {
-        memory::allocate_zeroed_user()
+        if !self.1.charge(1) {
+            return None;
+        }
+        let frame = memory::allocate_zeroed_user();
+        if frame.is_none() {
+            self.1.uncharge(1);
+        }
+        frame
     }
 
     fn table(&mut self, frame: Frame) -> &mut [u64; 512] {
         self.0.table(frame)
+    }
+}
+
+/// The user frames an address space holds, counted for its compartment's
+/// memory limit (P3-S4, ADR 0014): every present user page and every
+/// parked one (a page counts in each space that maps it, so pages shared
+/// copy-on-write are counted more than once, never less), plus every user
+/// page table. Updated only with the space's lock held. Before a budget is
+/// attached the count only grows locally; attaching charges it all.
+struct Account {
+    frames: usize,
+    budget: Option<Arc<Budget>>,
+}
+
+impl Account {
+    /// Counts `n` more frames, if the budget (when attached) allows.
+    fn charge(&mut self, n: usize) -> bool {
+        if let Some(budget) = &self.budget
+            && !budget.try_charge(n)
+        {
+            return false;
+        }
+        self.frames += n;
+        true
+    }
+
+    fn uncharge(&mut self, n: usize) {
+        self.frames = self.frames.saturating_sub(n);
+        if let Some(budget) = &self.budget {
+            budget.uncharge(n);
+        }
     }
 }
 
@@ -67,6 +107,7 @@ struct Inner {
     /// (L1TF, SR-15), and the page cannot be read (F-0002). Raising the
     /// protection maps the frame back.
     parked: BTreeMap<u64, Frame>,
+    account: Account,
 }
 
 /// One user address space, as two top-level tables:
@@ -123,6 +164,10 @@ impl AddressSpace {
             inner: IrqMutex::new(Inner {
                 layout: Layout::new(),
                 parked: BTreeMap::new(),
+                account: Account {
+                    frames: 0,
+                    budget: None,
+                },
             }),
         }))
     }
@@ -132,6 +177,23 @@ impl AddressSpace {
     /// the next address space.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Charges this space to `budget` from now on, starting with the frames
+    /// it already holds (what the loader populated). Refused, with nothing
+    /// changed, if they do not fit, or if a budget is already attached.
+    pub fn attach_budget(&self, budget: Arc<Budget>) -> Result<(), AsError> {
+        let mut inner = self.inner.lock();
+        if inner.account.budget.is_some() || !budget.try_charge(inner.account.frames) {
+            return Err(AsError::OutOfMemory);
+        }
+        inner.account.budget = Some(budget);
+        Ok(())
+    }
+
+    /// Frames charged to this space (see `Account`).
+    pub fn charged_frames(&self) -> usize {
+        self.inner.lock().account.frames
     }
 
     /// The user view's top-level table (CR3 while user code runs).
@@ -240,7 +302,7 @@ impl AddressSpace {
                 };
                 let exclusive = memory::references(frame) == 1;
                 let mapped = paging::map(
-                    &mut UserTables(DirectMapTables),
+                    &mut UserTables(DirectMapTables, &mut inner.account),
                     self.root,
                     page,
                     frame.address(),
@@ -268,6 +330,7 @@ impl AddressSpace {
             if let Some(phys) = paging::unmap_small(&mut DirectMapTables, self.root, page) {
                 cpu::invalidate_page(page);
                 let _ = memory::release(Frame::containing(phys));
+                inner.account.uncharge(1);
             }
         }
         let parked: alloc::vec::Vec<u64> = inner
@@ -278,6 +341,7 @@ impl AddressSpace {
         for page in parked {
             if let Some(frame) = inner.parked.remove(&page) {
                 let _ = memory::release(frame);
+                inner.account.uncharge(1);
             }
         }
     }
@@ -285,7 +349,7 @@ impl AddressSpace {
     /// Resolves a fault at `address`; returns whether the access can now
     /// be retried.
     fn resolve_fault(&self, address: u64, error_code: u64) -> bool {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let page = address & !(PAGE - 1);
         let action = vm::classify_fault(
             &inner.layout,
@@ -297,11 +361,18 @@ impl AddressSpace {
         match action {
             FaultAction::Violation => false,
             FaultAction::DemandZero(prot) => {
+                // Over the compartment's memory limit the fault cannot be
+                // resolved, as when memory runs out: a user access ends
+                // the thread, a kernel copy returns EFAULT.
+                if !inner.account.charge(1) {
+                    return false;
+                }
                 let Some(frame) = memory::allocate_zeroed_user() else {
+                    inner.account.uncharge(1);
                     return false;
                 };
                 let mapped = paging::map(
-                    &mut UserTables(DirectMapTables),
+                    &mut UserTables(DirectMapTables, &mut inner.account),
                     self.root,
                     page,
                     frame.address(),
@@ -310,6 +381,7 @@ impl AddressSpace {
                 );
                 if mapped.is_err() {
                     let _ = memory::release(frame);
+                    inner.account.uncharge(1);
                 }
                 self.sync_user_view();
                 // AlreadyMapped means another path mapped it first: retry.
@@ -353,7 +425,8 @@ impl AddressSpace {
     pub fn duplicate(&self) -> Result<Arc<AddressSpace>, AsError> {
         let child = AddressSpace::new()?;
         let inner = self.inner.lock();
-        child.inner.lock().layout = inner.layout.clone();
+        let mut child_inner = child.inner.lock();
+        child_inner.layout = inner.layout.clone();
         let mut leaves = alloc::vec::Vec::new();
         paging::walk(&mut DirectMapTables, self.root, |virt, t| {
             if virt < vm::USER_END && t.size == PageSize::Small {
@@ -365,10 +438,16 @@ impl AddressSpace {
                 continue;
             };
             let frame = Frame::containing(phys);
-            memory::retain(frame).map_err(|_| AsError::OutOfMemory)?;
+            if !child_inner.account.charge(1) {
+                return Err(AsError::OutOfMemory);
+            }
+            if memory::retain(frame).is_err() {
+                child_inner.account.uncharge(1);
+                return Err(AsError::OutOfMemory);
+            }
             let shared = user_flags(vma.prot, false);
             if paging::map(
-                &mut UserTables(DirectMapTables),
+                &mut UserTables(DirectMapTables, &mut child_inner.account),
                 child.root,
                 virt,
                 phys,
@@ -379,6 +458,7 @@ impl AddressSpace {
             {
                 // Give back the reference taken above (audit 2, A7.3).
                 let _ = memory::release(frame);
+                child_inner.account.uncharge(1);
                 return Err(AsError::OutOfMemory);
             }
             let _ = paging::replace_small(&mut DirectMapTables, self.root, virt, phys, shared);
@@ -387,9 +467,14 @@ impl AddressSpace {
         // Parked (PROT_NONE) pages are shared the same way: the child
         // parks the same frame, and whichever side raises the protection
         // first sees a shared frame and gets it read-only (copy on write).
-        let mut child_inner = child.inner.lock();
         for (&page, &frame) in &inner.parked {
-            memory::retain(frame).map_err(|_| AsError::OutOfMemory)?;
+            if !child_inner.account.charge(1) {
+                return Err(AsError::OutOfMemory);
+            }
+            if memory::retain(frame).is_err() {
+                child_inner.account.uncharge(1);
+                return Err(AsError::OutOfMemory);
+            }
             child_inner.parked.insert(page, frame);
         }
         drop(child_inner);
@@ -436,9 +521,14 @@ pub fn live_address_spaces() -> u64 {
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        for (_, frame) in core::mem::take(&mut self.inner.lock().parked) {
+        let mut inner = self.inner.lock();
+        for (_, frame) in core::mem::take(&mut inner.parked) {
             let _ = memory::release(frame);
         }
+        // Everything the space held is freed below: give it all back.
+        let frames = inner.account.frames;
+        inner.account.uncharge(frames);
+        drop(inner);
         // Each frame is freed as the walk reaches it; nothing is collected,
         // so tearing down a large process allocates nothing (audit 3, C2).
         paging::clear_user_half(&mut DirectMapTables, self.root, |item| {

@@ -85,3 +85,8 @@ bench = false
 name = "nap"
 test = false
 bench = false
+
+[[bin]]
+name = "hog"
+test = false
+bench = false

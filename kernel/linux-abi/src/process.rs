@@ -129,13 +129,19 @@ pub fn spawn(name: &'static str, loaded: &Loaded) -> Result<Spawned, Errno> {
 /// Starts a loaded program as a new process in `compartment`, with the
 /// console on fds 0-2: its root and working directory are the
 /// compartment's root, and its PID is the compartment's next. EAGAIN at
-/// the compartment's process limit.
+/// the compartment's process limit; ENOMEM if what the loader populated
+/// does not fit the compartment's memory limit. From then on its address
+/// space is charged to the compartment's memory budget (P3-S4).
 pub fn spawn_in(
     compartment: &Arc<Compartment>,
     name: &'static str,
     loaded: &Loaded,
 ) -> Result<Spawned, Errno> {
     let member = compartment.admit()?;
+    loaded
+        .space
+        .attach_budget(compartment.memory().clone())
+        .map_err(|_| Errno::ENOMEM)?;
     let mut handles = HandleTable::new(HANDLE_LIMIT);
     console_handles(&mut handles)?;
     let mut processes = PROCESSES.lock();

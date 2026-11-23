@@ -185,6 +185,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: false,
     },
     TestProgram {
+        path: "test/hog",
+        binary: "hog",
+        args: &["8"],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/nap",
         binary: "nap",
         args: &["10"],
