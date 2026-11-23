@@ -16,7 +16,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 6 | `mprotect` | 6646 | 0 | 6644 | partial | `syscalls.conformance` |
 | 7 | `readlink` | 5418 | 5000 | 5418 | complete | `exec.filesystem` |
 | 8 | `open` | 1080 | 89 | 1077 | complete | `exec.file_mappings`, `exec.shared_library` |
-| 9 | `fcntl` | 1499 | 0 | 1493 | partial (F_GETFD, F_SETFD) | `exec.file_mappings` |
+| 9 | `fcntl` | 1499 | 0 | 1493 | partial (no OFD locks) | `syscalls.conformance`, `exec.descriptors` |
 | 10 | `fstat` | 2142 | 0 | 2142 | complete | `syscalls.conformance`, `exec.filesystem` |
 | 11 | `read` | 65920 | 0 | 66407 | partial | `syscalls.conformance` |
 | 12 | `close` | 3296 | 57 | 3262 | partial | `syscalls.conformance` |
@@ -48,16 +48,16 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 38 | `listen` | 1 | 0 | 1 | missing |  |
 | 39 | `epoll_create1` | 1 | 0 | 1 | missing |  |
 | 40 | `epoll_ctl` | 155 | 0 | 149 | missing |  |
-| 41 | `dup2` | 22 | 0 | 22 | missing |  |
+| 41 | `dup2` | 22 | 0 | 22 | complete | `exec.descriptors` |
 | 42 | `write` | 28591 | 0 | 28754 | partial | `syscalls.conformance` |
 | 43 | `exit_group` | 27 | 0 |  | partial | `syscalls.conformance` |
 | 44 | `wait4` | 13 | 0 | 13 | partial (no process groups) | `exec.fork_wait` |
 | 45 | `setsockopt` | 22 | 0 | 22 | missing |  |
 | 46 | `connect` | 1 | 0 | 1 | missing |  |
 | 47 | `fchdir` | 75 | 0 | 75 | complete | `exec.filesystem` |
-| 48 | `fstatfs` | 242 | 0 | 232 | missing |  |
+| 48 | `fstatfs` | 242 | 0 | 232 | complete | `exec.descriptors` |
 | 49 | `pread64` | 2845 | 23 | 2835 | complete | `exec.file_mappings` |
-| 50 | `pwritev2` | 3 | 0 | 3 | missing |  |
+| 50 | `pwritev2` | 3 | 0 | 3 | complete | `exec.descriptors` |
 | 51 | `ftruncate` | 24 | 0 | 24 | complete | `exec.shared_mappings` |
 | 52 | `getpid` | 47 | 0 | 44 | complete | `compartment.pid_space` |
 | 53 | `setpriority` | 2 | 1 | 2 | missing |  |
@@ -72,15 +72,15 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 62 | `umask` | 22 | 0 | 22 | complete | `exec.filesystem` |
 | 63 | `getcwd` | 1 | 0 | 1 | complete | `exec.filesystem` |
 | 64 | `sysinfo` | 19 | 0 | 19 | missing |  |
-| 65 | `dup` | 401 | 0 | 400 | missing |  |
+| 65 | `dup` | 401 | 0 | 400 | complete | `exec.descriptors` |
 | 66 | `ioctl` | 404 | 189 | 404 | partial | `syscalls.conformance` |
 | 67 | `sched_setaffinity` | 57 | 0 | 54 | missing |  |
 | 68 | `uname` | 12 | 0 | 12 | missing |  |
 | 69 | `getdents64` | 1926 | 0 | 1926 | complete | `exec.filesystem` |
-| 70 | `getxattr` | 276 | 276 | 276 | missing |  |
-| 71 | `fgetxattr` | 8 | 8 | 8 | missing |  |
+| 70 | `getxattr` | 276 | 276 | 276 | complete (EOPNOTSUPP) | `exec.descriptors` |
+| 71 | `fgetxattr` | 8 | 8 | 8 | complete (EOPNOTSUPP) | `exec.descriptors` |
 | 72 | `clock_getres` | 11 | 0 | 11 | missing |  |
-| 73 | `readv` | 36 | 0 | 36 | missing |  |
+| 73 | `readv` | 36 | 0 | 36 | complete | `exec.descriptors` |
 | 74 | `getrusage` | 138 | 0 | 90 | missing |  |
 | 75 | `sched_yield` | 69 | 0 | 45 | missing |  |
 | 76 | `select` | 69 | 0 | 43 | missing |  |

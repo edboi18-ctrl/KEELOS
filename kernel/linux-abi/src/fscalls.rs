@@ -646,3 +646,542 @@ pub fn faccessat2(p: &ProcessRef, dirfd: i32, path: u64, mode: u32, flags: u32) 
     }
     Ok(0)
 }
+
+// ---------------------------------------------------------------------
+// Descriptor-level calls (P3-T8 second part, ADR 0023).
+
+/// Every POSIX record lock, and the queue F_SETLKW waits on.
+static LOCKS: IrqMutex<keel_core::lock::Locks> = IrqMutex::new(keel_core::lock::Locks::new());
+static LOCK_WAIT: keel_hal::sched::WaitQueue = keel_hal::sched::WaitQueue::new();
+
+/// Drops `owner`'s record locks on `file`, or on every file if None, and
+/// wakes F_SETLKW waiters if any went: a close of any descriptor of the
+/// file (`locks_remove_posix`), and a process's exit.
+pub fn release_locks(owner: u64, file: Option<Ino>) {
+    let released = {
+        let mut locks = LOCKS.lock();
+        match file {
+            Some(file) => locks.release(file, owner),
+            None => locks.release_owner(owner),
+        }
+    };
+    if released {
+        LOCK_WAIT.wake_all();
+    }
+}
+
+/// What closing a handle does beyond dropping it: if it was a file, the
+/// process's locks on that file go (`filp_flush` -> `locks_remove_posix`,
+/// whatever other descriptors of it stay open).
+pub fn closed(p: &ProcessRef, handle: keel_core::handle::Handle<crate::process::Object>) {
+    let crate::process::Object::File(file) = &handle.object;
+    let node = file.lock().node;
+    let owner = p.lock().lock_owner;
+    release_locks(owner, Some(node));
+    drop(handle);
+}
+
+/// dup(2): the lowest free descriptor, sharing the open file description
+/// (needs DUPLICATE; EBADF without). Close-on-exec is clear.
+pub fn dup(p: &ProcessRef, fd: i32) -> SysResult {
+    p.lock()
+        .handles
+        .duplicate_from(fd, 0, false)
+        .map(|n| n as u64)
+}
+
+/// dup2(2) and dup3(2) (`ksys_dup3`): dup3's flags other than O_CLOEXEC
+/// EINVAL, and the same descriptor twice EINVAL (checked first); dup2 of a
+/// descriptor to itself returns it if it is open (EBADF if not). A
+/// descriptor at or past the handle limit EBADF. Whatever `newfd` held is
+/// closed, its locks released.
+pub fn dup3(p: &ProcessRef, fd: i32, newfd: i32, flags: u64, is_dup2: bool) -> SysResult {
+    if is_dup2 && fd == newfd {
+        p.lock().handles.rights(fd)?;
+        return Ok(fd as u64);
+    }
+    if flags & !crate::abi::O_CLOEXEC != 0 || fd == newfd {
+        return Err(Errno::EINVAL);
+    }
+    let old = p
+        .lock()
+        .handles
+        .duplicate_to(fd, newfd, flags & crate::abi::O_CLOEXEC != 0)?;
+    if let Some(old) = old {
+        closed(p, old);
+    }
+    Ok(newfd as u64)
+}
+
+/// fcntl commands (`include/uapi/asm-generic/fcntl.h`,
+/// `include/uapi/linux/fcntl.h`).
+pub const F_DUPFD: u32 = 0;
+pub const F_GETFL: u32 = 3;
+pub const F_SETFL: u32 = 4;
+pub const F_GETLK: u32 = 5;
+pub const F_SETLK: u32 = 6;
+pub const F_SETLKW: u32 = 7;
+pub const F_DUPFD_CLOEXEC: u32 = 1024 + 6;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+/// F_SETFL's changeable flags (`SETFL_MASK`, `fs/fcntl.c`): O_APPEND,
+/// O_NONBLOCK (O_NDELAY is the same bit on x86), O_DIRECT, O_NOATIME.
+const O_DIRECT: u64 = 0o40000;
+const O_NOATIME: u64 = 0o1000000;
+const SETFL_MASK: u64 = crate::abi::O_APPEND | crate::abi::O_NONBLOCK | O_DIRECT | O_NOATIME;
+
+/// fcntl(2) beyond F_GETFD and F_SETFD:
+/// - F_DUPFD, F_DUPFD_CLOEXEC (`f_dupfd`): the lowest free descriptor at
+///   or above `arg` (as an int); at or past the limit EINVAL;
+/// - F_GETFL: the status flags; F_SETFL: sets O_APPEND, O_NONBLOCK,
+///   O_DIRECT and O_NOATIME from `arg` and ignores the rest (`setfl`;
+///   tmpfs allows O_DIRECT, `shmem_file_open`'s FMODE_CAN_ODIRECT, and
+///   root may set O_NOATIME);
+/// - F_GETLK, F_SETLK, F_SETLKW: POSIX record locks (`fs/locks.c`).
+pub fn fcntl_more(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let from = arg as u32 as i32;
+            let from = usize::try_from(from).map_err(|_| Errno::EINVAL)?;
+            p.lock()
+                .handles
+                .duplicate_from(fd, from, cmd == F_DUPFD_CLOEXEC)
+                .map(|n| n as u64)
+        }
+        F_GETFL => Ok(file(p, fd, Rights::NONE)?.lock().status),
+        F_SETFL => {
+            let open = file(p, fd, Rights::NONE)?;
+            let mut f = open.lock();
+            let arg = arg as u32 as u64;
+            f.status = (arg & SETFL_MASK) | (f.status & !SETFL_MASK);
+            f.append = f.status & crate::abi::O_APPEND != 0;
+            Ok(0)
+        }
+        F_GETLK | F_SETLK | F_SETLKW => record_lock(p, fd, cmd, arg),
+        _ => {
+            // Still checks the descriptor first, as Linux's fdget does.
+            p.lock().handles.rights(fd)?;
+            Err(Errno::EINVAL)
+        }
+    }
+}
+
+/// `struct flock` on x86-64 (`include/uapi/asm-generic/fcntl.h`): l_type
+/// i16 at 0, l_whence i16 at 2, l_start i64 at 8, l_len i64 at 16, l_pid
+/// i32 at 24; 32 bytes.
+const FLOCK_SIZE: usize = 32;
+
+/// F_GETLK, F_SETLK and F_SETLKW (`fcntl_getlk`, `fcntl_setlk`,
+/// `flock64_to_posix_lock`, `check_fmode_for_setlk`):
+/// - the range from l_whence (SEEK_SET, SEEK_CUR, SEEK_END, else EINVAL),
+///   l_start and l_len (`keel_core::lock::range`);
+/// - F_SETLK: F_RDLCK needs the descriptor open for reading and F_WRLCK
+///   for writing (EBADF), another owner's conflicting lock EAGAIN; F_UNLCK
+///   always succeeds; F_SETLKW waits instead, and a signal ends the wait
+///   with EINTR (no deadlock detection: ADR 0023);
+/// - F_GETLK: F_RDLCK or F_WRLCK (else EINVAL); the first conflicting
+///   lock is written back (l_whence SEEK_SET, l_len 0 for "to the end",
+///   l_pid its owner's PID, 0 if in another compartment), or only l_type
+///   becomes F_UNLCK if none.
+fn record_lock(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
+    use keel_core::lock::{Request, range};
+    let open = file(p, fd, Rights::NONE)?;
+    let rights = p.lock().handles.rights(fd)?;
+    let mut raw = [0u8; FLOCK_SIZE];
+    copy_from_user(&mut raw, arg).map_err(fault)?;
+    let l_type = i16::from_le_bytes([raw[0], raw[1]]);
+    let l_whence = i16::from_le_bytes([raw[2], raw[3]]);
+    let field = |at: usize| i64::from_le_bytes(raw[at..at + 8].try_into().unwrap_or([0; 8]));
+    let (l_start, l_len) = (field(8), field(16));
+    let (node, position) = {
+        let f = open.lock();
+        (f.node, f.offset as i64)
+    };
+    let base = match l_whence as u32 {
+        SEEK_SET => 0,
+        SEEK_CUR => position,
+        SEEK_END => fs::with(|fs| fs.stat(node))?.size as i64,
+        _ => return Err(Errno::EINVAL),
+    };
+    let (start, end) = range(base, l_start, l_len)?;
+    let (owner, pid, compartment) = {
+        let process = p.lock();
+        (
+            process.lock_owner,
+            process.pid(),
+            process.member.compartment().id(),
+        )
+    };
+    if cmd == F_GETLK {
+        let exclusive = match l_type {
+            F_RDLCK => false,
+            F_WRLCK => true,
+            _ => return Err(Errno::EINVAL),
+        };
+        let found = LOCKS.lock().conflict(node, owner, start, end, exclusive);
+        match found {
+            None => raw[0..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+            Some(l) => {
+                let t = if l.exclusive { F_WRLCK } else { F_RDLCK };
+                raw[0..2].copy_from_slice(&t.to_le_bytes());
+                raw[2..4].copy_from_slice(&0i16.to_le_bytes());
+                raw[8..16].copy_from_slice(&l.start.to_le_bytes());
+                let len = if l.end == keel_core::lock::OFFSET_MAX {
+                    0
+                } else {
+                    l.end - l.start + 1
+                };
+                raw[16..24].copy_from_slice(&len.to_le_bytes());
+                let shown = if l.compartment == compartment {
+                    l.pid
+                } else {
+                    0
+                };
+                raw[24..28].copy_from_slice(&shown.to_le_bytes());
+            }
+        }
+        copy_to_user(arg, &raw).map_err(fault)?;
+        return Ok(0);
+    }
+    let request = match l_type {
+        F_RDLCK => Request::Shared,
+        F_WRLCK => Request::Exclusive,
+        F_UNLCK => Request::Unlock,
+        _ => return Err(Errno::EINVAL),
+    };
+    match request {
+        Request::Shared if !rights.contains(Rights::READ) => return Err(Errno::EBADF),
+        Request::Exclusive if !rights.contains(Rights::WRITE) => return Err(Errno::EBADF),
+        _ => {}
+    }
+    let who = keel_core::lock::Owner {
+        id: owner,
+        pid,
+        compartment,
+    };
+    let attempt = || LOCKS.lock().set(node, who, start, end, request);
+    let result = if cmd == F_SETLKW {
+        let mut outcome = Err(Errno::EAGAIN);
+        let done = LOCK_WAIT.wait_until(|| {
+            outcome = attempt();
+            outcome != Err(Errno::EAGAIN)
+        });
+        if !done {
+            return Err(Errno::EINTR);
+        }
+        outcome
+    } else {
+        attempt()
+    };
+    result?;
+    if request == Request::Unlock {
+        LOCK_WAIT.wake_all();
+    }
+    Ok(0)
+}
+
+/// An `iovec` array (`import_iovec`): more than UIO_MAXIOV (1024) entries
+/// EINVAL; a total length past `ssize_t` EINVAL.
+fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    const UIO_MAXIOV: u64 = 1024;
+    if count > UIO_MAXIOV {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = alloc::vec![0u8; count as usize * 16];
+    copy_from_user(&mut raw, iov).map_err(fault)?;
+    let vectors: Vec<(u64, u64)> = raw
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|v| {
+            let word = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap_or_default());
+            (word(&v[..8]), word(&v[8..]))
+        })
+        .collect();
+    let mut total = 0u64;
+    for &(_, len) in &vectors {
+        total = total
+            .checked_add(len)
+            .filter(|&t| t <= i64::MAX as u64)
+            .ok_or(Errno::EINVAL)?;
+    }
+    Ok(vectors)
+}
+
+/// `RWF_*` (`include/uapi/linux/fs.h`).
+const RWF_HIPRI: u32 = 0x01;
+const RWF_DSYNC: u32 = 0x02;
+const RWF_SYNC: u32 = 0x04;
+const RWF_NOWAIT: u32 = 0x08;
+const RWF_APPEND: u32 = 0x10;
+const RWF_NOAPPEND: u32 = 0x20;
+const RWF_ATOMIC: u32 = 0x40;
+
+/// `kiocb_set_rw_flags`: unknown flags EOPNOTSUPP; RWF_APPEND with
+/// RWF_NOAPPEND EINVAL; RWF_ATOMIC EOPNOTSUPP (tmpfs has no atomic
+/// writes, nor reads have any). HIPRI, DSYNC, SYNC and NOWAIT change
+/// nothing here: tmpfs has no device to sync and Keel never blocks on a
+/// file. Returns the append override: Some(true) for RWF_APPEND,
+/// Some(false) for RWF_NOAPPEND.
+fn rw_flags(flags: u32) -> Result<Option<bool>, Errno> {
+    let known =
+        RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND | RWF_NOAPPEND | RWF_ATOMIC;
+    if flags & !known != 0 || flags & RWF_ATOMIC != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(if flags & RWF_APPEND != 0 {
+        Some(true)
+    } else if flags & RWF_NOAPPEND != 0 {
+        Some(false)
+    } else {
+        None
+    })
+}
+
+/// readv(2), preadv(2), preadv2(2): `at` None reads from the file
+/// position (readv, and preadv2 with offset -1); a negative offset
+/// otherwise EINVAL; a positional read of the console ESPIPE. Stops at
+/// the first short read, as `do_iter_readv_writev`.
+pub fn readv(
+    p: &ProcessRef,
+    fd: i32,
+    iov: u64,
+    count: u64,
+    at: Option<i64>,
+    flags: u32,
+) -> SysResult {
+    let open = file(p, fd, Rights::READ)?;
+    rw_flags(flags)?;
+    let at = match at {
+        Some(a) if a < 0 => return Err(Errno::EINVAL),
+        Some(a) => Some(a as u64),
+        None => None,
+    };
+    if at.is_some() && open.lock().kind == Kind::Device(vfs::Device::Console) {
+        return Err(Errno::ESPIPE);
+    }
+    let mut done = 0u64;
+    for (base, len) in iovecs(iov, count)? {
+        match crate::syscall::read_into(p, fd, base, len, at.map(|a| a + done)) {
+            Ok(n) => {
+                done += n;
+                if n < len {
+                    break;
+                }
+            }
+            Err(error) if done == 0 => return Err(error),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}
+
+/// writev(2)'s positional forms, pwritev(2) and pwritev2(2), and
+/// pwrite64(2) (one vector): `at` None writes at the file position
+/// (pwritev2 with offset -1); a negative offset otherwise EINVAL; the
+/// console ESPIPE. A file open with O_APPEND appends even at an offset,
+/// as Linux does ("BUGS" in pwrite(2)), unless RWF_NOAPPEND; RWF_APPEND
+/// appends either way. A positional write leaves the file position.
+pub fn pwritev(
+    p: &ProcessRef,
+    fd: i32,
+    iov: &[(u64, u64)],
+    at: Option<i64>,
+    flags: u32,
+) -> SysResult {
+    let open = file(p, fd, Rights::WRITE)?;
+    let append = rw_flags(flags)?;
+    let at = match at {
+        Some(a) if a < 0 => return Err(Errno::EINVAL),
+        Some(a) => Some(a as u64),
+        None => None,
+    };
+    if at.is_some() && open.lock().kind == Kind::Device(vfs::Device::Console) {
+        return Err(Errno::ESPIPE);
+    }
+    let quota = quota_of(p);
+    let mut done = 0u64;
+    for &(base, len) in iov {
+        match crate::syscall::write_at(
+            &open,
+            base,
+            len,
+            quota.as_ref(),
+            at.map(|a| a + done),
+            append,
+        ) {
+            Ok(n) => {
+                done += n;
+                if n < len {
+                    break;
+                }
+            }
+            Err(error) if done == 0 => return Err(error),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}
+
+/// pwritev(2) and pwritev2(2) from a user iovec array.
+pub fn pwritev_user(
+    p: &ProcessRef,
+    fd: i32,
+    iov: u64,
+    count: u64,
+    at: Option<i64>,
+    flags: u32,
+) -> SysResult {
+    file(p, fd, Rights::WRITE)?;
+    let vectors = iovecs(iov, count)?;
+    pwritev(p, fd, &vectors, at, flags)
+}
+
+/// `struct statfs` on x86-64 (`include/uapi/asm-generic/statfs.h`, the
+/// 64-bit layout): f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files,
+/// f_ffree (8 bytes each), f_fsid (two ints), f_namelen, f_frsize, f_flags,
+/// f_spare[4]; 120 bytes. For tmpfs (`shmem_statfs`): TMPFS_MAGIC
+/// 0x01021994, 4096-byte blocks, the byte and node limits as totals (the
+/// caller's compartment quota where it is smaller), NAME_MAX 255, and
+/// ST_VALID among the flags. f_fsid is 0, as tmpfs reports it.
+fn statfs_bytes(p: &ProcessRef) -> Result<[u8; 120], Errno> {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const ST_VALID: u64 = 0x0020;
+    let ((used_bytes, used_nodes), (byte_limit, node_limit)) =
+        fs::with(|fs| Ok((fs.usage(), fs.limits())))?;
+    let mut total_bytes = byte_limit as u64;
+    let mut free_bytes = (byte_limit - used_bytes.min(byte_limit)) as u64;
+    let mut total_nodes = node_limit as u64;
+    let mut free_nodes = (node_limit - used_nodes.min(node_limit)) as u64;
+    if let Some(q) = quota_of(p) {
+        if (q.bytes.limit() as u64) < total_bytes {
+            total_bytes = q.bytes.limit() as u64;
+            free_bytes =
+                free_bytes.min((q.bytes.limit() - q.bytes.used().min(q.bytes.limit())) as u64);
+        }
+        if (q.nodes.limit() as u64) < total_nodes {
+            total_nodes = q.nodes.limit() as u64;
+            free_nodes =
+                free_nodes.min((q.nodes.limit() - q.nodes.used().min(q.nodes.limit())) as u64);
+        }
+    }
+    let mut b = [0u8; 120];
+    let words = [
+        TMPFS_MAGIC,
+        4096,
+        total_bytes / 4096,
+        free_bytes / 4096,
+        free_bytes / 4096,
+        total_nodes,
+        free_nodes,
+    ];
+    for (i, w) in words.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    // f_fsid at 56 stays 0.
+    b[64..72].copy_from_slice(&(vfs::NAME_MAX as u64).to_le_bytes());
+    b[72..80].copy_from_slice(&4096u64.to_le_bytes());
+    b[80..88].copy_from_slice(&ST_VALID.to_le_bytes());
+    Ok(b)
+}
+
+/// statfs(2): the filesystem holding the path (there is one).
+pub fn statfs(p: &ProcessRef, path: u64, buf: u64) -> SysResult {
+    let path = user_path(path)?;
+    node_at(p, AT_FDCWD, &path, true, false)?;
+    let b = statfs_bytes(p)?;
+    copy_to_user(buf, &b).map_err(fault)?;
+    Ok(0)
+}
+
+/// fstatfs(2): of the filesystem holding the descriptor's file.
+pub fn fstatfs(p: &ProcessRef, fd: i32, buf: u64) -> SysResult {
+    file(p, fd, Rights::NONE)?;
+    let b = statfs_bytes(p)?;
+    copy_to_user(buf, &b).map_err(fault)?;
+    Ok(0)
+}
+
+/// The xattr calls (getxattr(2) and the rest): Keel's tmpfs keeps no
+/// extended attributes and answers as a filesystem without xattr support
+/// does, EOPNOTSUPP, after the checks Linux makes first, in its order
+/// (`fs/xattr.c`):
+/// - get and list: the path or descriptor (ENOENT, EBADF), then for get
+///   the name;
+/// - set: its flags (other than XATTR_CREATE and XATTR_REPLACE: EINVAL),
+///   the name, the size (past XATTR_SIZE_MAX 65536: E2BIG), then the path
+///   or descriptor (`setxattr_copy`);
+/// - remove: the name, then the path or descriptor.
+///
+/// An empty name, or one longer than XATTR_NAME_MAX (255), is ERANGE.
+/// Wine treats EOPNOTSUPP as it treats ENODATA: no attribute (ADR 0023).
+pub fn xattr(p: &ProcessRef, target: XattrTarget, call: XattrCall) -> SysResult {
+    const XATTR_CREATE: u64 = 1;
+    const XATTR_REPLACE: u64 = 2;
+    const XATTR_SIZE_MAX: u64 = 65536;
+    let check_name = |name: u64| -> Result<(), Errno> {
+        let name = crate::syscall::user_string_max(name, 256).map_err(|e| {
+            if e == Errno::ENAMETOOLONG {
+                Errno::ERANGE
+            } else {
+                e
+            }
+        })?;
+        if name.is_empty() {
+            return Err(Errno::ERANGE);
+        }
+        Ok(())
+    };
+    let check_target = || -> Result<(), Errno> {
+        match target {
+            XattrTarget::Path(path, follow) => {
+                let path = user_path(path)?;
+                node_at(p, AT_FDCWD, &path, follow, false).map(|_| ())
+            }
+            XattrTarget::Fd(fd) => file(p, fd, Rights::NONE).map(|_| ()),
+        }
+    };
+    match call {
+        XattrCall::Get(name) => {
+            check_target()?;
+            check_name(name)?;
+        }
+        XattrCall::List => check_target()?,
+        XattrCall::Set { name, size, flags } => {
+            if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            check_name(name)?;
+            if size > XATTR_SIZE_MAX {
+                return Err(Errno::E2BIG);
+            }
+            check_target()?;
+        }
+        XattrCall::Remove(name) => {
+            check_name(name)?;
+            check_target()?;
+        }
+    }
+    Err(Errno::EOPNOTSUPP)
+}
+
+/// What an xattr call names.
+#[derive(Clone, Copy)]
+pub enum XattrTarget {
+    /// A path, followed (`getxattr`) or not (`lgetxattr`).
+    Path(u64, bool),
+    Fd(i32),
+}
+
+/// Which xattr call, with the arguments its checks read.
+#[derive(Clone, Copy)]
+pub enum XattrCall {
+    Get(u64),
+    List,
+    Set { name: u64, size: u64, flags: u64 },
+    Remove(u64),
+}

@@ -469,6 +469,132 @@ pub fn rename2(old: &CStr, new: &CStr, flags: u32) -> i64 {
     )
 }
 
+pub fn dup(fd: i32) -> i64 {
+    call3(32, fd as u64, 0, 0)
+}
+
+pub fn dup2(fd: i32, newfd: i32) -> i64 {
+    call3(33, fd as u64, newfd as u64, 0)
+}
+
+pub fn dup3(fd: i32, newfd: i32, flags: u64) -> i64 {
+    call3(292, fd as u64, newfd as u64, flags)
+}
+
+/// fcntl(2) with a `struct flock` (F_GETLK, F_SETLK, F_SETLKW).
+pub fn fcntl_lock(fd: i32, cmd: u32, flock: &mut [u8; 32]) -> i64 {
+    call3(
+        nr::FCNTL,
+        fd as u64,
+        u64::from(cmd),
+        flock.as_mut_ptr() as u64,
+    )
+}
+
+pub fn pwrite(fd: i32, data: &[u8], offset: i64) -> i64 {
+    call6(
+        18,
+        [
+            fd as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            offset as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// pwritev2(2) of one buffer.
+pub fn pwritev2(fd: i32, data: &[u8], offset: i64, flags: u32) -> i64 {
+    let iov = [data.as_ptr() as u64, data.len() as u64];
+    call6(
+        328,
+        [
+            fd as u64,
+            iov.as_ptr() as u64,
+            1,
+            offset as u64,
+            0,
+            u64::from(flags),
+        ],
+    )
+}
+
+/// readv(2) (offset None) or preadv(2) into two buffers.
+pub fn readv2(fd: i32, a: &mut [u8], b: &mut [u8], offset: Option<i64>) -> i64 {
+    let iov = [
+        a.as_mut_ptr() as u64,
+        a.len() as u64,
+        b.as_mut_ptr() as u64,
+        b.len() as u64,
+    ];
+    match offset {
+        None => call3(19, fd as u64, iov.as_ptr() as u64, 2),
+        Some(at) => call6(295, [fd as u64, iov.as_ptr() as u64, 2, at as u64, 0, 0]),
+    }
+}
+
+/// statfs(2) and fstatfs(2) into a 120-byte `struct statfs`.
+pub fn statfs(path: &CStr, buf: &mut [u8; 120]) -> i64 {
+    call3(137, path.as_ptr() as u64, buf.as_mut_ptr() as u64, 0)
+}
+
+pub fn fstatfs(fd: i32, buf: &mut [u8; 120]) -> i64 {
+    call3(138, fd as u64, buf.as_mut_ptr() as u64, 0)
+}
+
+pub fn getxattr(path: &CStr, name: &CStr, buf: &mut [u8]) -> i64 {
+    call6(
+        191,
+        [
+            path.as_ptr() as u64,
+            name.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn fgetxattr(fd: i32, name: &CStr, buf: &mut [u8]) -> i64 {
+    call6(
+        193,
+        [
+            fd as u64,
+            name.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn listxattr(path: &CStr, buf: &mut [u8]) -> i64 {
+    call3(
+        194,
+        path.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
+pub fn setxattr(path: &CStr, name: &CStr, value: &[u8], flags: u64) -> i64 {
+    call6(
+        188,
+        [
+            path.as_ptr() as u64,
+            name.as_ptr() as u64,
+            value.as_ptr() as u64,
+            value.len() as u64,
+            flags,
+            0,
+        ],
+    )
+}
+
 /// utimensat(2) with two `struct timespec`s (or None: both now). `path`
 /// None passes NULL (the file open on `dirfd`).
 pub fn utimensat(

@@ -225,6 +225,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/fdprobe",
+        binary: "fdprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/execprobe",
         binary: "execprobe",
         args: &[],

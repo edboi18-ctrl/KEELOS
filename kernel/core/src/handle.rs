@@ -204,6 +204,72 @@ impl<T: Clone> HandleTable<T> {
         self.insert(copy)
     }
 
+    /// fcntl F_DUPFD and F_DUPFD_CLOEXEC (`f_dupfd`, `fs/file.c`): copies
+    /// `fd` to the lowest free index at or above `from`, with all its
+    /// rights. `from` at or past the limit EINVAL; no free index EMFILE.
+    /// Needs DUPLICATE (EBADF without, as any missing right).
+    pub fn duplicate_from(
+        &mut self,
+        fd: i32,
+        from: usize,
+        close_on_exec: bool,
+    ) -> Result<i32, Errno> {
+        let handle = self.slot(fd).ok_or(Errno::EBADF)?;
+        if !handle.rights.contains(Rights::DUPLICATE) {
+            return Err(Errno::EBADF);
+        }
+        if from >= self.limit {
+            return Err(Errno::EINVAL);
+        }
+        let copy = Handle {
+            object: handle.object.clone(),
+            rights: handle.rights,
+            close_on_exec,
+        };
+        let index = match (from..self.slots.len()).find(|&i| self.slots[i].is_none()) {
+            Some(free) => free,
+            None if self.slots.len().max(from) < self.limit => {
+                let index = self.slots.len().max(from);
+                self.slots.resize_with(index + 1, || None);
+                index
+            }
+            None => return Err(Errno::EMFILE),
+        };
+        self.slots[index] = Some(copy);
+        i32::try_from(index).map_err(|_| Errno::EMFILE)
+    }
+
+    /// dup2 and dup3 (`ksys_dup3`, `do_dup2`): copies `fd` to exactly
+    /// `newfd`, replacing what was there, which is returned for the caller
+    /// to drop outside its locks. `newfd` at or past the limit, or
+    /// negative, EBADF. Needs DUPLICATE. `fd == newfd` is the caller's
+    /// case (dup2 returns it, dup3 is EINVAL).
+    pub fn duplicate_to(
+        &mut self,
+        fd: i32,
+        newfd: i32,
+        close_on_exec: bool,
+    ) -> Result<Option<Handle<T>>, Errno> {
+        let target = usize::try_from(newfd).map_err(|_| Errno::EBADF)?;
+        if target >= self.limit {
+            return Err(Errno::EBADF);
+        }
+        let handle = self.slot(fd).ok_or(Errno::EBADF)?;
+        if !handle.rights.contains(Rights::DUPLICATE) {
+            return Err(Errno::EBADF);
+        }
+        let copy = Handle {
+            object: handle.object.clone(),
+            rights: handle.rights,
+            close_on_exec,
+        };
+        if target >= self.slots.len() {
+            self.slots.resize_with(target + 1, || None);
+        }
+        let index = index_nospec(target, self.slots.len());
+        Ok(self.slots[index].replace(copy))
+    }
+
     /// Removes `fd` and returns its handle.
     pub fn close(&mut self, fd: i32) -> Result<Handle<T>, Errno> {
         usize::try_from(fd)
@@ -357,6 +423,41 @@ mod tests {
             copy.get(fd, Rights::WRITE),
             Err(Errno::EBADF),
             "rights are copied, not widened"
+        );
+    }
+
+    #[test]
+    fn dup_to_a_place_and_from_a_floor() {
+        let mut t = HandleTable::new(8);
+        let all = Rights::READ | Rights::DUPLICATE;
+        assert_eq!(t.insert(h(1, all)), Ok(0));
+        assert_eq!(t.insert(h(2, Rights::READ)), Ok(1));
+        // F_DUPFD: the lowest free index at or above the floor.
+        assert_eq!(t.duplicate_from(0, 0, false), Ok(2));
+        assert_eq!(t.duplicate_from(0, 5, true), Ok(5));
+        assert_eq!(t.close_on_exec(5), Ok(true));
+        assert_eq!(t.duplicate_from(0, 5, false), Ok(6));
+        assert_eq!(t.duplicate_from(0, 8, false), Err(Errno::EINVAL));
+        assert_eq!(
+            t.duplicate_from(1, 0, false),
+            Err(Errno::EBADF),
+            "no DUPLICATE"
+        );
+        // dup2: exactly there, replacing.
+        assert_eq!(
+            t.duplicate_to(0, 1, false).map(|old| old.map(|h| h.object)),
+            Ok(Some(2))
+        );
+        assert_eq!(t.get(1, Rights::READ), Ok(&1));
+        assert_eq!(t.duplicate_to(0, 7, false).map(|o| o.is_none()), Ok(true));
+        assert_eq!(t.duplicate_to(0, 8, false).err(), Some(Errno::EBADF));
+        assert_eq!(t.duplicate_to(0, -1, false).err(), Some(Errno::EBADF));
+        assert_eq!(t.duplicate_from(0, 0, false), Ok(3));
+        assert_eq!(t.duplicate_from(0, 0, false), Ok(4));
+        assert_eq!(
+            t.duplicate_from(0, 0, false),
+            Err(Errno::EMFILE),
+            "all 8 used"
         );
     }
 }

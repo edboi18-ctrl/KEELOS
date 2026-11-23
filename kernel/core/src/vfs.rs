@@ -365,6 +365,11 @@ impl Fs {
         (self.bytes_used, self.slots)
     }
 
+    /// The cap on file data and the cap on entries (statfs).
+    pub fn limits(&self) -> (usize, usize) {
+        (self.byte_limit, self.node_limit)
+    }
+
     /// Nodes alive (tests).
     pub fn node_count(&self) -> usize {
         self.nodes.len()

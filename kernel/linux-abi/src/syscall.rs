@@ -170,6 +170,83 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
             )
         });
         t[439] = Some(|p, a| f::faccessat2(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3] as u32));
+        // Descriptor-level calls (P3-T8 second part, ADR 0023).
+        t[32] = Some(|p, a| f::dup(p, a[0] as u32 as i32));
+        t[33] = Some(|p, a| f::dup3(p, a[0] as u32 as i32, a[1] as u32 as i32, 0, true));
+        t[292] = Some(|p, a| {
+            f::dup3(
+                p,
+                a[0] as u32 as i32,
+                a[1] as u32 as i32,
+                a[2] as u32 as u64,
+                false,
+            )
+        });
+        t[19] = Some(|p, a| f::readv(p, a[0] as u32 as i32, a[1], a[2], None, 0));
+        t[295] = Some(|p, a| f::readv(p, a[0] as u32 as i32, a[1], a[2], Some(a[3] as i64), 0));
+        t[327] = Some(|p, a| {
+            let at = (a[3] as i64 != -1).then_some(a[3] as i64);
+            f::readv(p, a[0] as u32 as i32, a[1], a[2], at, a[5] as u32)
+        });
+        t[18] = Some(|p, a| {
+            if (a[3] as i64) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            f::pwritev(p, a[0] as u32 as i32, &[(a[1], a[2])], Some(a[3] as i64), 0)
+        });
+        t[296] =
+            Some(|p, a| f::pwritev_user(p, a[0] as u32 as i32, a[1], a[2], Some(a[3] as i64), 0));
+        t[328] = Some(|p, a| {
+            let at = (a[3] as i64 != -1).then_some(a[3] as i64);
+            f::pwritev_user(p, a[0] as u32 as i32, a[1], a[2], at, a[5] as u32)
+        });
+        t[137] = Some(|p, a| f::statfs(p, a[0], a[1]));
+        t[138] = Some(|p, a| f::fstatfs(p, a[0] as u32 as i32, a[1]));
+        {
+            use f::{XattrCall as C, XattrTarget as T};
+            t[188] = Some(|p, a| {
+                f::xattr(
+                    p,
+                    T::Path(a[0], true),
+                    C::Set {
+                        name: a[1],
+                        size: a[3],
+                        flags: a[4],
+                    },
+                )
+            });
+            t[189] = Some(|p, a| {
+                f::xattr(
+                    p,
+                    T::Path(a[0], false),
+                    C::Set {
+                        name: a[1],
+                        size: a[3],
+                        flags: a[4],
+                    },
+                )
+            });
+            t[190] = Some(|p, a| {
+                f::xattr(
+                    p,
+                    T::Fd(a[0] as u32 as i32),
+                    C::Set {
+                        name: a[1],
+                        size: a[3],
+                        flags: a[4],
+                    },
+                )
+            });
+            t[191] = Some(|p, a| f::xattr(p, T::Path(a[0], true), C::Get(a[1])));
+            t[192] = Some(|p, a| f::xattr(p, T::Path(a[0], false), C::Get(a[1])));
+            t[193] = Some(|p, a| f::xattr(p, T::Fd(a[0] as u32 as i32), C::Get(a[1])));
+            t[194] = Some(|p, a| f::xattr(p, T::Path(a[0], true), C::List));
+            t[195] = Some(|p, a| f::xattr(p, T::Path(a[0], false), C::List));
+            t[196] = Some(|p, a| f::xattr(p, T::Fd(a[0] as u32 as i32), C::List));
+            t[197] = Some(|p, a| f::xattr(p, T::Path(a[0], true), C::Remove(a[1])));
+            t[198] = Some(|p, a| f::xattr(p, T::Path(a[0], false), C::Remove(a[1])));
+            t[199] = Some(|p, a| f::xattr(p, T::Fd(a[0] as u32 as i32), C::Remove(a[1])));
+        }
     }
     t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
     t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
@@ -435,6 +512,12 @@ pub(crate) fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
 
 /// A NUL-terminated string from user memory, read a page at a time. With
 /// its NUL it must fit in `max` bytes, else `too_long`.
+/// A NUL-terminated string of at most `max` bytes with its NUL
+/// (ENAMETOOLONG past that).
+pub(crate) fn user_string_max(address: u64, max: usize) -> Result<Vec<u8>, Errno> {
+    user_string(address, max, Errno::ENAMETOOLONG)
+}
+
 fn user_string(address: u64, max: usize, too_long: Errno) -> Result<Vec<u8>, Errno> {
     let mut path = Vec::new();
     let mut at = address;
@@ -600,8 +683,11 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
         }
         (old, process.handles.take_close_on_exec())
     };
-    // Closed outside the process lock, as close(2) does.
-    drop(closed);
+    // Closed outside the process lock, as close(2) does, with their
+    // record locks (ADR 0023).
+    for handle in closed {
+        crate::fscalls::closed(p, handle);
+    }
     // The thread switches to the new space here; only then may the old
     // one (still the CPU's until now) be dropped.
     let switched = sched::exec_current(loaded.space, loaded.entry, loaded.rsp);
@@ -642,9 +728,8 @@ fn fcntl(p: &Arc<IrqMutex<Process>>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             Ok(0)
         }
         _ => {
-            // Still checks the descriptor first, as Linux's fdget does.
-            process.handles.rights(fd)?;
-            Err(Errno::EINVAL)
+            drop(process);
+            crate::fscalls::fcntl_more(p, fd, cmd, arg)
         }
     }
 }
@@ -664,6 +749,17 @@ fn pread64(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64, offset: u6
 }
 
 /// read(2) from the file position, or pread64(2) from `at`.
+/// read(2), pread64 and readv: `count` bytes into user memory at `buf`.
+pub(crate) fn read_into(
+    p: &Arc<IrqMutex<Process>>,
+    fd: i32,
+    buf: u64,
+    count: u64,
+    at: Option<u64>,
+) -> SysResult {
+    read_at(p, fd, buf, count, at)
+}
+
 fn read_at(
     p: &Arc<IrqMutex<Process>>,
     fd: i32,
@@ -747,6 +843,22 @@ fn write_to(
     count: u64,
     quota: Option<&Arc<keel_core::compartment::Quota>>,
 ) -> SysResult {
+    write_at(file, buf, count, quota, None, None)
+}
+
+/// write(2), and with `at` the positional writes (pwrite64, pwritev): at
+/// the file position (moving it) or at `at` (leaving it). `append`
+/// overrides the description's O_APPEND (pwritev2's RWF_APPEND and
+/// RWF_NOAPPEND); with O_APPEND or RWF_APPEND a file is written at its
+/// end, even by a positional write, as Linux does.
+pub(crate) fn write_at(
+    file: &Arc<IrqMutex<OpenFile>>,
+    buf: u64,
+    count: u64,
+    quota: Option<&Arc<keel_core::compartment::Quota>>,
+    at: Option<u64>,
+    append: Option<bool>,
+) -> SysResult {
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
     let mut done = 0usize;
@@ -775,7 +887,12 @@ fn write_to(
             let mut f = file.lock();
             match f.kind {
                 Kind::File => {
-                    let (node, append, offset) = (f.node, f.append, f.offset);
+                    let append = append.unwrap_or(f.append);
+                    let offset = match at {
+                        Some(at) => at.saturating_add(done as u64),
+                        None => f.offset,
+                    };
+                    let node = f.node;
                     let result = fs::with(|fs| {
                         let at = if append { fs.stat(node)?.size } else { offset };
                         let n = fs.write_as(node, at, &chunk[..want], quota)?;
@@ -785,7 +902,9 @@ fn write_to(
                         Ok((n, end)) => {
                             // Shared mappings of the file see the write.
                             keel_hal::vm::shared_write(node, end - n as u64, &chunk[..n]);
-                            f.offset = end;
+                            if at.is_none() {
+                                f.offset = end;
+                            }
                             n
                         }
                         // ENOSPC and the like: report what was written.
@@ -860,8 +979,12 @@ fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResul
 }
 
 fn close(p: &Arc<IrqMutex<Process>>, fd: i32) -> SysResult {
-    // Closing needs no right: the handle is the caller's own.
-    p.lock().handles.close(fd).map(|_| 0)
+    // Closing needs no right: the handle is the caller's own. Its record
+    // locks on the file go too (ADR 0023); the handle is dropped outside
+    // the process lock.
+    let handle = p.lock().handles.close(fd)?;
+    crate::fscalls::closed(p, handle);
+    Ok(0)
 }
 
 fn fstat(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64) -> SysResult {
@@ -951,6 +1074,10 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         kind,
         offset: 0,
         append: flags & O_APPEND != 0,
+        // f_flags: O_LARGEFILE added on 64-bit (`force_o_largefile`),
+        // O_CLOEXEC not kept (`build_open_flags`), and O_CREAT, O_EXCL,
+        // O_NOCTTY, O_TRUNC cleared after the open (`do_dentry_open`).
+        status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
     };
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),

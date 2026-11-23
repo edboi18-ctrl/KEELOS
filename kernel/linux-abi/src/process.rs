@@ -34,6 +34,11 @@ pub struct OpenFile {
     pub kind: Kind,
     pub offset: u64,
     pub append: bool,
+    /// The status flags F_GETFL reports (`f_flags`): the access mode and
+    /// the open flags that stay with the description (O_APPEND,
+    /// O_NONBLOCK, O_DIRECT, O_NOATIME, O_LARGEFILE, which open always
+    /// sets on 64-bit: `force_o_largefile`). `append` mirrors O_APPEND.
+    pub status: u64,
 }
 
 impl Drop for OpenFile {
@@ -94,6 +99,10 @@ pub struct Process {
     /// The file mode creation mask (umask(2)); 022 for a process the
     /// kernel starts, as Linux's init_fs. fork and execve keep it.
     pub umask: u32,
+    /// Who owns its POSIX record locks (Linux's `current->files`): unique
+    /// to the process, so a forked child has its own (fcntl(2): "record
+    /// locks are not inherited by a child created via fork").
+    pub lock_owner: u64,
     /// Its threads, by scheduler thread id (P3-T4). The first is the one
     /// it started with, whose TID is the PID.
     pub threads: BTreeMap<u64, ThreadInfo>,
@@ -171,6 +180,12 @@ pub struct Child {
 /// Woken whenever a process exits, for wait4.
 static CHILD_EXITS: sched::WaitQueue = sched::WaitQueue::new();
 
+/// Lock owners, one per process, never reused.
+fn new_lock_owner() -> u64 {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Processes by thread ID.
 static PROCESSES: IrqMutex<BTreeMap<u64, Arc<IrqMutex<Process>>>> = IrqMutex::new(BTreeMap::new());
 
@@ -218,6 +233,9 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
             kind,
             offset: 0,
             append: false,
+            // As the kernel opens the console for init: O_LARGEFILE, read
+            // or write as the descriptor is.
+            status: crate::abi::O_LARGEFILE | if write { crate::abi::O_WRONLY } else { 0 },
         };
         handles.insert(Handle {
             object: Object::File(Arc::new(IrqMutex::new(file))),
@@ -264,6 +282,7 @@ pub fn spawn_in(
         root,
         cwd: root,
         umask: 0o022,
+        lock_owner: new_lock_owner(),
         signals: SignalState::new(),
         pending: Pending::new(),
         parent: None,
@@ -334,6 +353,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         root,
         cwd,
         umask,
+        lock_owner: new_lock_owner(),
         signals,
         pending: Pending::new(),
         parent: Some(Arc::downgrade(p)),
@@ -567,7 +587,7 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
         }
         return;
     }
-    let (handles, space, children, parent, code, signal) = {
+    let (handles, space, children, parent, code, signal, owner) = {
         let mut p = process.lock();
         (
             core::mem::replace(&mut p.handles, HandleTable::new(0)),
@@ -576,9 +596,12 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
             p.parent.clone(),
             p.group_exit.unwrap_or(status),
             p.killed_by,
+            p.lock_owner,
         )
     };
     drop((handles, space, children));
+    // Its record locks go with it.
+    crate::fscalls::release_locks(owner, None);
     let wait_status = match signal {
         Some(signal) => signal & 0x7f,
         None => ((code & 0xff) << 8) as i32,

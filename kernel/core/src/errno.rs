@@ -39,6 +39,7 @@ pub enum Errno {
     ENOTEMPTY = 39,
     ELOOP = 40,
     ENODATA = 61,
+    EOVERFLOW = 75,
     ELIBBAD = 80,
     EOPNOTSUPP = 95,
     ETIMEDOUT = 110,

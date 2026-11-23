@@ -1921,6 +1921,7 @@ fn phase3(t: &mut Runner) {
     phase3_signals(t);
     phase3_shared_mappings(t);
     phase3_filesystem(t);
+    phase3_descriptors(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2062,6 +2063,38 @@ fn phase3_filesystem(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  fsprobe: {status:?}; left in /tmp {left}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T8 second part (ADR 0023): user/tests/fdprobe, which passes under
+/// Linux too (`host.fdprobe`): dup, dup2, dup3, F_DUPFD(_CLOEXEC),
+/// F_GETFL/F_SETFL, pwrite64 and pwritev2 with O_APPEND, RWF_APPEND,
+/// RWF_NOAPPEND and offset -1, readv and preadv, record locks between a
+/// process and its children (F_GETLK, F_SETLK, F_SETLKW, release on close
+/// and on exit), statfs, fstatfs and the xattr calls' checks. Afterwards
+/// nothing is left in /tmp, and every node, frame and process is back.
+fn phase3_descriptors(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/fdprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.descriptors",
+        ok,
+        "the descriptor calls as on Linux: dup, dup2, dup3, F_DUPFD, F_GETFL/F_SETFL, pwrite and pwritev2 (O_APPEND, RWF_APPEND, RWF_NOAPPEND), readv, record locks across fork (EAGAIN, F_GETLK, F_SETLKW, released on close and exit), statfs, xattr checks; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  fdprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

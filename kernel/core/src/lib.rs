@@ -18,6 +18,7 @@ pub mod exec;
 pub mod frame;
 pub mod handle;
 pub mod keyboard;
+pub mod lock;
 pub mod paging;
 pub mod poll;
 pub mod rng;
