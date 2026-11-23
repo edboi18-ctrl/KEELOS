@@ -32,6 +32,7 @@ use crate::process::{self, Object, OpenFile, Process, file_rights};
 pub mod nr {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
     pub const POLL: u64 = 7;
@@ -42,9 +43,11 @@ pub mod nr {
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
+    pub const PREAD64: u64 = 17;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
     pub const EXIT: u64 = 60;
+    pub const FCNTL: u64 = 72;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
@@ -93,6 +96,11 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::FSTAT as usize] = Some(|p, a| fstat(p, a[0] as u32 as i32, a[1]));
     t[nr::POLL as usize] = Some(|p, a| poll(p, a[0], a[1] as u32, a[2] as u32 as i32));
     t[nr::OPENAT as usize] = Some(|p, a| openat(p, a[0] as u32 as i32, a[1], a[2], a[3]));
+    // open(2) is openat(AT_FDCWD, ...), as Linux's sys_open (`fs/open.c`),
+    // which also sets O_LARGEFILE on 64-bit (no effect here).
+    t[nr::OPEN as usize] = Some(|p, a| openat(p, AT_FDCWD, a[0], a[1] | O_LARGEFILE, a[2]));
+    t[nr::PREAD64 as usize] = Some(|p, a| pread64(p, a[0] as u32 as i32, a[1], a[2], a[3]));
+    t[nr::FCNTL as usize] = Some(|p, a| fcntl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
     t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
     t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
     t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
@@ -322,7 +330,67 @@ fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
 }
 
 fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult {
+    read_at(p, fd, buf, count, None)
+}
+
+/// fcntl(2), the descriptor flags only (more commands as the trace needs
+/// them). As Linux's do_fcntl (`fs/fcntl.c` at v6.12): F_GETFD returns
+/// FD_CLOEXEC if set; F_SETFD sets it from `arg & FD_CLOEXEC`; any other
+/// command is EINVAL. musl's open() calls F_SETFD after O_CLOEXEC
+/// (`src/fcntl/open.c`). No rights needed: the flag belongs to the
+/// caller's own handle table.
+fn fcntl(p: &Arc<IrqMutex<Process>>, fd: i32, cmd: u32, arg: u64) -> SysResult {
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
+    const FD_CLOEXEC: u64 = 1;
+    let mut process = p.lock();
+    match cmd {
+        F_GETFD => Ok(if process.handles.close_on_exec(fd)? {
+            FD_CLOEXEC
+        } else {
+            0
+        }),
+        F_SETFD => {
+            // `argi = (int)arg` in Linux: only the low 32 bits count.
+            process
+                .handles
+                .set_close_on_exec(fd, (arg as u32 as u64) & FD_CLOEXEC != 0)?;
+            Ok(0)
+        }
+        _ => {
+            // Still checks the descriptor first, as Linux's fdget does.
+            process.handles.rights(fd)?;
+            Err(Errno::EINVAL)
+        }
+    }
+}
+
+/// pread64(2): reads at `offset` without moving the file position
+/// ("The file offset is not changed", pread(2)). As Linux's ksys_pread64
+/// (`fs/read_write.c` at v6.12): a negative offset is EINVAL, a missing
+/// descriptor EBADF, and a file opened non-seekable ESPIPE. Of Keel's
+/// files only the console is: tty_open calls nonseekable_open
+/// (`drivers/tty/tty_io.c`), while /dev/null, /dev/zero and /dev/urandom
+/// keep FMODE_PREAD.
+fn pread64(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64, offset: u64) -> SysResult {
+    if (offset as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    read_at(p, fd, buf, count, Some(offset))
+}
+
+/// read(2) from the file position, or pread64(2) from `at`.
+fn read_at(
+    p: &Arc<IrqMutex<Process>>,
+    fd: i32,
+    buf: u64,
+    count: u64,
+    at: Option<u64>,
+) -> SysResult {
     let file = file(p, fd, Rights::READ)?;
+    if at.is_some() && file.lock().kind == Kind::Device(Device::Console) {
+        return Err(Errno::ESPIPE);
+    }
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
     let mut done = 0usize;
@@ -332,8 +400,14 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
         let n = match kind {
             Kind::File => {
                 let mut f = file.lock();
-                let n = fs::with(|fs| fs.read(f.node, f.offset, &mut chunk[..want]))?;
-                f.offset += n as u64;
+                let from = match at {
+                    Some(at) => at.saturating_add(done as u64),
+                    None => f.offset,
+                };
+                let n = fs::with(|fs| fs.read(f.node, from, &mut chunk[..want]))?;
+                if at.is_none() {
+                    f.offset += n as u64;
+                }
                 n
             }
             Kind::Directory => return Err(Errno::EISDIR),

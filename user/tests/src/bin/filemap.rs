@@ -152,6 +152,44 @@ fn main(startup: &Startup) -> i32 {
     if Region::map_file_private(PAGE, PROT_READ, dir as i32, 0).err() != Some(ENODEV) {
         return 30;
     }
+    // 8. pread64 reads at an offset and leaves the position alone; a
+    //    negative offset is EINVAL. open(2) opens like openat.
+    let opened = sys::open(path, O_RDONLY, 0);
+    if opened < 0 {
+        return 33;
+    }
+    let opened = opened as i32;
+    let mut some = [0u8; 8];
+    if sys::pread(opened, &mut some, 1) != 8 || some[..] != file[1..9] {
+        return 34;
+    }
+    let mut first = [0u8; 4];
+    if sys::read(opened, &mut first) != 4 || &first != b"\x7fELF" {
+        return 35; // the pread did not move the position
+    }
+    if sys::pread(opened, &mut some, size + 100) != 0 {
+        return 36; // at or past the end: 0
+    }
+    if sys::pread(opened, &mut some, u64::MAX) != EINVAL {
+        return 37;
+    }
+    sys::close(opened);
+    // 9. fcntl's descriptor flags: O_CLOEXEC shows as FD_CLOEXEC, F_SETFD
+    //    changes it; a descriptor that is not open is EBADF, a command no
+    //    kernel has is EINVAL.
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
+    let cloexec = sys::open(path, O_RDONLY | sys::O_CLOEXEC, 0);
+    if cloexec < 0 || sys::fcntl(cloexec as i32, F_GETFD, 0) != 1 {
+        return 38;
+    }
+    if sys::fcntl(cloexec as i32, F_SETFD, 0) != 0 || sys::fcntl(cloexec as i32, F_GETFD, 0) != 0 {
+        return 39;
+    }
+    if sys::fcntl(1000, F_GETFD, 0) != EBADF || sys::fcntl(cloexec as i32, 99_999, 0) != EINVAL {
+        return 40;
+    }
+    sys::close(cloexec as i32);
     // 7. /dev/zero maps as zeroed memory.
     let zero = sys::openat(AT_FDCWD, c"/dev/zero", O_RDONLY, 0);
     let Ok(zeros) = Region::map_file_private(PAGE, PROT_READ | PROT_WRITE, zero as i32, 0) else {

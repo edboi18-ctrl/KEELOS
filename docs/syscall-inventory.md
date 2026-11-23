@@ -15,8 +15,8 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 5 | `mmap` | 7825 | 187 | 7820 | partial (no MAP_SHARED) | `syscalls.conformance`, `exec.file_mappings` |
 | 6 | `mprotect` | 6646 | 0 | 6644 | partial | `syscalls.conformance` |
 | 7 | `readlink` | 5418 | 5000 | 5418 | missing |  |
-| 8 | `open` | 1080 | 89 | 1077 | missing |  |
-| 9 | `fcntl` | 1499 | 0 | 1493 | missing |  |
+| 8 | `open` | 1080 | 89 | 1077 | complete | `exec.file_mappings`, `exec.shared_library` |
+| 9 | `fcntl` | 1499 | 0 | 1493 | partial (F_GETFD, F_SETFD) | `exec.file_mappings` |
 | 10 | `fstat` | 2142 | 0 | 2142 | partial | `syscalls.conformance` |
 | 11 | `read` | 65920 | 0 | 66407 | partial | `syscalls.conformance` |
 | 12 | `close` | 3296 | 57 | 3262 | partial | `syscalls.conformance` |
@@ -56,7 +56,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 46 | `connect` | 1 | 0 | 1 | missing |  |
 | 47 | `fchdir` | 75 | 0 | 75 | missing |  |
 | 48 | `fstatfs` | 242 | 0 | 232 | missing |  |
-| 49 | `pread64` | 2845 | 23 | 2835 | missing |  |
+| 49 | `pread64` | 2845 | 23 | 2835 | complete | `exec.file_mappings` |
 | 50 | `pwritev2` | 3 | 0 | 3 | missing |  |
 | 51 | `ftruncate` | 24 | 0 | 24 | missing |  |
 | 52 | `getpid` | 47 | 0 | 44 | complete | `compartment.pid_space` |

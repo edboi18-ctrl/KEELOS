@@ -295,6 +295,23 @@ pub const TEST_FIXTURES: &[TestFixture] = &[
         stdout: Some("Hello from dynamically linked musl on Keel\n"),
         host_via: Some("lib/ld-musl-x86_64.so.1"),
     },
+    // P3-T7: a program with a shared library of its own, which musl's
+    // dynamic linker finds in /lib (its default path) and maps from the
+    // file.
+    TestFixture {
+        path: "test/musl-greet",
+        file: "fixtures/musl-dynamic/greet",
+        hash_file: "fixtures/musl-dynamic/greet.sha256",
+        stdout: Some("Hello from a musl shared library on Keel (count 3)\n"),
+        host_via: Some("lib/ld-musl-x86_64.so.1"),
+    },
+    TestFixture {
+        path: "lib/libkeelgreet.so",
+        file: "fixtures/musl-dynamic/libkeelgreet.so",
+        hash_file: "fixtures/musl-dynamic/libkeelgreet.sha256",
+        stdout: None,
+        host_via: None,
+    },
     TestFixture {
         path: "lib/ld-musl-x86_64.so.1",
         file: "fixtures/musl-dynamic/ld-musl-x86_64.so.1",

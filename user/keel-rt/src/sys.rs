@@ -16,6 +16,7 @@ use crate::{syscall3, syscall6};
 pub mod nr {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
     pub const POLL: u64 = 7;
@@ -26,6 +27,8 @@ pub mod nr {
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
+    pub const PREAD64: u64 = 17;
+    pub const FCNTL: u64 = 72;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
     pub const SIGALTSTACK: u64 = 131;
@@ -38,6 +41,7 @@ pub mod nr {
 
 pub const AT_FDCWD: i32 = -100;
 pub const O_RDONLY: u64 = 0;
+pub const O_CLOEXEC: u64 = 0o2000000;
 pub const O_WRONLY: u64 = 1;
 pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
@@ -144,6 +148,32 @@ pub fn openat(dirfd: i32, path: &CStr, flags: u64, mode: u64) -> i64 {
 
 pub fn openat_from(path: Hostile, flags: u64) -> i64 {
     call6(nr::OPENAT, [AT_FDCWD as u64, path.0, flags, 0, 0, 0])
+}
+
+/// fcntl(2) with an integer argument.
+pub fn fcntl(fd: i32, cmd: u32, arg: u64) -> i64 {
+    call3(nr::FCNTL, fd as u64, u64::from(cmd), arg)
+}
+
+/// open(2), the legacy call musl uses on x86-64.
+pub fn open(path: &CStr, flags: u64, mode: u64) -> i64 {
+    call3(nr::OPEN, path.as_ptr() as u64, flags, mode)
+}
+
+/// pread64(2) into `buf` from file offset `offset` (as an `off_t`: a value
+/// above `i64::MAX` is a negative offset).
+pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> i64 {
+    call6(
+        nr::PREAD64,
+        [
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            offset,
+            0,
+            0,
+        ],
+    )
 }
 
 pub fn close(fd: i32) -> i64 {

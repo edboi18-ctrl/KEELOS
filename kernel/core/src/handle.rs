@@ -115,6 +115,23 @@ impl<T: Clone> HandleTable<T> {
         i32::try_from(index).map_err(|_| Errno::EMFILE)
     }
 
+    /// Whether `fd` is closed by execve (FD_CLOEXEC). EBADF if no handle.
+    pub fn close_on_exec(&self, fd: i32) -> Result<bool, Errno> {
+        self.slot(fd).map(|h| h.close_on_exec).ok_or(Errno::EBADF)
+    }
+
+    /// Sets whether `fd` is closed by execve. EBADF if no handle.
+    pub fn set_close_on_exec(&mut self, fd: i32, close: bool) -> Result<(), Errno> {
+        let index = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        if index >= self.slots.len() {
+            return Err(Errno::EBADF);
+        }
+        let index = index_nospec(index, self.slots.len());
+        let handle = self.slots[index].as_mut().ok_or(Errno::EBADF)?;
+        handle.close_on_exec = close;
+        Ok(())
+    }
+
     fn slot(&self, fd: i32) -> Option<&Handle<T>> {
         let index = usize::try_from(fd).ok()?;
         if index >= self.slots.len() {
@@ -260,5 +277,23 @@ mod tests {
         let plain = t.insert(h(5, Rights::READ)).unwrap();
         assert_eq!(t.duplicate(plain, all), Err(Errno::EBADF));
         assert_eq!(t.duplicate(77, all), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn close_on_exec_is_per_handle_and_needs_one() {
+        let mut table: HandleTable<u8> = HandleTable::new(4);
+        let fd = table
+            .insert(Handle {
+                object: 1,
+                rights: Rights::READ,
+                close_on_exec: false,
+            })
+            .unwrap();
+        assert_eq!(table.close_on_exec(fd), Ok(false));
+        table.set_close_on_exec(fd, true).unwrap();
+        assert_eq!(table.close_on_exec(fd), Ok(true));
+        assert_eq!(table.close_on_exec(fd + 1), Err(Errno::EBADF));
+        assert_eq!(table.set_close_on_exec(-1, true), Err(Errno::EBADF));
+        assert_eq!(table.set_close_on_exec(100, true), Err(Errno::EBADF));
     }
 }

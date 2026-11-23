@@ -81,5 +81,10 @@ dynamic linker's libraries. Keel refused every file mapping with
 - When `unlink` arrives (P3-T8), a mapped file must stay alive until its
   last mapping goes, as on Linux. Today nothing can be deleted, and a
   mapping names its inode by number.
-- A dynamic linker can now map shared libraries. The next end-to-end
-  test is a musl program with a shared library of its own.
+- A dynamic linker can now map shared libraries. `exec.shared_library`
+  runs `fixtures/musl-dynamic/greet`: musl's dynamic linker opens
+  `/lib/libkeelgreet.so` with `open`, reads its headers with `read`,
+  maps it from the file with `mmap` and `mprotect`, and the program
+  prints the library's string and a count from its data segment. That
+  needed `open`, `pread64` and `fcntl`'s `F_SETFD` too, and it logs no
+  unimplemented call.

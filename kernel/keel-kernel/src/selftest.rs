@@ -1917,6 +1917,21 @@ fn phase3(t: &mut Runner) {
 /// executable and compares every byte with read(2). It passes under Linux
 /// too (`host.filemap`).
 fn phase3_file_mappings(t: &mut Runner) {
+    // A program with a shared library of its own: musl's dynamic linker
+    // opens /lib/libkeelgreet.so (open, read, fstat), maps it from the
+    // file and runs. The line, with the count kept in the library's data
+    // segment, is checked on serial.
+    const GREET: &[u8] = b"/test/musl-greet";
+    let greet = run_test_program(GREET, &[GREET]);
+    t.check(
+        "exec.shared_library",
+        greet == Some((0, None)),
+        "a musl program linked against its own shared library runs: the dynamic linker finds it in /lib and maps it from the file (its line is checked on serial)",
+    );
+    if greet != Some((0, None)) {
+        kprintln!("  musl-greet: {greet:?}");
+    }
+
     const PROGRAM: &[u8] = b"/test/filemap";
     let status = run_test_program(PROGRAM, &[PROGRAM]);
     t.check(

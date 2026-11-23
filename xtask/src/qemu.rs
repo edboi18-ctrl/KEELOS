@@ -73,8 +73,11 @@ pub const PHASES: &[Phase] = &[
         number: 3,
         complete: false,
         scenarios: &[],
-        // P3-T2: the dynamically linked musl program's line.
-        expect_lines: &["Hello from dynamically linked musl on Keel"],
+        // P3-T2 and P3-T7: the dynamically linked musl programs' lines.
+        expect_lines: &[
+            "Hello from dynamically linked musl on Keel",
+            "Hello from a musl shared library on Keel (count 3)",
+        ],
         expect_prefixes: &[],
     },
 ];
@@ -895,13 +898,29 @@ fn test_user_programs_on_host() -> Result<()> {
                     .iter()
                     .find(|f| f.path == via)
                     .ok_or_else(|| format!("{}: no fixture {via}", fixture.path))?;
+                // Every fixture library is copied, and the dynamic linker
+                // is told where (it looks in /lib on Keel).
+                for library in build::TEST_FIXTURES
+                    .iter()
+                    .filter(|f| f.stdout.is_none() && f.path.starts_with("lib/"))
+                {
+                    copy(library)?;
+                }
                 let mut command = Command::new(copy(interpreter)?);
-                command.arg(&path);
+                // Nothing from the developer's environment but this.
+                command.env_clear().arg(&path).env(
+                    "LD_LIBRARY_PATH",
+                    root.join("target").join("fixtures").join("lib"),
+                );
                 command
             }
-            None => Command::new(&path),
+            None => {
+                let mut command = Command::new(&path);
+                command.env_clear();
+                command
+            }
         };
-        let output = command.env_clear().stdin(Stdio::null()).output()?;
+        let output = command.stdin(Stdio::null()).output()?;
         let name = format!(
             "host.{}",
             fixture.path.rsplit('/').next().unwrap_or(fixture.path)
