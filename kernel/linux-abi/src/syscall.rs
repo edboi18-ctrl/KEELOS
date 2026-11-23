@@ -46,6 +46,7 @@ pub mod nr {
     pub const PREAD64: u64 = 17;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
+    pub const EXECVE: u64 = 59;
     pub const EXIT: u64 = 60;
     pub const FCNTL: u64 = 72;
     pub const SIGALTSTACK: u64 = 131;
@@ -101,6 +102,7 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::OPEN as usize] = Some(|p, a| openat(p, AT_FDCWD, a[0], a[1] | O_LARGEFILE, a[2]));
     t[nr::PREAD64 as usize] = Some(|p, a| pread64(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     t[nr::FCNTL as usize] = Some(|p, a| fcntl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
+    t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
     t[nr::MMAP as usize] = Some(|p, a| mmap(p, a[0], a[1], a[2], a[3], a[4] as u32 as i32, a[5]));
     t[nr::MUNMAP as usize] = Some(|p, a| munmap(p, a[0], a[1]));
     t[nr::MPROTECT as usize] = Some(|p, a| mprotect(p, a[0], a[1], a[2]));
@@ -310,11 +312,17 @@ fn file(
 /// Copies a NUL-terminated path from user memory, one page at a time so a
 /// string ending just before an unmapped page is still read.
 fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
+    user_string(address, PATH_MAX, Errno::ENAMETOOLONG)
+}
+
+/// A NUL-terminated string from user memory, read a page at a time. With
+/// its NUL it must fit in `max` bytes, else `too_long`.
+fn user_string(address: u64, max: usize, too_long: Errno) -> Result<Vec<u8>, Errno> {
     let mut path = Vec::new();
     let mut at = address;
     loop {
         let room = (PAGE - at % PAGE) as usize;
-        let take = room.min(PATH_MAX - path.len());
+        let take = room.min(max - path.len());
         let mut buf = [0u8; PAGE as usize];
         copy_from_user(&mut buf[..take], at).map_err(fault)?;
         if let Some(end) = buf[..take].iter().position(|&b| b == 0) {
@@ -322,8 +330,8 @@ fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
             return Ok(path);
         }
         path.extend_from_slice(&buf[..take]);
-        if path.len() >= PATH_MAX {
-            return Err(Errno::ENAMETOOLONG);
+        if path.len() >= max {
+            return Err(too_long);
         }
         at = at.checked_add(take as u64).ok_or(Errno::EFAULT)?;
     }
@@ -331,6 +339,112 @@ fn user_path(address: u64) -> Result<Vec<u8>, Errno> {
 
 fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult {
     read_at(p, fd, buf, count, None)
+}
+
+/// Longest argument or environment string, its NUL included: Linux's
+/// MAX_ARG_STRLEN, 32 pages (`include/uapi/linux/binfmts.h`).
+const MAX_ARG_STRLEN: usize = 32 * PAGE as usize;
+
+/// The strings of a NULL-terminated array of string pointers in user
+/// memory (execve's argv or envp). A NULL array is empty, as on Linux.
+/// The pointers (8 bytes each) and the strings together must fit the
+/// initial-stack limit (`exec::ARG_LIMIT`), else E2BIG, checked as they
+/// are read, so a huge array is refused without being read in full.
+fn user_strings(array: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
+    let mut strings = Vec::new();
+    if array == 0 {
+        return Ok(strings);
+    }
+    loop {
+        let at = array
+            .checked_add(strings.len() as u64 * 8)
+            .ok_or(Errno::EFAULT)?;
+        let mut pointer = [0u8; 8];
+        copy_from_user(&mut pointer, at).map_err(fault)?;
+        let pointer = u64::from_le_bytes(pointer);
+        if pointer == 0 {
+            return Ok(strings);
+        }
+        let string = user_string(pointer, MAX_ARG_STRLEN, Errno::E2BIG)?;
+        *budget = budget
+            .checked_sub(string.len() + 1 + 8)
+            .ok_or(Errno::E2BIG)?;
+        strings.push(string);
+    }
+}
+
+/// execve(2) (P3-T3): replaces the calling process's program. Everything
+/// that can fail is done first, leaving the process as it was: reading
+/// the path and the argument and environment strings, finding the file
+/// (from the process's root and working directory, so a compartment can
+/// only run what is in its tree), loading it and its interpreter into a
+/// new address space (`exec::load_in`, ADR 0015), and charging that
+/// space to the compartment's memory budget. Then, as Linux's
+/// begin_new_exec (`fs/exec.c` at v6.12): the new address space and
+/// program break, close-on-exec handles closed, caught signals reset and
+/// the alternate stack dropped (the blocked mask is kept), FS/GS bases and
+/// FPU state reset (`sched::exec_current`). The call "returns" into the
+/// new program.
+///
+/// As Linux: an empty argv gets "" as argv[0] (`do_execveat_common`,
+/// since 5.18); a string longer than MAX_ARG_STRLEN, or arguments that do
+/// not fit the stack, are E2BIG; a file that is not a regular file is
+/// EACCES; an unusable program ENOEXEC and an unusable interpreter
+/// ELIBBAD. Mode bits grant nothing (SR-6), so no execute bit is checked.
+fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysResult {
+    let path = user_path(path)?;
+    let mut budget = crate::exec::ARG_LIMIT;
+    let mut args = user_strings(argv, &mut budget)?;
+    let env = user_strings(envp, &mut budget)?;
+    if args.is_empty() {
+        args.push(Vec::new());
+    }
+    let (root, cwd, compartment) = {
+        let process = p.lock();
+        (
+            process.root,
+            process.cwd,
+            process.member.compartment().clone(),
+        )
+    };
+    let file = fs::with(|fs| {
+        let ino = fs.lookup(root, cwd, &path)?;
+        if fs.kind(ino)? != Kind::File {
+            return Err(Errno::EACCES);
+        }
+        fs.contents(ino)
+    })?;
+    let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+    let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    let loaded = crate::exec::load_in(root, &file, &path, &args, &env).map_err(|e| e.errno())?;
+    loaded
+        .space
+        .attach_budget(compartment.memory().clone())
+        .map_err(|_| Errno::ENOMEM)?;
+
+    // No failure past this point: the old program is gone.
+    let (old_space, closed) = {
+        let mut process = p.lock();
+        let old = core::mem::replace(&mut process.space, loaded.space.clone());
+        process.brk_start = loaded.brk_start;
+        process.brk = loaded.brk_start;
+        process.clear_child_tid = 0;
+        process.signals.reset_for_exec();
+        (old, process.handles.take_close_on_exec())
+    };
+    // Closed outside the process lock, as close(2) does.
+    drop(closed);
+    // The thread switches to the new space here; only then may the old
+    // one (still the CPU's until now) be dropped.
+    let switched = sched::exec_current(loaded.space, loaded.entry, loaded.rsp);
+    drop(old_space);
+    if switched.is_err() {
+        // Past the point of no return there is nothing to return to: as
+        // Linux's bprm_execve (force_fatal_sig(SIGSEGV), `fs/exec.c`), the
+        // thread ends as if by SIGSEGV.
+        sched::exit_with(128 + 11);
+    }
+    Ok(0)
 }
 
 /// fcntl(2), the descriptor flags only (more commands as the trace needs

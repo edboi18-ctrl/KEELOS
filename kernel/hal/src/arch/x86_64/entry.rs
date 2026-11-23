@@ -416,7 +416,7 @@ const SYSCALL_FLAG_MASK: u64 = 1 << 8 | 1 << 9 | 1 << 10 | 3 << 12 | 1 << 14 | 1
 /// ID. IOPL, NT, RF, VM, VIF and VIP are forced to 0 and IF to 1 on every
 /// return to user mode (SR-9: IOPL must stay 0).
 const USER_RFLAGS_MASK: u64 = 0x24_0DD5;
-const RFLAGS_FIXED: u64 = 0x202;
+pub(crate) const RFLAGS_FIXED: u64 = 0x202;
 
 /// Sets up the SYSCALL MSRs and points TSS.RSP0 at the trampoline stack.
 /// Call once at boot, after paging.

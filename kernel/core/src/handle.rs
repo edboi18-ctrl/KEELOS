@@ -115,6 +115,21 @@ impl<T: Clone> HandleTable<T> {
         i32::try_from(index).map_err(|_| Errno::EMFILE)
     }
 
+    /// Removes every handle marked close-on-exec and returns them (execve;
+    /// Linux's do_close_on_exec). The caller drops them, outside any lock
+    /// it holds.
+    pub fn take_close_on_exec(&mut self) -> alloc::vec::Vec<Handle<T>> {
+        let mut closed = alloc::vec::Vec::new();
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|h| h.close_on_exec)
+                && let Some(handle) = slot.take()
+            {
+                closed.push(handle);
+            }
+        }
+        closed
+    }
+
     /// Whether `fd` is closed by execve (FD_CLOEXEC). EBADF if no handle.
     pub fn close_on_exec(&self, fd: i32) -> Result<bool, Errno> {
         self.slot(fd).map(|h| h.close_on_exec).ok_or(Errno::EBADF)
@@ -295,5 +310,23 @@ mod tests {
         assert_eq!(table.close_on_exec(fd + 1), Err(Errno::EBADF));
         assert_eq!(table.set_close_on_exec(-1, true), Err(Errno::EBADF));
         assert_eq!(table.set_close_on_exec(100, true), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn exec_closes_only_close_on_exec_handles() {
+        let mut table: HandleTable<u8> = HandleTable::new(4);
+        let handle = |object, close_on_exec| Handle {
+            object,
+            rights: Rights::READ,
+            close_on_exec,
+        };
+        let kept = table.insert(handle(1, false)).unwrap();
+        let gone = table.insert(handle(2, true)).unwrap();
+        let closed = table.take_close_on_exec();
+        assert_eq!(closed.iter().map(|h| h.object).collect::<Vec<_>>(), [2]);
+        assert_eq!(table.get(kept, Rights::READ), Ok(&1));
+        assert_eq!(table.get(gone, Rights::NONE), Err(Errno::EBADF));
+        // The freed number is used again.
+        assert_eq!(table.insert(handle(3, false)), Ok(gone));
     }
 }

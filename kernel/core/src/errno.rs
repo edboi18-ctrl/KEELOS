@@ -31,6 +31,7 @@ pub enum Errno {
     ENOSYS = 38,
     ENOTEMPTY = 39,
     ELOOP = 40,
+    ELIBBAD = 80,
 }
 
 impl Errno {

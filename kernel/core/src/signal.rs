@@ -207,6 +207,29 @@ impl SignalState {
         Ok(old)
     }
 
+    /// What execve keeps (Linux v6.12 `fs/exec.c`, begin_new_exec): the
+    /// blocked mask. Every caught signal goes back to `SIG_DFL` and ignored
+    /// ones stay ignored, with flags, restorer and mask cleared
+    /// (`flush_signal_handlers(me, 0)`, `kernel/signal.c`); the alternate
+    /// stack is dropped (`sas_ss_sp = sas_ss_size = 0`). execve(2): "The
+    /// dispositions of any signals that are being caught are reset to the
+    /// default."
+    pub fn reset_for_exec(&mut self) {
+        for action in &mut self.actions {
+            if action.handler != SIG_IGN {
+                action.handler = SIG_DFL;
+            }
+            action.flags = 0;
+            action.restorer = 0;
+            action.mask = 0;
+        }
+        self.altstack = AltStack {
+            sp: 0,
+            flags: SS_DISABLE,
+            size: 0,
+        };
+    }
+
     /// `rt_sigprocmask` after its size check: returns the mask as it was
     /// before the call. With no new set, `how` is not checked (as Linux).
     pub fn sigprocmask(&mut self, how: i32, set: Option<u64>) -> Result<u64, Errno> {
@@ -431,5 +454,55 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn exec_resets_caught_signals_and_the_alternate_stack_but_keeps_the_mask() {
+        let mut state = SignalState::new();
+        let caught = SigAction {
+            handler: 0x40_1000,
+            flags: 0x0400_0000, // SA_RESTORER
+            restorer: 0x40_2000,
+            mask: 0b110,
+        };
+        state.sigaction(10, Some(caught)).unwrap();
+        state
+            .sigaction(
+                13,
+                Some(SigAction {
+                    handler: SIG_IGN,
+                    flags: 0x0400_0000,
+                    restorer: 0x40_2000,
+                    mask: 1,
+                }),
+            )
+            .unwrap();
+        state.sigprocmask(SIG_SETMASK, Some(1 << 9)).unwrap();
+        state
+            .sigaltstack(
+                Some(AltStack {
+                    sp: 0x7000_0000,
+                    flags: 0,
+                    size: 0x4000,
+                }),
+                0x7fff_0000,
+            )
+            .unwrap();
+        state.reset_for_exec();
+        let blank = |handler| SigAction {
+            handler,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        assert_eq!(state.action(10), Some(blank(SIG_DFL)));
+        assert_eq!(
+            state.action(13),
+            Some(blank(SIG_IGN)),
+            "ignored stays ignored"
+        );
+        assert_eq!(state.blocked(), 1 << 9, "the mask survives");
+        let old = state.sigaltstack(None, 0x7fff_0000).unwrap();
+        assert_eq!(old.flags, SS_DISABLE);
     }
 }

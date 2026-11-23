@@ -60,6 +60,9 @@ struct Thread {
     /// whenever this thread is switched in. The kernel never uses FS or GS
     /// itself (ADR 0005), so these need no saving on kernel entry.
     user_bases: [u64; 2],
+    /// Set by `exec_current` during a system call: the new program's RIP
+    /// and RSP, which the system-call return path puts in the frame.
+    pending_exec: Option<(u64, u64)>,
 }
 
 /// How a user thread's last exception looked, for tests and diagnostics.
@@ -131,6 +134,7 @@ pub fn init() -> Result<(), SchedError> {
         space: None,
         user_entry: None,
         user_bases: [0; 2],
+        pending_exec: None,
     });
     let mut sched = Scheduler {
         threads: BTreeMap::new(),
@@ -215,6 +219,7 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         space: None,
         user_entry: None,
         user_bases: [0; 2],
+        pending_exec: None,
     }))
 }
 
@@ -375,6 +380,19 @@ pub fn set_ibpb_on_switch(enabled: bool) {
     IBPB_ON_SWITCH.store(enabled, Ordering::Relaxed);
 }
 
+/// Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
+/// different user address space is about to run, so branch predictions
+/// trained by one program cannot steer another. Called on every context
+/// switch and when execve gives a thread a new program.
+fn barrier_if_new_space(space: &AddressSpace) {
+    if note_user_space(space) && IBPB_ON_SWITCH.load(Ordering::Relaxed) {
+        // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
+        // enabled only after `set_ibpb_on_switch` checked CPUID for it.
+        // Writing it has no effect on memory.
+        unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
+    }
+}
+
 /// Makes `space` the running thread's address space and switches to it;
 /// returns the previous one. The scheduler restores a thread's recorded
 /// space whenever it runs again, so a temporary switch made this way
@@ -469,6 +487,57 @@ pub fn user_base(which: SegmentBase) -> u64 {
         .as_ref()
         .and_then(|s| s.threads.get(&s.current))
         .map_or(0, |t| t.user_bases[which as usize])
+}
+
+/// Replaces the running thread's program (execve): from now on it runs in
+/// `space`, and when the current system call returns it enters user mode
+/// at `rip` with stack pointer `rsp` and every other register cleared.
+/// The user FS and GS bases are reset to 0, as Linux's elf_common_init
+/// (ELF_PLAT_INIT, `arch/x86/include/asm/elf.h` at v6.12) does, and the
+/// FPU/SSE/AVX state to its initial values (x87 control word 037FH, MXCSR
+/// 1F80H), as flush_thread's fpu_flush_thread (`arch/x86/kernel/process.c`). The old
+/// address space is dropped here, after the switch, unless something else
+/// still holds it. Only for a thread that runs user code.
+pub fn exec_current(space: Arc<AddressSpace>, rip: u64, rsp: u64) -> Result<(), BaseError> {
+    let fresh = FpuState::new().ok_or(BaseError::NotUserThread)?;
+    if SCHED
+        .lock()
+        .as_ref()
+        .and_then(|s| s.threads.get(&s.current))
+        .is_none_or(|t| t.space.is_none())
+    {
+        return Err(BaseError::NotUserThread);
+    }
+    barrier_if_new_space(&space);
+    let old = swap_space(Some(space));
+    set_user_base(SegmentBase::Fs, 0)?;
+    set_user_base(SegmentBase::Gs, 0)?;
+    {
+        let mut guard = SCHED.lock();
+        let sched = guard.as_mut().ok_or(BaseError::NotUserThread)?;
+        let current = sched.current;
+        let thread = sched
+            .threads
+            .get_mut(&current)
+            .ok_or(BaseError::NotUserThread)?;
+        // The CPU's registers belong to this thread now (it is running):
+        // load the initial state, and keep the same values as its saved
+        // area for the next switch.
+        fresh.restore();
+        thread.fpu = fresh;
+        thread.pending_exec = Some((rip, rsp));
+    }
+    drop(old);
+    Ok(())
+}
+
+/// The entry point and stack `exec_current` left for the running thread,
+/// taken (so they are used once).
+pub(crate) fn take_pending_exec() -> Option<(u64, u64)> {
+    let mut guard = SCHED.lock();
+    let sched = guard.as_mut()?;
+    let current = sched.current;
+    sched.threads.get_mut(&current)?.pending_exec.take()
 }
 
 /// Ends the running thread.
@@ -608,17 +677,8 @@ fn schedule(next_state: State) {
     let stack_top = next.stack.as_ref().map_or(0, |s| s.top);
     entry::set_current(kernel_cr3, user_cr3, stack_top);
     crate::vm::set_current(next.space.clone());
-    // Spectre v2 between processes (SR-15; P1-S4): a barrier whenever a
-    // different user address space is about to run, so branch predictions
-    // trained by one process cannot steer another.
-    if let Some(space) = next.space.as_ref()
-        && note_user_space(space)
-        && IBPB_ON_SWITCH.load(Ordering::Relaxed)
-    {
-        // SAFETY: IA32_PRED_CMD (49h) bit 0 = IBPB (Linux msr-index.h);
-        // enabled only after `set_ibpb_on_switch` checked CPUID for it.
-        // Writing it has no effect on memory.
-        unsafe { cpu::wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB) };
+    if let Some(space) = next.space.as_ref() {
+        barrier_if_new_space(space);
     }
     if next.space.is_some() {
         // SAFETY: both values were checked to be user (hence canonical)

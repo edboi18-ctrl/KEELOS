@@ -65,6 +65,26 @@ pub enum LoadError {
     Copy,
     /// The interpreter could not be read (not found, not a regular file).
     Interpreter(Errno),
+    /// The interpreter is not a usable ELF image (ELIBBAD, as Linux).
+    BadInterpreter(ElfError),
+}
+
+impl LoadError {
+    /// The errno execve(2) reports, as Linux's load_elf_binary
+    /// (`fs/binfmt_elf.c` at v6.12): ENOEXEC for a program that is not a
+    /// usable ELF executable, ELIBBAD for such an interpreter ("Accessing
+    /// a corrupted shared library"), the lookup's error for a missing one,
+    /// E2BIG for arguments that do not fit, ENOMEM otherwise.
+    pub fn errno(self) -> Errno {
+        match self {
+            LoadError::Elf(_) => Errno::ENOEXEC,
+            LoadError::BadInterpreter(_) => Errno::ELIBBAD,
+            LoadError::Interpreter(errno) => errno,
+            LoadError::Stack(ExecError::TooLarge) => Errno::E2BIG,
+            LoadError::Stack(_) => Errno::EINVAL,
+            LoadError::Memory(_) | LoadError::Copy => Errno::ENOMEM,
+        }
+    }
 }
 
 impl From<ElfError> for LoadError {
@@ -194,16 +214,18 @@ pub fn load_in(
         None => None,
         Some(interp_path) => {
             let interp_file = read_interpreter(root, interp_path)?;
-            let interp = elf::parse(&interp_file)?;
+            let interp = elf::parse(&interp_file).map_err(LoadError::BadInterpreter)?;
             if interp.interpreter.is_some() {
-                return Err(LoadError::Elf(ElfError::Interpreter));
+                return Err(LoadError::BadInterpreter(ElfError::Interpreter));
             }
             if interp.kind != Kind::Relocatable {
-                return Err(LoadError::Elf(ElfError::BadInterpreter));
+                return Err(LoadError::BadInterpreter(ElfError::BadInterpreter));
             }
             let (first, last) = interp.span();
             let base = space.map(Placement::Anywhere { hint: 0 }, last - first, Prot::NONE)?;
-            let interp_bias = interp.bias_for_base(base)?;
+            let interp_bias = interp
+                .bias_for_base(base)
+                .map_err(LoadError::BadInterpreter)?;
             map_image(&space, &interp, &interp_file, interp_bias)?;
             Some((interp.entry + interp_bias, interp_bias))
         }

@@ -100,3 +100,8 @@ bench = false
 name = "filemap"
 test = false
 bench = false
+
+[[bin]]
+name = "execprobe"
+test = false
+bench = false

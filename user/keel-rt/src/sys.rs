@@ -31,6 +31,7 @@ pub mod nr {
     pub const FCNTL: u64 = 72;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
+    pub const EXECVE: u64 = 59;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
@@ -148,6 +149,56 @@ pub fn openat(dirfd: i32, path: &CStr, flags: u64, mode: u64) -> i64 {
 
 pub fn openat_from(path: Hostile, flags: u64) -> i64 {
     call6(nr::OPENAT, [AT_FDCWD as u64, path.0, flags, 0, 0, 0])
+}
+
+/// execve(2) of `path` with these arguments (`None`: a NULL argv) and
+/// environment, at most 15 of each. Returns only on failure, with -errno;
+/// on success this program is replaced, so no Rust state of it survives.
+pub fn execve(path: &CStr, argv: Option<&[&CStr]>, envp: &[&CStr]) -> i64 {
+    let mut args = [0u64; 16];
+    let mut env = [0u64; 16];
+    let Some(argv_list) = argv.map_or(Some(&[][..]), Some).filter(|a| a.len() < 16) else {
+        return -7; // E2BIG
+    };
+    if envp.len() >= 16 {
+        return -7;
+    }
+    for (slot, arg) in args.iter_mut().zip(argv_list) {
+        *slot = arg.as_ptr() as u64;
+    }
+    for (slot, var) in env.iter_mut().zip(envp) {
+        *slot = var.as_ptr() as u64;
+    }
+    let argv_ptr = if argv.is_some() {
+        args.as_ptr() as u64
+    } else {
+        0
+    };
+    call3(
+        nr::EXECVE,
+        path.as_ptr() as u64,
+        argv_ptr,
+        env.as_ptr() as u64,
+    )
+}
+
+/// execve(2) with the path at a hostile address (and no arguments).
+pub fn execve_from(path: Hostile) -> i64 {
+    call3(nr::EXECVE, path.0, 0, 0)
+}
+
+/// The FS base (arch_prctl ARCH_GET_FS), or -errno.
+pub fn fs_base() -> Result<u64, i64> {
+    let mut base = 0u64;
+    let r = call3(nr::ARCH_PRCTL, ARCH_GET_FS, &raw mut base as u64, 0);
+    if r < 0 { Err(r) } else { Ok(base) }
+}
+
+/// The GS base (arch_prctl ARCH_GET_GS, 0x1004), or -errno.
+pub fn gs_base() -> Result<u64, i64> {
+    let mut base = 0u64;
+    let r = call3(nr::ARCH_PRCTL, 0x1004, &raw mut base as u64, 0);
+    if r < 0 { Err(r) } else { Ok(base) }
 }
 
 /// fcntl(2) with an integer argument.

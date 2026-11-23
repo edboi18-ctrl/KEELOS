@@ -1911,6 +1911,25 @@ fn phase3(t: &mut Runner) {
     phase3_tmpfs_quota(t);
     phase3_dynamic(t);
     phase3_file_mappings(t);
+    phase3_execve(t);
+}
+
+/// P3-T3: execve. user/tests/execprobe runs itself three times; it passes
+/// under Linux too (`host.execprobe`).
+fn phase3_execve(t: &mut Runner) {
+    const PROGRAM: &[u8] = b"/test/execprobe";
+    let before = memory::free_frames();
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    let after = memory::free_frames();
+    let ok = status == Some((0, None)) && after == before;
+    t.check(
+        "exec.execve",
+        ok,
+        "execve replaces the program: refusals as Linux (ENOENT, EACCES, EFAULT), an empty argv arrives as [\"\"], close-on-exec handles closed and others kept, caught signals reset, ignored ones and the blocked mask kept, the FS base cleared; no frame is lost across three programs",
+    );
+    if !ok {
+        kprintln!("  execprobe: {status:?}, free frames {before} -> {after}");
+    }
 }
 
 /// P3-T7, private file mappings: user/tests/filemap maps its own
@@ -2074,7 +2093,7 @@ fn phase3_dynamic(t: &mut Runner) {
     let refused = exec::load_in(fixed.root(), &file, PROGRAM, &[PROGRAM], &[]).err();
     let runs = run_in(&with_ldso, PROGRAM, &[PROGRAM]);
     let ok = missing == Some(LoadError::Interpreter(Errno::ENOENT))
-        && refused == Some(LoadError::Elf(ElfError::BadInterpreter))
+        && refused == Some(LoadError::BadInterpreter(ElfError::BadInterpreter))
         && runs == Some((0, None));
     t.check(
         "exec.interpreter_in_root",
