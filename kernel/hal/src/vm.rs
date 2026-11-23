@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use keel_core::compartment::Budget;
 use keel_core::frame::Frame;
 use keel_core::paging::{self, Flags, PageSize, TableAccess};
-use keel_core::vm::{self, FaultAction, Layout, Placement, Prot, VmError};
+use keel_core::vm::{self, Backing, FaultAction, Layout, Placement, Prot, VmError};
 
 use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::idt::{TrapFrame, page_fault};
@@ -87,6 +87,21 @@ impl Account {
 }
 
 const PAGE: u64 = vm::PAGE;
+
+/// Reads one page of a mapped file: fills `page` from file `object` at
+/// `offset` and returns how many bytes the file had there (the rest stays
+/// zero), or `None` if the page starts at or beyond the end of the file.
+pub type FileReader = fn(object: u64, offset: u64, page: &mut [u8; 4096]) -> Option<usize>;
+
+/// Installed by the personality that owns the files (`linux-abi`). Called
+/// from the page-fault path with the address-space lock held, so it may
+/// take the filesystem lock: nothing takes an address-space lock while
+/// holding the filesystem lock (no user memory is touched under it).
+static FILE_READER: IrqMutex<Option<FileReader>> = IrqMutex::new(None);
+
+pub fn set_file_reader(reader: FileReader) {
+    *FILE_READER.lock() = Some(reader);
+}
 
 /// Page-table rights for a user page with VMA protection `prot`.
 /// `writable` is false for pages shared copy-on-write.
@@ -239,8 +254,31 @@ impl AddressSpace {
 
     /// Adds a mapping (mmap). No memory is used until pages are touched.
     pub fn map(&self, placement: Placement, length: u64, prot: Prot) -> Result<u64, AsError> {
+        self.map_backed(placement, length, prot, None)
+    }
+
+    /// Adds a private mapping of a file (mmap with a descriptor, P3-T7).
+    /// Pages are read from the file through the installed `FileReader`
+    /// when first touched, into private frames.
+    pub fn map_file(
+        &self,
+        placement: Placement,
+        length: u64,
+        prot: Prot,
+        backing: Backing,
+    ) -> Result<u64, AsError> {
+        self.map_backed(placement, length, prot, Some(backing))
+    }
+
+    fn map_backed(
+        &self,
+        placement: Placement,
+        length: u64,
+        prot: Prot,
+        backing: Option<Backing>,
+    ) -> Result<u64, AsError> {
         let mut inner = self.inner.lock();
-        let (start, replaced) = inner.layout.map(placement, length, prot)?;
+        let (start, replaced) = inner.layout.map_backed(placement, length, prot, backing)?;
         for (from, to) in replaced {
             self.unmap_pages(&mut inner, from, to);
         }
@@ -360,33 +398,12 @@ impl AddressSpace {
         );
         match action {
             FaultAction::Violation => false,
-            FaultAction::DemandZero(prot) => {
-                // Over the compartment's memory limit the fault cannot be
-                // resolved, as when memory runs out: a user access ends
-                // the thread, a kernel copy returns EFAULT.
-                if !inner.account.charge(1) {
-                    return false;
-                }
-                let Some(frame) = memory::allocate_zeroed_user() else {
-                    inner.account.uncharge(1);
-                    return false;
-                };
-                let mapped = paging::map(
-                    &mut UserTables(DirectMapTables, &mut inner.account),
-                    self.root,
-                    page,
-                    frame.address(),
-                    PageSize::Small,
-                    user_flags(prot, true),
-                );
-                if mapped.is_err() {
-                    let _ = memory::release(frame);
-                    inner.account.uncharge(1);
-                }
-                self.sync_user_view();
-                // AlreadyMapped means another path mapped it first: retry.
-                matches!(mapped, Ok(()) | Err(paging::MapError::AlreadyMapped))
-            }
+            FaultAction::DemandZero(prot) => self.populate(&mut inner, page, prot, None),
+            FaultAction::FromFile {
+                prot,
+                object,
+                offset,
+            } => self.populate(&mut inner, page, prot, Some((object, offset))),
             FaultAction::CopyOnWrite(prot) => {
                 let Some(old) = paging::translate(&mut DirectMapTables, self.root, page) else {
                     return false;
@@ -417,6 +434,56 @@ impl AddressSpace {
                 replaced.is_ok()
             }
         }
+    }
+
+    /// Maps a fresh page at `page`: zeroed, or holding the file's bytes from
+    /// `file` = (object, offset). Charged to the account first: over the
+    /// compartment's memory limit the fault cannot be resolved, as when
+    /// memory runs out (a user access ends the thread, a kernel copy
+    /// returns EFAULT). A file page that starts at or past the end of the
+    /// file cannot be resolved either: Linux sends SIGBUS there (mmap(2)),
+    /// and until signals arrive (P3-T6) the fault ends the thread.
+    fn populate(&self, inner: &mut Inner, page: u64, prot: Prot, file: Option<(u64, u64)>) -> bool {
+        // Read the file before taking a frame: a page past the end costs
+        // nothing.
+        let mut contents = [0u8; 4096];
+        let filled = match file {
+            None => 0,
+            Some((object, offset)) => {
+                let reader = *FILE_READER.lock();
+                match reader.and_then(|read| read(object, offset, &mut contents)) {
+                    Some(n) => n.min(contents.len()),
+                    None => return false,
+                }
+            }
+        };
+        if !inner.account.charge(1) {
+            return false;
+        }
+        let Some(frame) = memory::allocate_zeroed_user() else {
+            inner.account.uncharge(1);
+            return false;
+        };
+        if filled > 0 && memory::fill_frame(frame, &contents[..filled]).is_err() {
+            let _ = memory::release(frame);
+            inner.account.uncharge(1);
+            return false;
+        }
+        let mapped = paging::map(
+            &mut UserTables(DirectMapTables, &mut inner.account),
+            self.root,
+            page,
+            frame.address(),
+            PageSize::Small,
+            user_flags(prot, true),
+        );
+        if mapped.is_err() {
+            let _ = memory::release(frame);
+            inner.account.uncharge(1);
+        }
+        self.sync_user_view();
+        // AlreadyMapped means another path mapped it first: retry.
+        matches!(mapped, Ok(()) | Err(paging::MapError::AlreadyMapped))
     }
 
     /// A copy of this address space in which every present page is shared

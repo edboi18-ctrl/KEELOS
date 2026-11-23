@@ -393,6 +393,24 @@ impl Region {
         }
     }
 
+    /// A private mapping of `fd` from file offset `offset` (mmap with
+    /// MAP_PRIVATE), placed by the kernel. Writes to it stay in this
+    /// process; the file is not changed.
+    pub fn map_file_private(length: u64, prot: u64, fd: i32, offset: u64) -> Result<Region, i64> {
+        let result = call6(
+            nr::MMAP,
+            [0, length, prot, MAP_PRIVATE, fd as u32 as u64, offset],
+        );
+        if result < 0 {
+            Err(result)
+        } else {
+            Ok(Region {
+                address: result as u64,
+                length,
+            })
+        }
+    }
+
     /// mmap at `address` exactly, with MAP_FIXED_NOREPLACE: fails (EEXIST)
     /// rather than replace anything already mapped, so it can never land
     /// on this program's own memory.
@@ -452,6 +470,18 @@ impl Region {
         // SAFETY: inside the mapping (checked); read_unaligned allows any
         // alignment; any 8 bytes are a valid u64.
         Some(unsafe { (at as *const u64).read_unaligned() })
+    }
+
+    /// Copies `buf.len()` bytes at `offset` into `buf`. Fails (`None`) if
+    /// the range does not fit. The region must be readable there; if it
+    /// is not, the read faults and the kernel ends the program.
+    pub fn read(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        let at = self.range(offset, buf.len())?;
+        // SAFETY: `[at, at + len)` lies inside this mapping (checked), in
+        // which no Rust object or reference exists (module rule), so it
+        // cannot overlap `buf`; any bytes are valid `u8`s.
+        unsafe { core::ptr::copy_nonoverlapping(at as *const u8, buf.as_mut_ptr(), buf.len()) };
+        Some(())
     }
 
     /// Writes `value` at `offset` (any alignment).

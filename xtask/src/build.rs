@@ -201,6 +201,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: false,
     },
     TestProgram {
+        path: "test/filemap",
+        binary: "filemap",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/nap",
         binary: "nap",
         args: &["10"],

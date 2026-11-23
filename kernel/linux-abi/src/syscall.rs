@@ -16,7 +16,7 @@ use keel_core::errno::Errno;
 
 use keel_core::handle::{Handle, Refusal, Rights};
 use keel_core::vfs::{Device, Kind, PATH_MAX};
-use keel_core::vm::{PAGE, Placement, Prot, USER_END, VmError};
+use keel_core::vm::{Backing, PAGE, Placement, Prot, USER_END, VmError};
 use keel_hal::sched::{self, SegmentBase};
 use keel_hal::sync::IrqMutex;
 use keel_hal::syscall::SyscallArgs;
@@ -62,6 +62,7 @@ type SysResult = Result<u64, Errno>;
 /// Registers the handler and the exit hook. Call once at boot.
 pub fn init() {
     keel_hal::syscall::set_handler(handle);
+    keel_hal::vm::set_file_reader(read_mapped_page);
     sched::set_exit_hook(process::on_thread_exit);
 }
 
@@ -267,7 +268,8 @@ fn vm_error(error: AsError) -> Errno {
         AsError::Vm(VmError::Invalid) => Errno::EINVAL,
         AsError::Vm(VmError::NoMemory) | AsError::OutOfMemory => Errno::ENOMEM,
         AsError::Vm(VmError::Exists) => Errno::EEXIST,
-        AsError::Vm(VmError::WriteExec) => Errno::EACCES,
+        AsError::Vm(VmError::WriteExec | VmError::NotExecutable) => Errno::EACCES,
+        AsError::Vm(VmError::BadOffset) => Errno::EINVAL,
     }
 }
 
@@ -612,16 +614,51 @@ fn mmap(
         // Shared mappings arrive with fork and file mappings (Phase 3).
         return Err(Errno::EINVAL);
     }
+    // A private file mapping (P3-T7). The handle must allow reading, and
+    // mapping executable if PROT_EXEC is asked for; whether it allows
+    // MAP_EXEC is recorded, so mprotect cannot add PROT_EXEC later
+    // without it (EACCES, as mprotect(2) for a file that may not be
+    // executed). Regular files only: /dev/zero maps as anonymous memory,
+    // as on Linux, and anything else is ENODEV ("The underlying filesystem
+    // of the specified file does not support memory mapping", mmap(2)).
+    //
+    // Errors as mmap(2): no handle EBADF; a handle not open for reading
+    // EACCES ("a file mapping was requested, but fd is not open for
+    // reading"); PROT_EXEC without MAP_EXEC EPERM (as for "a filesystem
+    // that was mounted no-exec").
+    let mut backing = None;
     if flags & MAP_ANONYMOUS == 0 {
-        // File mappings arrive with P3-T7; check the handle first so a bad
-        // descriptor still reports EBADF, then refuse.
-        let needs = if prot.exec {
-            Rights::READ | Rights::MAP_EXEC
-        } else {
-            Rights::READ
+        let open = file(p, fd, Rights::NONE)?;
+        let (may_read, may_exec) = {
+            let process = p.lock();
+            (
+                process.handles.check(fd, Rights::READ).is_ok(),
+                process.handles.check(fd, Rights::MAP_EXEC).is_ok(),
+            )
         };
-        file(p, fd, needs)?;
-        return Err(Errno::ENODEV);
+        if !may_read || (prot.exec && !may_exec) {
+            RIGHTS_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return Err(if may_read {
+                Errno::EPERM
+            } else {
+                Errno::EACCES
+            });
+        }
+        let (kind, node) = {
+            let f = open.lock();
+            (f.kind, f.node)
+        };
+        match kind {
+            Kind::File => {
+                backing = Some(Backing {
+                    object: u64::from(node),
+                    offset,
+                    may_exec,
+                });
+            }
+            Kind::Device(Device::Zero) => {}
+            _ => return Err(Errno::ENODEV),
+        }
     }
     let placement = if flags & MAP_FIXED_NOREPLACE != 0 {
         Placement::FixedNoReplace(address)
@@ -633,7 +670,27 @@ fn mmap(
         }
     };
     let space = p.lock().space.clone();
-    space.map(placement, length, prot).map_err(vm_error)
+    match backing {
+        Some(backing) => space.map_file(placement, length, prot, backing),
+        None => space.map(placement, length, prot),
+    }
+    .map_err(vm_error)
+}
+
+/// The `FileReader` for private file mappings: one page of the file at
+/// `object` (an inode) from `offset`. `None` at or past the end of the
+/// file (SIGBUS on Linux). Runs in the page-fault path, so it allocates
+/// nothing; it takes only the filesystem lock.
+fn read_mapped_page(object: u64, offset: u64, page: &mut [u8; 4096]) -> Option<usize> {
+    let ino = keel_core::vfs::Ino::try_from(object).ok()?;
+    fs::with(|fs| {
+        if offset >= fs.stat(ino)?.size {
+            return Ok(None);
+        }
+        fs.read(ino, offset, page).map(Some)
+    })
+    .ok()
+    .flatten()
 }
 
 fn munmap(p: &Arc<IrqMutex<Process>>, address: u64, length: u64) -> SysResult {

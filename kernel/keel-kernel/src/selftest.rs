@@ -1910,6 +1910,78 @@ fn phase3(t: &mut Runner) {
     phase3_memory_limit(t);
     phase3_tmpfs_quota(t);
     phase3_dynamic(t);
+    phase3_file_mappings(t);
+}
+
+/// P3-T7, private file mappings: user/tests/filemap maps its own
+/// executable and compares every byte with read(2). It passes under Linux
+/// too (`host.filemap`).
+fn phase3_file_mappings(t: &mut Runner) {
+    const PROGRAM: &[u8] = b"/test/filemap";
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    t.check(
+        "exec.file_mappings",
+        status == Some((0, None)),
+        "private file mappings hold the file's bytes at the right offsets (zero past the end), stay private when written, survive a split, and are refused as Linux refuses them (EACCES, EBADF, ENODEV, EINVAL)",
+    );
+    if status != Some((0, None)) {
+        kprintln!("  filemap: {status:?}");
+    }
+
+    // A page wholly past the end of the file cannot be filled: Linux sends
+    // SIGBUS (mmap(2)); here a kernel copy from it gets EFAULT, while the
+    // page holding the file's last byte reads normally.
+    use keel_core::vm::{Backing, Placement, Prot};
+    use keel_hal::vm::{AddressSpace, copy_from_user, with_address_space};
+    const AT: u64 = 0x1000_0000;
+    let ino = keel_linux_abi::fs::lookup(PROGRAM).ok();
+    let size = ino
+        .and_then(|ino| keel_linux_abi::fs::with(|fs| fs.stat(ino)).ok())
+        .map(|s| s.size);
+    let space = AddressSpace::new().ok();
+    let past_end = match (ino, size, space) {
+        (Some(ino), Some(size), Some(space)) => {
+            let last = (size - 1) / 4096 * 4096;
+            let map = |at, offset| {
+                let backing = Backing {
+                    object: u64::from(ino),
+                    offset,
+                    may_exec: false,
+                };
+                space.map_file(
+                    Placement::Fixed(at),
+                    4096,
+                    Prot {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                    backing,
+                )
+            };
+            let (a, b) = (map(AT, last), map(AT + 0x10000, last + 4096));
+            let mut byte = [0u8; 1];
+            let mut magic = [0u8; 4];
+            let tail = with_address_space(&space, || copy_from_user(&mut byte, AT));
+            let beyond = with_address_space(&space, || copy_from_user(&mut byte, AT + 0x10000));
+            let head = map(AT + 0x20000, 0).and_then(|_| {
+                with_address_space(&space, || copy_from_user(&mut magic, AT + 0x20000))
+                    .map_err(|_| keel_hal::vm::AsError::OutOfMemory)
+            });
+            a.is_ok()
+                && b.is_ok()
+                && tail.is_ok()
+                && beyond.is_err()
+                && head.is_ok()
+                && &magic == b"\x7fELF"
+        }
+        _ => false,
+    };
+    t.check(
+        "exec.file_mapping_past_end",
+        past_end,
+        "a mapped page wholly past the end of its file is not filled (a copy from it gets EFAULT; Linux sends SIGBUS), while the page holding the last byte and the first page read normally",
+    );
 }
 
 /// P3-T2: dynamically linked programs. The musl program names

@@ -95,3 +95,8 @@ bench = false
 name = "tmpquota"
 test = false
 bench = false
+
+[[bin]]
+name = "filemap"
+test = false
+bench = false
