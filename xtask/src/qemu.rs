@@ -73,7 +73,8 @@ pub const PHASES: &[Phase] = &[
         number: 3,
         complete: false,
         scenarios: &[],
-        expect_lines: &[],
+        // P3-T2: the dynamically linked musl program's line.
+        expect_lines: &["Hello from dynamically linked musl on Keel"],
         expect_prefixes: &[],
     },
 ];
@@ -855,7 +856,9 @@ fn test_user_programs_on_host() -> Result<()> {
                 "host.peldr.{}{mode}",
                 fixture.path.rsplit('/').next().unwrap_or(fixture.path)
             );
-            if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+            if output.status.success()
+                && Some(output.stdout.as_slice()) == fixture.stdout.map(str::as_bytes)
+            {
                 println!("  TEST {name} PASS peldr runs it under Linux: exact line, exit 0");
             } else {
                 return Err(format!(
@@ -868,9 +871,9 @@ fn test_user_programs_on_host() -> Result<()> {
             }
         }
     }
-    for fixture in build::TEST_FIXTURES {
-        // Run a copy: the committed file may lack the executable bit (it
-        // was committed from Windows).
+    // Copies of every fixture under target/fixtures (the committed files
+    // may lack the executable bit: they were committed from Windows).
+    let copy = |fixture: &build::TestFixture| -> Result<std::path::PathBuf> {
         let data = build::load_fixture(&root, fixture)?;
         let path = root.join("target").join("fixtures").join(fixture.path);
         util::write(&path, &data)?;
@@ -879,15 +882,31 @@ fn test_user_programs_on_host() -> Result<()> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
-        let output = Command::new(&path)
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()?;
+        Ok(path)
+    };
+    for fixture in build::TEST_FIXTURES {
+        let Some(stdout) = fixture.stdout else {
+            continue;
+        };
+        let path = copy(fixture)?;
+        let mut command = match fixture.host_via {
+            Some(via) => {
+                let interpreter = build::TEST_FIXTURES
+                    .iter()
+                    .find(|f| f.path == via)
+                    .ok_or_else(|| format!("{}: no fixture {via}", fixture.path))?;
+                let mut command = Command::new(copy(interpreter)?);
+                command.arg(&path);
+                command
+            }
+            None => Command::new(&path),
+        };
+        let output = command.env_clear().stdin(Stdio::null()).output()?;
         let name = format!(
             "host.{}",
             fixture.path.rsplit('/').next().unwrap_or(fixture.path)
         );
-        if output.status.success() && output.stdout == fixture.stdout.as_bytes() {
+        if output.status.success() && output.stdout == stdout.as_bytes() {
             println!("  TEST {name} PASS prints the expected line under Linux");
         } else {
             return Err(format!(

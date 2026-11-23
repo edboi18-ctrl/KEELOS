@@ -1801,7 +1801,8 @@ fn run_in(
     args: &[&[u8]],
 ) -> Option<(i64, Option<sched::UserFault>)> {
     let file = keel_linux_abi::fs::read_file(path).ok()?;
-    let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
+    // Its interpreter, if any, is looked up in the compartment's own tree.
+    let loaded = keel_linux_abi::exec::load_in(compartment.root(), &file, path, args, &[]).ok()?;
     let spawned = keel_linux_abi::process::spawn_in(compartment, "test", &loaded).ok()?;
     join(spawned.thread);
     sched::exit_status(spawned.thread)
@@ -1908,6 +1909,94 @@ fn phase3(t: &mut Runner) {
     }
     phase3_memory_limit(t);
     phase3_tmpfs_quota(t);
+    phase3_dynamic(t);
+}
+
+/// P3-T2: dynamically linked programs. The musl program names
+/// /lib/ld-musl-x86_64.so.1, musl's dynamic linker; the kernel loads both
+/// and starts the dynamic linker, which runs the program.
+fn phase3_dynamic(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::elf::ElfError;
+    use keel_core::errno::Errno;
+    use keel_linux_abi::exec::{self, LoadError};
+    use keel_linux_abi::{compartment, fs};
+
+    const PROGRAM: &[u8] = b"/test/musl-dynamic";
+    const LDSO: &[u8] = b"/lib/ld-musl-x86_64.so.1";
+    let file = fs::read_file(PROGRAM).ok();
+    // In the system compartment: the program's line is checked on serial.
+    let loaded = file
+        .as_ref()
+        .and_then(|f| exec::load(f, PROGRAM, &[PROGRAM], &[]).ok());
+    let base = loaded.as_ref().and_then(|l| l.interpreter_base);
+    let status = loaded.and_then(|l| {
+        let spawned = keel_linux_abi::process::spawn("musl-dynamic", &l).ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    });
+    // The interpreter lies in the mmap area, below the randomized stack,
+    // away from the program (loaded near DYN_BASE).
+    let placed = base.is_some_and(|b| b > exec::DYN_BASE + (1 << 40) && b % 4096 == 0);
+    t.check(
+        "exec.dynamic_musl",
+        status == Some((0, None)) && placed,
+        "a dynamically linked musl program runs: the kernel loads its PT_INTERP (musl's dynamic linker) in the mmap area and starts it, AT_BASE set (its line is checked on serial)",
+    );
+    if !(status == Some((0, None)) && placed) {
+        kprintln!("  musl-dynamic: exit {status:?}, interpreter at {base:#x?}");
+    }
+
+    // In a compartment, the interpreter is found in the compartment's own
+    // tree: without /lib there the program cannot load (ENOENT), with a
+    // copy of the dynamic linker it runs.
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        fs.create_dir(comp, b"bare", 0o755)?;
+        let dyn_root = fs.create_dir(comp, b"dyn", 0o755)?;
+        let lib = fs.create_dir(dyn_root, b"lib", 0o755)?;
+        let ldso = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, LDSO)?;
+        let bytes = fs.contents(ldso)?;
+        let copy = fs.create_file(lib, b"ld-musl-x86_64.so.1", 0o755)?;
+        fs.write(copy, 0, &bytes)?;
+        // A static executable as the "interpreter": refused.
+        let fixed = fs.create_dir(comp, b"fixed", 0o755)?;
+        let lib = fs.create_dir(fixed, b"lib", 0o755)?;
+        let startup = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/test/startup")?;
+        let bytes = fs.contents(startup)?;
+        let copy = fs.create_file(lib, b"ld-musl-x86_64.so.1", 0o755)?;
+        fs.write(copy, 0, &bytes)?;
+        Ok(())
+    });
+    let at = |path: &[u8]| compartment::create(path, Limits::UNLIMITED).ok();
+    let (Ok(()), Some(file), Some(bare), Some(with_ldso), Some(fixed)) = (
+        made,
+        file,
+        at(b"/comp/bare"),
+        at(b"/comp/dyn"),
+        at(b"/comp/fixed"),
+    ) else {
+        t.check(
+            "exec.interpreter_in_root",
+            false,
+            "setting up the interpreter compartments",
+        );
+        return;
+    };
+    let missing = exec::load_in(bare.root(), &file, PROGRAM, &[PROGRAM], &[]).err();
+    let refused = exec::load_in(fixed.root(), &file, PROGRAM, &[PROGRAM], &[]).err();
+    let runs = run_in(&with_ldso, PROGRAM, &[PROGRAM]);
+    let ok = missing == Some(LoadError::Interpreter(Errno::ENOENT))
+        && refused == Some(LoadError::Elf(ElfError::BadInterpreter))
+        && runs == Some((0, None));
+    t.check(
+        "exec.interpreter_in_root",
+        ok,
+        "a compartment's program finds its interpreter in the compartment's tree: ENOENT without one, a fixed-address one refused, a copy of the dynamic linker runs it",
+    );
+    if !ok {
+        kprintln!("  missing {missing:?}, fixed {refused:?}, with ld.so {runs:?}");
+    }
 }
 
 /// P3-S4 tmpfs, the rest of Phase 2 audit item 1: each compartment's file

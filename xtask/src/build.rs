@@ -259,18 +259,42 @@ pub struct TestFixture {
     /// the workspace root.
     pub file: &'static str,
     pub hash_file: &'static str,
-    /// What it must print on standard output.
-    pub stdout: &'static str,
+    /// What it must print on standard output; `None` for a file that is
+    /// not run on its own (the dynamic linker).
+    pub stdout: Option<&'static str>,
+    /// Under Linux, run it through this fixture (its initramfs path) as a
+    /// command, `interpreter program`: the host has no musl dynamic linker
+    /// at the path the program names, but musl's can be run directly.
+    pub host_via: Option<&'static str>,
 }
 
 /// Phase 1 acceptance item 1: musl "hello world", built from
 /// fixtures/musl-hello by its Dockerfile.
-pub const TEST_FIXTURES: &[TestFixture] = &[TestFixture {
-    path: "test/musl-hello",
-    file: "fixtures/musl-hello/hello",
-    hash_file: "fixtures/musl-hello/hello.sha256",
-    stdout: "Hello from musl on Keel\n",
-}];
+/// P3-T2: the same, dynamically linked, with musl's dynamic linker at the
+/// path its PT_INTERP names; both from fixtures/musl-dynamic.
+pub const TEST_FIXTURES: &[TestFixture] = &[
+    TestFixture {
+        path: "test/musl-hello",
+        file: "fixtures/musl-hello/hello",
+        hash_file: "fixtures/musl-hello/hello.sha256",
+        stdout: Some("Hello from musl on Keel\n"),
+        host_via: None,
+    },
+    TestFixture {
+        path: "test/musl-dynamic",
+        file: "fixtures/musl-dynamic/hello",
+        hash_file: "fixtures/musl-dynamic/hello.sha256",
+        stdout: Some("Hello from dynamically linked musl on Keel\n"),
+        host_via: Some("lib/ld-musl-x86_64.so.1"),
+    },
+    TestFixture {
+        path: "lib/ld-musl-x86_64.so.1",
+        file: "fixtures/musl-dynamic/ld-musl-x86_64.so.1",
+        hash_file: "fixtures/musl-dynamic/ld-musl.sha256",
+        stdout: None,
+        host_via: None,
+    },
+];
 
 /// Phase 2: Windows executables, run through `peldr` (not natively), with
 /// what they print. In the initramfs of test builds at `path`.
@@ -278,7 +302,8 @@ pub const PE_FIXTURES: &[TestFixture] = &[TestFixture {
     path: "winetest/hello.exe",
     file: "winetest/hello-console/hello.exe",
     hash_file: "winetest/hello-console/hello.sha256",
-    stdout: "Hello from a Windows executable on Keel\r\n",
+    stdout: Some("Hello from a Windows executable on Keel\r\n"),
+    host_via: None,
 }];
 
 /// Reads a fixture and checks it against its recorded SHA-256 (SR-29: every
@@ -575,7 +600,8 @@ mod tests {
             path: "test/x",
             file: "target/fixture-test/bin",
             hash_file: "target/fixture-test/bin.sha256",
-            stdout: "",
+            stdout: None,
+            host_via: None,
         };
         assert!(load_fixture(&root, &tampered).is_err());
     }
