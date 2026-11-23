@@ -1914,6 +1914,35 @@ fn phase3(t: &mut Runner) {
     phase3_file_mappings(t);
     phase3_execve(t);
     phase3_fork(t);
+    phase3_shared_frame_limit(t);
+}
+
+/// Phase 2 audit item 4: a frame's reference count can fill up from user
+/// mode. The real limit, 65534, is tested on the host
+/// (`keel_core::frame`); here it is lowered to 12 so a dozen processes
+/// reach it: the program's pages then have 12 sharers, so fork number 12
+/// is refused with ENOMEM. The partial copy is undone, the kernel carries
+/// on, every frame comes back, and the limit is restored.
+fn phase3_shared_frame_limit(t: &mut Runner) {
+    const PROGRAM: &[u8] = b"/test/forkprobe";
+    const LIMIT: u16 = 12;
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let before = outside_heap();
+    let previous = memory::set_reference_limit(LIMIT);
+    let status = run_test_program(PROGRAM, &[PROGRAM, b"sharers"]);
+    memory::set_reference_limit(previous);
+    let after = outside_heap();
+    // The program's text pages are shared by it and every child, so they
+    // hit the limit first: LIMIT - 1 children.
+    let ok = status == Some((i64::from(LIMIT) - 1, None)) && after == before;
+    t.check(
+        "vm.shared_frame_limit",
+        ok,
+        "with a frame's reference limit lowered to 12, fork from user mode gets 11 children and then ENOMEM; nothing leaks and the program keeps running",
+    );
+    if !ok {
+        kprintln!("  sharers: {status:?}; frames outside the heap {before} -> {after}");
+    }
 }
 
 /// P3-T3: fork and wait4, and a fork bomb against a compartment's process

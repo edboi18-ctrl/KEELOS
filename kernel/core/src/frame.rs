@@ -111,7 +111,13 @@ pub struct FrameAllocator<'a> {
     free: usize,
     /// Word index to start the next search at.
     next: usize,
+    /// Most references a frame may have: `MAX_REFERENCES`, lower in tests.
+    reference_limit: u16,
 }
+
+/// Most references a frame may have: RESERVED is not a real count, so the
+/// last usable value is one below it.
+pub const MAX_REFERENCES: u16 = RESERVED - 1;
 
 impl<'a> FrameAllocator<'a> {
     /// Creates an allocator for frames `0..frame_count` with every frame
@@ -130,6 +136,7 @@ impl<'a> FrameAllocator<'a> {
             frame_count,
             free: 0,
             next: 0,
+            reference_limit: MAX_REFERENCES,
         })
     }
 
@@ -237,12 +244,17 @@ impl<'a> FrameAllocator<'a> {
         Ok(index)
     }
 
+    /// Lowers the most references a frame may have (tests reach the limit
+    /// with a handful of processes instead of 65534), at most to
+    /// `MAX_REFERENCES`; returns the previous limit.
+    pub fn set_reference_limit(&mut self, limit: u16) -> u16 {
+        core::mem::replace(&mut self.reference_limit, limit.clamp(1, MAX_REFERENCES))
+    }
+
     /// Adds a reference to an allocated frame (copy-on-write sharing).
     pub fn retain(&mut self, frame: Frame) -> Result<(), FrameError> {
         let index = self.allocated_index(frame)?;
-        // RESERVED is not a real count, so the last usable value is one
-        // below it.
-        if self.refs[index] >= RESERVED - 1 {
+        if self.refs[index] >= self.reference_limit {
             return Err(FrameError::TooManyReferences);
         }
         self.refs[index] += 1;
@@ -403,6 +415,27 @@ mod tests {
             a.retain(Frame::containing(1 << 40)),
             Err(FrameError::NotAllocated)
         );
+    }
+
+    #[test]
+    fn a_lowered_reference_limit_applies_and_can_be_restored() {
+        let (mut used, mut refs) = allocator(8);
+        let mut a = FrameAllocator::new(8, &mut used, &mut refs).unwrap();
+        a.add_free_region(0, 8 * 4096);
+        let frame = a.allocate().unwrap();
+        assert_eq!(a.set_reference_limit(3), MAX_REFERENCES);
+        assert_eq!(a.retain(frame), Ok(()));
+        assert_eq!(a.retain(frame), Ok(()));
+        assert_eq!(
+            a.retain(frame),
+            Err(FrameError::TooManyReferences),
+            "3 references"
+        );
+        // Never above the real limit, never 0.
+        assert_eq!(a.set_reference_limit(u16::MAX), 3);
+        assert_eq!(a.set_reference_limit(0), MAX_REFERENCES);
+        assert_eq!(a.set_reference_limit(MAX_REFERENCES), 1);
+        assert_eq!(a.retain(frame), Ok(()));
     }
 
     #[test]

@@ -309,6 +309,17 @@ pub(crate) fn retain(frame: Frame) -> Result<(), FrameError> {
         .retain(frame)
 }
 
+/// Lowers the most references a frame may have (tests), and returns the
+/// previous limit. See `FrameAllocator::set_reference_limit`.
+pub fn set_reference_limit(limit: u16) -> u16 {
+    FRAMES
+        .lock()
+        .as_mut()
+        .map_or(keel_core::frame::MAX_REFERENCES, |a| {
+            a.set_reference_limit(limit)
+        })
+}
+
 /// Drops a reference; the frame is freed when the last one goes.
 pub(crate) fn release(frame: Frame) -> Result<bool, FrameError> {
     FRAMES

@@ -70,9 +70,49 @@ fn bomb() -> i32 {
     children
 }
 
+/// Forks children that only wait, so this program's pages gain one more
+/// sharer per child, until fork fails with ENOMEM (a frame's reference
+/// count is full: the kernel's test lowers the limit); then reaps them
+/// all, writes to its memory, and exits with the number of children.
+fn sharers() -> i32 {
+    const ENOMEM: i64 = -12;
+    let mut children = 0;
+    loop {
+        match sys::fork() {
+            0 => {
+                nap(300);
+                keel_rt::exit(0);
+            }
+            ENOMEM => break,
+            pid if pid < 0 => return 210,
+            _ => children += 1,
+        }
+        if children > 200 {
+            return 211;
+        }
+    }
+    let mut status = 0;
+    for _ in 0..children {
+        if sys::wait4(-1, &mut status, 0) <= 0 || status != 0 {
+            return 212;
+        }
+    }
+    // Every page is this program's own again: writing works.
+    let Ok(memory) = Region::map(4096, PROT_READ | PROT_WRITE) else {
+        return 213;
+    };
+    if memory.write_u64(0, 5).is_none() || memory.read_u64(0) != Some(5) {
+        return 214;
+    }
+    children
+}
+
 fn main(startup: &Startup) -> i32 {
     if startup.args().nth(1) == Some(&b"bomb"[..]) {
         return bomb();
+    }
+    if startup.args().nth(1) == Some(&b"sharers"[..]) {
+        return sharers();
     }
     let me = sys::getpid();
     let Ok(memory) = Region::map(4096, PROT_READ | PROT_WRITE) else {
