@@ -3,8 +3,11 @@
 //! Every offset and size in the file is checked before it is used: against
 //! the file length for file offsets, and against `SizeOfImage` for RVAs.
 //! All arithmetic is checked. Nothing is allocated, and tables are walked
-//! lazily with fixed caps, so a crafted file cannot make the parser loop
-//! for long or panic. Safe Rust only (ADR 0013).
+//! lazily with fixed caps: at most `MAX_IMPORTS` imports in all, each name
+//! found with one lookup of its section and one scan of at most
+//! `MAX_NAME` bytes, so the work a file can cause is bounded (a crafted
+//! 44 KB file used to take minutes: Phase 2 audit, D1). Safe Rust only
+//! (ADR 0013).
 //!
 //! Layouts are from Microsoft's "PE Format" (MicrosoftDocs/win32,
 //! `desktop-src/Debug/pe-format.md`, read 2026-11-22):
@@ -64,6 +67,10 @@ pub const MAX_NAME: usize = 255;
 pub const MAX_DLLS: usize = 256;
 /// Most functions imported from one DLL.
 pub const MAX_IMPORTS_PER_DLL: usize = 4096;
+/// Most imports in all. Without it the per-DLL caps multiply to a
+/// million, and descriptors may share one table, so a tiny file could
+/// make the walk last minutes (Phase 2 audit, D1).
+pub const MAX_IMPORTS: usize = 16384;
 
 /// Why a file was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,9 +299,12 @@ impl<'a> Image<'a> {
         self.section_count
     }
 
-    /// Section `index` (below `section_count`), checked as `parse` checked
-    /// it.
+    /// Section `index`, checked as `parse` checked it; an index at or past
+    /// `section_count` is an error.
     pub fn section(&self, index: usize) -> Result<Section<'a>, PeError> {
+        if index >= self.section_count {
+            return Err(PeError::BadSection);
+        }
         let at = self.table_at + index * SECTION_SIZE;
         let header = self
             .file
@@ -364,30 +374,56 @@ impl<'a> Image<'a> {
         if end <= self.size_of_headers as usize {
             return Ok(&self.file[rva as usize..end]);
         }
-        for i in 0..self.section_count {
-            let s = self.section(i)?;
-            let start = s.rva as usize;
-            if (start..start + s.data.len()).contains(&(rva as usize))
-                && end <= start + s.data.len()
-            {
-                return Ok(&s.data[rva as usize - start..end - start]);
+        let data = self.data_from(rva)?;
+        data.get(..len).ok_or(PeError::BadReference)
+    }
+
+    /// The section whose address range contains `rva`, found by binary
+    /// search: `parse` checked that sections are in ascending, disjoint
+    /// RVA order.
+    fn section_containing(&self, rva: u32) -> Result<Section<'a>, PeError> {
+        let (mut lo, mut hi) = (0, self.section_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = self.section(mid)?;
+            if rva < s.rva {
+                hi = mid;
+            } else if rva >= s.rva + s.memory_size {
+                lo = mid + 1;
+            } else {
+                return Ok(s);
             }
         }
         Err(PeError::BadReference)
     }
 
-    /// A NUL-terminated name at `rva`, without the NUL; at most `MAX_NAME`
-    /// bytes.
-    fn name_at(&self, rva: u32) -> Result<&'a [u8], PeError> {
-        // Read byte by byte up to the cap, so a name near the end of a
-        // section is still found.
-        for len in 0..=MAX_NAME {
-            let byte = self.bytes_at(rva.checked_add(len as u32).ok_or(PeError::BadName)?, 1)?;
-            if byte[0] == 0 {
-                return self.bytes_at(rva, len);
-            }
+    /// The file-backed bytes from `rva` to the end of the headers or of the
+    /// section that holds it: one lookup, however much is then read.
+    fn data_from(&self, rva: u32) -> Result<&'a [u8], PeError> {
+        let at = rva as usize;
+        if at < self.size_of_headers as usize {
+            return Ok(&self.file[at..self.size_of_headers as usize]);
         }
-        Err(PeError::BadName)
+        let s = self.section_containing(rva)?;
+        // Only the file-backed part: zero-fill beyond it is not readable.
+        s.data
+            .get(at - s.rva as usize..)
+            .filter(|rest| !rest.is_empty())
+            .ok_or(PeError::BadReference)
+    }
+
+    /// A NUL-terminated name at `rva`, without the NUL; at most `MAX_NAME`
+    /// bytes, all in one section (or the headers). The section is found
+    /// once and its bytes scanned once (D1: this used to look the section
+    /// up again for every byte).
+    fn name_at(&self, rva: u32) -> Result<&'a [u8], PeError> {
+        let data = self.data_from(rva)?;
+        let window = &data[..data.len().min(MAX_NAME + 1)];
+        let len = window
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(PeError::BadName)?;
+        Ok(&data[..len])
     }
 
     /// The imports, DLL by DLL, function by function.
@@ -396,6 +432,7 @@ impl<'a> Image<'a> {
             image: *self,
             dll: 0,
             entry: 0,
+            total: 0,
             done: self.directory(DIR_IMPORT).1 == 0,
         }
     }
@@ -435,6 +472,8 @@ pub struct Imports<'a> {
     image: Image<'a>,
     dll: usize,
     entry: usize,
+    /// Imports yielded so far, against `MAX_IMPORTS`.
+    total: usize,
     done: bool,
 }
 
@@ -460,7 +499,7 @@ impl<'a> Imports<'a> {
             let iat = u32_at(desc, 16)?;
             // Without a lookup table, the IAT holds the lookup entries.
             let lookup = if lookup == 0 { iat } else { lookup };
-            if self.entry >= MAX_IMPORTS_PER_DLL {
+            if self.entry >= MAX_IMPORTS_PER_DLL || self.total >= MAX_IMPORTS {
                 return Err(PeError::TooManyImports);
             }
             let offset = (self.entry * 8) as u32;
@@ -489,6 +528,7 @@ impl<'a> Imports<'a> {
                 ImportName::Name(image.name_at(hint_name)?)
             };
             self.entry += 1;
+            self.total += 1;
             return Ok(Some(Import {
                 dll,
                 name,

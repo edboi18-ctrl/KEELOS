@@ -65,6 +65,17 @@ Host tool `xtask` only (never linked into the image):
 | `bitflags` 1.3.2, `byteorder` 1.5.0, `log` 0.4.35 | see `Cargo.lock` | MIT OR Apache-2.0; Unlicense OR MIT (`byteorder`) | Dependencies of `fatfs` |
 | `digest`, `crypto-common`, `block-buffer`, `hybrid-array`, `typenum`, `const-oid`, `cpufeatures`, `cmov`, `ctutils`, `cfg-if`, `libc` | see `Cargo.lock` | MIT OR Apache-2.0 | Transitive dependencies of the two RustCrypto crates above (`libc` only on non-x86 hosts) |
 
+## Wine (Phase 3 trace, Phase 4 build input)
+
+Built by `wine/build/Dockerfile` (the `wine-image` workflow); see
+`wine/build/README.md`. Not yet part of any Keel image.
+
+| Input | Version | License | Pin |
+| --- | --- | --- | --- |
+| Wine source | 11.0 (stable, 2026-01-13) | LGPL-2.1-or-later | `https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz`, SHA-256 `c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701`, checked by the build. Upstream signature verified 2026-11-22 against key `DA23 579A 74D4 AD9A F9D3 F945 CEFA C8EA AF17 519D` (Alexandre Julliard), fetched from keyserver.ubuntu.com: trust on first use. |
+| Base image | `alpine:3.24.4` | MIT and others (Alpine) | digest `sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf` |
+| Build packages | Alpine 3.24 (`build-base`, `mingw-w64-gcc` 15.2.0, `flex`, `bison`, `linux-headers`, `perl`; `strace` for the trace) | various | not hash-pinned; every installed version is written to `packages.txt` in the output |
+
 ## Host tools (not build inputs)
 
 These run on the developer's machine or the CI runner. They do not
@@ -87,8 +98,8 @@ release is created with the `gh` CLI in a plain shell step.
 
 | Action | Version | Commit SHA | Used in |
 | --- | --- | --- | --- |
-| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | `ci.yml`, `release.yml` |
-| `actions/upload-artifact` | v7.0.2 | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | `release.yml` |
+| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | `ci.yml`, `release.yml`, `wine-image.yml` |
+| `actions/upload-artifact` | v7.0.2 | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | `release.yml`, `wine-image.yml` |
 | `actions/download-artifact` | v8.0.2 | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | `release.yml` |
 | `actions/attest-build-provenance` | v4.2.2 | `4d101475d8b20a2381f78447822ac1eab6504dd8` | `release.yml` |
 

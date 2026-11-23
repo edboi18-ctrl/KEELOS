@@ -177,6 +177,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: false,
     },
     TestProgram {
+        path: "test/forger",
+        binary: "forger",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/conflood",
         binary: "conflood",
         args: &[],

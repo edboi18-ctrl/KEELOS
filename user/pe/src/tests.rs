@@ -338,6 +338,119 @@ fn relocation_errors() {
     );
 }
 
+/// The Phase 2 audit's D1 file: 96 sections and 255 import descriptors
+/// sharing one 4095-entry lookup table and one 255-byte name (44,544
+/// bytes). Built exactly as the audit's program builds it.
+fn shared_import_tables() -> Vec<u8> {
+    fn p16(v: &mut [u8], at: usize, x: u16) {
+        v[at..at + 2].copy_from_slice(&x.to_le_bytes());
+    }
+    fn p32(v: &mut [u8], at: usize, x: u32) {
+        v[at..at + 4].copy_from_slice(&x.to_le_bytes());
+    }
+    fn p64(v: &mut [u8], at: usize, x: u64) {
+        v[at..at + 8].copy_from_slice(&x.to_le_bytes());
+    }
+    const NSEC: usize = 96;
+    const DLLS: usize = 255;
+    const FUNCS: usize = 4095;
+    let hdr = 0x1400usize;
+    let data_len = (DLLS + 1) * 20 + (FUNCS + 1) * 8 + 2 + 256 + 256;
+    let raw_len = data_len.next_multiple_of(512);
+    let mut f = std::vec![0u8; hdr + 512 + raw_len];
+    f[0] = b'M';
+    f[1] = b'Z';
+    p32(&mut f, 0x3c, 0x40);
+    f[0x40..0x44].copy_from_slice(b"PE\0\0");
+    let coff = 0x44;
+    p16(&mut f, coff, 0x8664);
+    p16(&mut f, coff + 2, NSEC as u16);
+    p16(&mut f, coff + 16, 240);
+    p16(&mut f, coff + 18, 0x0002);
+    let opt = coff + 20;
+    p16(&mut f, opt, 0x20b);
+    p32(&mut f, opt + 16, 0x2000);
+    p64(&mut f, opt + 24, 0x1_4000_0000);
+    p32(&mut f, opt + 32, 0x1000);
+    p32(&mut f, opt + 36, 512);
+    let last_rva = 0x2000 + (NSEC as u32 - 1) * 0x10000;
+    let size_of_image = (last_rva + raw_len as u32).next_multiple_of(0x1000);
+    p32(&mut f, opt + 56, size_of_image);
+    p32(&mut f, opt + 60, hdr as u32);
+    p32(&mut f, opt + 108, 16);
+    p32(&mut f, opt + 112 + 8, last_rva);
+    p32(&mut f, opt + 112 + 12, ((DLLS + 1) * 20) as u32);
+    let table = opt + 240;
+    for i in 0..NSEC {
+        let s = table + i * 40;
+        let rva = 0x2000 + i as u32 * 0x10000;
+        if i == NSEC - 1 {
+            p32(&mut f, s + 8, raw_len as u32);
+            p32(&mut f, s + 12, rva);
+            p32(&mut f, s + 16, raw_len as u32);
+            p32(&mut f, s + 20, (hdr + 512) as u32);
+            p32(&mut f, s + 36, 0xC000_0000);
+        } else {
+            p32(&mut f, s + 8, 0x1000);
+            p32(&mut f, s + 12, rva);
+            p32(&mut f, s + 16, if i == 0 { 512 } else { 0 });
+            p32(&mut f, s + 20, hdr as u32);
+            p32(
+                &mut f,
+                s + 36,
+                if i == 0 { 0x6000_0000 } else { 0x4000_0000 },
+            );
+        }
+    }
+    let base = hdr + 512;
+    let lookup_off = (DLLS + 1) * 20;
+    let hint_off = lookup_off + (FUNCS + 1) * 8;
+    let dll_off = hint_off + 2 + 256;
+    for d in 0..DLLS {
+        let at = base + d * 20;
+        p32(&mut f, at, last_rva + lookup_off as u32);
+        p32(&mut f, at + 12, last_rva + dll_off as u32);
+        p32(&mut f, at + 16, last_rva + lookup_off as u32);
+    }
+    for e in 0..FUNCS {
+        p64(
+            &mut f,
+            base + lookup_off + e * 8,
+            u64::from(last_rva + hint_off as u32),
+        );
+    }
+    for b in 0..255 {
+        f[base + hint_off + 2 + b] = b'a';
+        f[base + dll_off + b] = b'k';
+    }
+    f
+}
+
+/// Phase 2 audit, D1: walking that file used to take minutes (a section
+/// lookup per byte of every name, a million imports). Now the walk stops
+/// at MAX_IMPORTS with TooManyImports, quickly.
+#[test]
+fn shared_import_tables_are_walked_quickly() {
+    let file = shared_import_tables();
+    assert_eq!(file.len(), 44_544);
+    let image = parse(&file).unwrap();
+    let start = std::time::Instant::now();
+    let mut count = 0;
+    let mut last = None;
+    for import in image.imports() {
+        match import {
+            Ok(_) => count += 1,
+            Err(error) => last = Some(error),
+        }
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(count, MAX_IMPORTS);
+    assert_eq!(last, Some(PeError::TooManyImports));
+    // Generous for an unoptimized test build on a busy machine.
+    assert!(elapsed.as_secs_f64() < 1.0, "walk took {elapsed:?}");
+    std::println!("D1 file: {count} imports in {elapsed:?}");
+}
+
 /// The first error parsing `data` or walking its imports and relocations
 /// gives, as text ("BadSection", "UnsupportedRelocation(3)").
 fn first_error_anywhere(data: &[u8]) -> Option<std::string::String> {
@@ -450,6 +563,7 @@ fn write_corpus() {
     let mut b = with_imports_and_relocs();
     b.sections[1].3[0x100..0x104].copy_from_slice(&0x9000u32.to_le_bytes());
     cases.push(("BadRelocation-page-outside", b.build()));
+    cases.push(("TooManyImports-shared-tables", shared_import_tables()));
     for (stem, data) in cases {
         std::fs::write(dir.join(std::format!("{stem}.exe")), data).unwrap();
     }

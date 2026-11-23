@@ -1,0 +1,51 @@
+# Builds the minimal musl Wine and records the system-call trace Phase 3
+# is planned from (spec section 7, `wine-image.yml`; P4-T1 and P3-T1).
+#
+# Same rules as ci.yml (SR-32 to SR-34), enforced by `cargo xtask audit`:
+# actions pinned by full commit SHA, read-only token, no secrets, no
+# pull_request_target, GitHub-hosted runners only. All build logic is in
+# wine/build/Dockerfile; this file only runs it and keeps the output.
+name: wine-image
+
+on:
+  push:
+    paths:
+      - "wine/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wine-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-trace:
+    name: Build Wine on musl and trace wine cmd /c echo hello
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and trace
+        run: docker build --progress=plain --output type=local,dest=out wine/build
+      - name: Show the result
+        run: |
+          cat out/SHA256SUMS
+          cat out/hello-stdout.txt
+          head -50 out/counts.txt
+      # Wine must actually run: the line, then exit status 0.
+      - name: Check wine cmd /c echo hello worked
+        run: |
+          tr -d '\r' < out/hello-stdout.txt | grep -qx 'hello'
+          grep -qx 'exit 0' out/hello-stdout.txt
+      - name: Keep the output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wine-musl-and-trace
+          path: out/
+          retention-days: 30
+          if-no-files-found: warn
