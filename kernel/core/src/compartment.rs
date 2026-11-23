@@ -35,6 +35,10 @@ pub struct Limits {
     /// 4 KiB frames of user memory: pages its processes have touched and
     /// their user page tables (see [`Budget`]).
     pub memory_frames: usize,
+    /// Bytes of tmpfs file data its files hold (see [`Quota`]).
+    pub tmpfs_bytes: usize,
+    /// tmpfs nodes it has created.
+    pub tmpfs_nodes: usize,
 }
 
 impl Limits {
@@ -42,6 +46,8 @@ impl Limits {
     pub const UNLIMITED: Limits = Limits {
         processes: u32::MAX,
         memory_frames: usize::MAX,
+        tmpfs_bytes: usize::MAX,
+        tmpfs_nodes: usize::MAX,
     };
 }
 
@@ -93,6 +99,16 @@ impl Budget {
     }
 }
 
+/// A compartment's share of the tmpfs (P3-S4): the file data its files
+/// hold and the nodes it has created. `vfs::Fs` charges it: a file's bytes
+/// go to the file's owner, the compartment that created it, or, for a
+/// file the kernel created, the first compartment that grows it.
+#[derive(Debug)]
+pub struct Quota {
+    pub bytes: Budget,
+    pub nodes: Budget,
+}
+
 /// A compartment.
 #[derive(Debug)]
 pub struct Compartment {
@@ -107,6 +123,9 @@ pub struct Compartment {
     next_pid: AtomicU32,
     /// User memory of all its processes, in frames.
     memory: Arc<Budget>,
+    /// None when both tmpfs limits are unlimited (the system compartment):
+    /// its files are bounded only by the filesystem's own caps.
+    tmpfs: Option<Arc<Quota>>,
 }
 
 impl Compartment {
@@ -119,6 +138,14 @@ impl Compartment {
             processes: AtomicU32::new(0),
             next_pid: AtomicU32::new(1),
             memory: Arc::new(Budget::new(limits.memory_frames)),
+            tmpfs: (limits.tmpfs_bytes != usize::MAX || limits.tmpfs_nodes != usize::MAX).then(
+                || {
+                    Arc::new(Quota {
+                        bytes: Budget::new(limits.tmpfs_bytes),
+                        nodes: Budget::new(limits.tmpfs_nodes),
+                    })
+                },
+            ),
         }
     }
 
@@ -138,6 +165,11 @@ impl Compartment {
     /// The user-memory budget its processes' address spaces charge.
     pub fn memory(&self) -> &Arc<Budget> {
         &self.memory
+    }
+
+    /// Its tmpfs quota, if it has limits there.
+    pub fn tmpfs(&self) -> Option<&Arc<Quota>> {
+        self.tmpfs.as_ref()
     }
 
     /// Processes alive in it now.
@@ -210,7 +242,7 @@ mod tests {
             ROOT,
             Limits {
                 processes,
-                memory_frames: usize::MAX,
+                ..Limits::UNLIMITED
             },
         ))
     }

@@ -1823,7 +1823,7 @@ fn phase3(t: &mut Runner) {
     });
     let limits = Limits {
         processes: 4,
-        memory_frames: usize::MAX,
+        ..Limits::UNLIMITED
     };
     let (Ok(()), Ok(a), Ok(b)) = (
         made,
@@ -1877,7 +1877,7 @@ fn phase3(t: &mut Runner) {
         b"/comp/c",
         Limits {
             processes: 1,
-            memory_frames: usize::MAX,
+            ..Limits::UNLIMITED
         },
     );
     let limited = one.as_ref().ok().and_then(|c| {
@@ -1907,6 +1907,70 @@ fn phase3(t: &mut Runner) {
         kprintln!("  process limit: {result:?}");
     }
     phase3_memory_limit(t);
+    phase3_tmpfs_quota(t);
+}
+
+/// P3-S4 tmpfs, the rest of Phase 2 audit item 1: each compartment's file
+/// bytes and nodes are capped on their own. Two compartments with the same
+/// quota each reach exactly their own limits, so neither's use is counted
+/// against the other, and a file the kernel placed is charged to the
+/// compartment that grows it.
+fn phase3_tmpfs_quota(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs};
+
+    const PROGRAM: &[u8] = b"/test/tmpquota";
+    const BYTES: usize = 64 << 10;
+    const NODES: usize = 8;
+    let made = fs::with(|fs| {
+        let comp = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        for name in [&b"qa"[..], b"qb"] {
+            let dir = fs.create_dir(comp, name, 0o755)?;
+            fs.create_file(dir, b"given", 0o644)?;
+        }
+        Ok(())
+    });
+    let limits = Limits {
+        tmpfs_bytes: BYTES,
+        tmpfs_nodes: NODES,
+        ..Limits::UNLIMITED
+    };
+    let (Ok(()), Ok(a), Ok(b)) = (
+        made,
+        compartment::create(b"/comp/qa", limits),
+        compartment::create(b"/comp/qb", limits),
+    ) else {
+        t.check(
+            "compartment.tmpfs_quota",
+            false,
+            "creating the quota compartments",
+        );
+        return;
+    };
+    let args: [&[u8]; 3] = [PROGRAM, b"65536", b"8"];
+    let in_a = run_in(&a, PROGRAM, &args);
+    let in_b = run_in(&b, PROGRAM, &args);
+    let used = |c: &alloc::sync::Arc<keel_core::compartment::Compartment>| {
+        c.tmpfs().map(|q| (q.bytes.used(), q.nodes.used()))
+    };
+    // After the run: one chunk in /given, and the eight files.
+    let expected = Some((4096, NODES));
+    let ok = in_a == Some((0, None))
+        && in_b == Some((0, None))
+        && used(&a) == expected
+        && used(&b) == expected;
+    t.check(
+        "compartment.tmpfs_quota",
+        ok,
+        "file bytes and nodes are capped per compartment (ENOSPC at exactly 64 KiB and 8 nodes, in each of two compartments); a kernel-made file is charged to the compartment that grows it; truncating gives bytes back",
+    );
+    if !ok {
+        kprintln!(
+            "  tmpquota: A {in_a:?} {:?}, B {in_b:?} {:?}",
+            used(&a),
+            used(&b)
+        );
+    }
 }
 
 /// P3-S4 memory, and security acceptance P3 item 3 for memory: a program
@@ -1935,6 +1999,7 @@ fn phase3_memory_limit(t: &mut Runner) {
             Limits {
                 processes: 4,
                 memory_frames: frames,
+                ..Limits::UNLIMITED
             },
         )
     };

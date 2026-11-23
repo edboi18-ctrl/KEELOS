@@ -364,7 +364,19 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
 }
 
 /// Writes `count` bytes from user memory at `buf` to an open file.
-fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
+/// The tmpfs quota of the process's compartment, if it has one (P3-S4).
+fn quota_of(p: &Arc<IrqMutex<Process>>) -> Option<Arc<keel_core::compartment::Quota>> {
+    p.lock().member.compartment().tmpfs().cloned()
+}
+
+/// Writes user memory to an open file. File growth is charged to `quota`
+/// (the writer's compartment), as `vfs::Fs::write_as` decides.
+fn write_to(
+    file: &Arc<IrqMutex<OpenFile>>,
+    buf: u64,
+    count: u64,
+    quota: Option<&Arc<keel_core::compartment::Quota>>,
+) -> SysResult {
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
     let mut done = 0usize;
@@ -396,7 +408,7 @@ fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
                     let (node, append, offset) = (f.node, f.append, f.offset);
                     let result = fs::with(|fs| {
                         let at = if append { fs.stat(node)?.size } else { offset };
-                        let n = fs.write(node, at, &chunk[..want])?;
+                        let n = fs.write_as(node, at, &chunk[..want], quota)?;
                         Ok((n, at + n as u64))
                     });
                     match result {
@@ -423,11 +435,12 @@ fn write_to(file: &Arc<IrqMutex<OpenFile>>, buf: u64, count: u64) -> SysResult {
 
 fn write(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult {
     let file = file(p, fd, Rights::WRITE)?;
-    write_to(&file, buf, count)
+    write_to(&file, buf, count, quota_of(p).as_ref())
 }
 
 fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResult {
     let file = file(p, fd, Rights::WRITE)?;
+    let quota = quota_of(p);
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);
     }
@@ -456,7 +469,7 @@ fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResul
     let mut done = 0u64;
     for (base, len) in vectors {
         let len = len.min(MAX_RW_COUNT - done);
-        match write_to(&file, base, len) {
+        match write_to(&file, base, len, quota.as_ref()) {
             Ok(n) => {
                 done += n;
                 if n < len {
@@ -519,6 +532,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
     };
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);
+    let quota = quota_of(p);
     let node = fs::with(|fs| {
         let node = match fs.lookup(root, base, &path) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(Errno::EEXIST),
@@ -526,7 +540,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
             Err(Errno::ENOENT) if flags & O_CREAT != 0 => {
                 let (dir, name) = fs.lookup_parent(root, base, &path)?;
                 // umask 022 until umask(2) exists.
-                fs.create_file(dir, name, (mode as u32) & 0o7777 & !0o022)?
+                fs.create_file_as(dir, name, (mode as u32) & 0o7777 & !0o022, quota.as_ref())?
             }
             Err(error) => return Err(error),
         };
@@ -538,7 +552,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
             return Err(Errno::ENOTDIR);
         }
         if kind == Kind::File && write && flags & O_TRUNC != 0 {
-            fs.set_len(node, 0)?;
+            fs.set_len_as(node, 0, quota.as_ref())?;
         }
         Ok((node, kind))
     })?;

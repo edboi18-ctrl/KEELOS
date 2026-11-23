@@ -90,3 +90,8 @@ bench = false
 name = "hog"
 test = false
 bench = false
+
+[[bin]]
+name = "tmpquota"
+test = false
+bench = false

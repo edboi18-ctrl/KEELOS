@@ -66,8 +66,26 @@ compartment to set that root.
    - **Not counted:** the two top-level tables of each space, kernel
      stacks, and handles. Each is bounded per process, and processes are
      bounded per compartment.
-   - **tmpfs bytes and nodes** are still global, the remaining part of
-     Phase 2 audit item 1. They need an owner on each node, and come next.
+   - **tmpfs bytes and nodes**, the rest of Phase 2 audit item 1. A
+     compartment's `Quota` caps the file data its files hold and the
+     nodes it creates.
+     - Every node records an owner: the quota of the compartment that
+       created it. A node the kernel made has none.
+     - A file's growth is charged to its owner. A kernel-made file gets
+       as its owner the first compartment that grows it, so a
+       compartment cannot grow a file the kernel put in its tree at
+       nobody's expense.
+     - Each file records how many of its bytes are charged. Those are its
+       last bytes, so truncating gives them back first.
+     - Overwriting costs nothing.
+     - Past the limit: `ENOSPC`, as write(2) and open(2) report when "the
+       device ... has no room". The quota is the compartment's device
+       size.
+     - The global tmpfs caps still apply on top.
+     - The system compartment has no quota: limits that are all unlimited
+       create none.
+     - Nodes are never given back yet, because nothing can be deleted.
+       `unlink` and `rmdir` (P3-T8) must uncharge the owner.
 5. **The system compartment** (ID 0, root `/`, no limits beyond the
    kernel's own) holds the programs the kernel itself starts at boot and
    in tests. `process::spawn` puts a program there, and
@@ -136,6 +154,23 @@ per compartment from the start:
 - Host tests for `Budget`: exact limit, no overflow, no underflow, and
   16 threads making 3,200 charges against a limit of 1,000 get exactly
   1,000.
+- `compartment.tmpfs_quota`: two compartments, each with 64 KiB and 8
+  nodes and an empty kernel-made `/given`, each run `user/tests/tmpquota`.
+  - Growing `/given` stops with `ENOSPC` at exactly 65,536 bytes.
+  - Creating files stops with `ENOSPC` at exactly 8.
+  - After `O_TRUNC`, a 4 KiB write fits again.
+  - Both compartments reach their own limits, so neither is charged for
+    the other. Each ends with 4,096 bytes and 8 nodes charged.
+  - Mutations:
+    - Writes charged to no quota run past the limit (exit 2).
+    - Creations charged to no quota run past 8 nodes (exit 4).
+    - Truncation that gives nothing back cannot write again (exit 7).
+- Host tests in `vfs`:
+  - the byte limit, with overwrite free and truncate giving back;
+  - the node limit, where a refused creation costs nothing;
+  - a kernel-made file's first grower paying, a later grower paying the
+    owner and not itself, and truncation below the kernel's bytes giving
+    back only what was charged.
 
 ## Consequences
 

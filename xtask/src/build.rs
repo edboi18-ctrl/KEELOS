@@ -193,6 +193,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/tmpquota",
+        binary: "tmpquota",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
         path: "test/nap",
         binary: "nap",
         args: &["10"],
