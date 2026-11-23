@@ -43,6 +43,7 @@ pub mod nr {
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
     pub const WRITEV: u64 = 20;
+    pub const GETPID: u64 = 39;
     pub const EXIT: u64 = 60;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
@@ -102,6 +103,7 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::IOCTL as usize] = Some(|p, a| ioctl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
     t[nr::ARCH_PRCTL as usize] = Some(|_, a| arch_prctl(a[0], a[1]));
     t[nr::SET_TID_ADDRESS as usize] = Some(|p, a| Ok(set_tid_address(p, a[0])));
+    t[nr::GETPID as usize] = Some(|p, _| Ok(u64::from(p.lock().pid())));
     t[nr::CLOCK_GETTIME as usize] = Some(|_, a| clock_gettime(a[0] as u32 as u64, a[1]));
     t[nr::GETRANDOM as usize] = Some(|_, a| getrandom(a[0], a[1], a[2] as u32 as u64));
     t
@@ -178,9 +180,10 @@ pub fn reserve_refusals() -> u64 {
 /// which already does this for user page faults). Exempt: `close` and
 /// `munmap` free memory, so a program can recover; `brk` never returns an
 /// error (it reports the old break), and its mapping is checked by the
-/// same cap as any other.
+/// same cap as any other. `getpid` allocates nothing and getpid(2) says it
+/// is "always successful".
 fn may_run_on_reserve(number: u64) -> bool {
-    matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK)
+    matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK | nr::GETPID)
 }
 
 fn dispatch(call: &SyscallArgs) -> i64 {
@@ -716,7 +719,7 @@ fn set_tid_address(p: &Arc<IrqMutex<Process>>, address: u64) -> u64 {
     let mut process = p.lock();
     process.clear_child_tid = address;
     // One thread per process: its TID is the PID.
-    u64::from(process.pid)
+    u64::from(process.pid())
 }
 
 fn clock_gettime(clock: u64, buf: u64) -> SysResult {

@@ -195,6 +195,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
         (0, Scenario::None) => phase0(&mut runner),
         (1, Scenario::None) => phase1(&mut runner),
         (2, Scenario::None) => phase2(&mut runner),
+        (3, Scenario::None) => phase3(&mut runner),
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -1790,6 +1791,111 @@ fn phase2(t: &mut Runner) {
     // Phase 2 acceptance marker, only when every test above passed.
     if t.failed == 0 {
         kresult!("KEEL P2 OK");
+    }
+}
+
+/// Runs `path` in `compartment` to completion: its exit status and fault.
+fn run_in(
+    compartment: &alloc::sync::Arc<keel_core::compartment::Compartment>,
+    path: &[u8],
+    args: &[&[u8]],
+) -> Option<(i64, Option<sched::UserFault>)> {
+    let file = keel_linux_abi::fs::read_file(path).ok()?;
+    let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
+    let spawned = keel_linux_abi::process::spawn_in(compartment, "test", &loaded).ok()?;
+    join(spawned.thread);
+    sched::exit_status(spawned.thread)
+}
+
+/// Phase 3 (in progress): compartments first (P3-S1 to P3-S4), before any
+/// program from outside the tree runs.
+fn phase3(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::errno::Errno;
+    use keel_linux_abi::{compartment, fs};
+
+    let made = fs::with(|fs| {
+        let comp = fs.create_dir(keel_core::vfs::ROOT, b"comp", 0o755)?;
+        for name in [&b"a"[..], b"b", b"c"] {
+            fs.create_dir(comp, name, 0o755)?;
+        }
+        Ok(())
+    });
+    let limits = Limits { processes: 4 };
+    let (Ok(()), Ok(a), Ok(b)) = (
+        made,
+        compartment::create(b"/comp/a", limits),
+        compartment::create(b"/comp/b", limits),
+    ) else {
+        t.check(
+            "compartment.create",
+            false,
+            "creating /comp/a and /comp/b and their compartments",
+        );
+        return;
+    };
+
+    // Security acceptance P3 item 2, files: A, then B, then A again, so
+    // each looks for the other's marker after it exists. Each run also
+    // checks it cannot name the system's /test and that its PID counts
+    // from 1 in its own compartment.
+    const PROBE: &[u8] = b"/test/compprobe";
+    let first_a = run_in(&a, PROBE, &[PROBE, b"a", b"b", b"1"]);
+    let first_b = run_in(&b, PROBE, &[PROBE, b"b", b"a", b"1"]);
+    let second_a = run_in(&a, PROBE, &[PROBE, b"a", b"b", b"2"]);
+    // Seen from the system root, each marker is in its own compartment's
+    // directory and nowhere else.
+    let placed = fs::lookup(b"/comp/a/marker-a").is_ok()
+        && fs::lookup(b"/comp/b/marker-b").is_ok()
+        && fs::lookup(b"/marker-a").is_err()
+        && fs::lookup(b"/marker-b").is_err()
+        && fs::lookup(b"/comp/a/marker-b").is_err();
+    let ok = [first_a, first_b, second_a] == [Some((0, None)); 3];
+    t.check(
+        "compartment.files_confined",
+        ok && placed,
+        "two compartments cannot name each other's files, or the system's, in either direction; absolute paths and .. stay in the compartment root",
+    );
+    if !(ok && placed) {
+        kprintln!(
+            "  compprobe: A {first_a:?}, B {first_b:?}, A again {second_a:?}; markers placed: {placed}"
+        );
+    }
+    t.check(
+        "compartment.pid_space",
+        ok && a.processes() == 0 && b.processes() == 0,
+        "each compartment numbers its processes from 1 (getpid), and its count returns to 0 when they exit",
+    );
+
+    // P3-S4: a compartment's process limit. One slot: a second process
+    // is refused with EAGAIN while the first lives, and admitted after.
+    const NAP: &[u8] = b"/test/nap";
+    let one = compartment::create(b"/comp/c", Limits { processes: 1 });
+    let limited = one.as_ref().ok().and_then(|c| {
+        let file = fs::read_file(NAP).ok()?;
+        let load = || keel_linux_abi::exec::load(&file, NAP, &[NAP, b"300"], &[]).ok();
+        let first = keel_linux_abi::process::spawn_in(c, "nap", &load()?).ok()?;
+        let refused = keel_linux_abi::process::spawn_in(c, "nap", &load()?).err();
+        join(first.thread);
+        let first_status = sched::exit_status(first.thread);
+        let again = keel_linux_abi::process::spawn_in(c, "nap", &load()?).ok()?;
+        join(again.thread);
+        Some((
+            refused,
+            first_status,
+            sched::exit_status(again.thread),
+            c.processes(),
+        ))
+    });
+    t.check(
+        "compartment.process_limit",
+        limited == Some((Some(Errno::EAGAIN), Some((0, None)), Some((0, None)), 0)),
+        "at a compartment's process limit a new process is refused with EAGAIN, and admitted once one exits",
+    );
+    if let Some(result) =
+        limited.filter(|r| *r != (Some(Errno::EAGAIN), Some((0, None)), Some((0, None)), 0))
+    {
+        kprintln!("  process limit: {result:?}");
     }
 }
 

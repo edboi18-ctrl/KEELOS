@@ -27,6 +27,7 @@ pub mod nr {
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const IOCTL: u64 = 16;
     pub const WRITEV: u64 = 20;
+    pub const GETPID: u64 = 39;
     pub const SIGALTSTACK: u64 = 131;
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
@@ -180,6 +181,11 @@ pub fn getrandom(buf: &mut [u8], flags: u64) -> i64 {
 
 pub fn getrandom_into(target: Hostile, len: u64) -> i64 {
     call3(nr::GETRANDOM, target.0, len, 0)
+}
+
+/// getpid(2): the PID inside the caller's compartment.
+pub fn getpid() -> i64 {
+    call3(nr::GETPID, 0, 0, 0)
 }
 
 pub fn set_tid_address(slot: &mut u32) -> i64 {

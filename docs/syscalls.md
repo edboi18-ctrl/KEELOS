@@ -34,8 +34,9 @@ Common rules for all calls:
 - `int` arguments use their low 32 bits, as on Linux.
 - When only the kernel's frame reserve is free (`memory::user_reserve`),
   every call except `close`, `munmap`, `brk` and `exit`/`exit_group`
-  returns ENOMEM before doing anything, so no program can make the kernel
-  allocate its last frames (F-0011, ADR 0011). Page tables for user
+  (and `getpid`, which allocates nothing) returns ENOMEM before doing
+  anything, so no program can make the kernel allocate its last frames
+  (F-0011, ADR 0011). Page tables for user
   mappings come out of the same user-limited pool as user pages.
 
 Tested by `user/tests/src/bin/syscalls.rs`, which runs under Linux
@@ -63,13 +64,14 @@ addresses.
 | 14 | `rt_sigprocmask` | Partial: records the blocked mask; nothing is delivered yet | none (own thread) | `sigsetsize` other than 8 EINVAL; SIGKILL and SIGSTOP are never blocked; an unknown `how` is EINVAL only when a set is given, as Linux. |
 | 16 | `ioctl` | Partial: TCGETS, TIOCGWINSZ on `/dev/console` | STAT | Other descriptors and requests: ENOTTY (SR-10). TCGETS reports Linux's `tty_std_termios`. Setting terminal state arrives with the TTY layer. |
 | 20 | `writev` | Complete | WRITE | Count above 1024, or a total above the `ssize_t` maximum: EINVAL. |
+| 39 | `getpid` | Complete | none (own process) | The PID inside the caller's compartment; each compartment numbers its processes from 1, as a Linux PID namespace (P3-S1, ADR 0014). Exempt from the reserve check: getpid(2) is "always successful". |
 | 60 | `exit` | Partial: ends the calling thread | none | Status is the low 8 bits, as Linux. |
 | 131 | `sigaltstack` | Partial: records the alternate stack; used from P3-T6 | none (own thread) | Linux's rules: an unknown mode EINVAL; a stack below MINSIGSTKSZ (2048) ENOMEM; a change while the caller's stack pointer is on the alternate stack EPERM (never with SS_AUTODISARM); SS_DISABLE clears pointer and size; an unchanged request succeeds before the size check. The old stack reports SS_DISABLE, SS_ONSTACK or 0, as Linux's `sas_ss_flags`. |
 | 158 | `arch_prctl` | ARCH_SET_FS/GS, ARCH_GET_FS/GS | none (own thread) | Bases must be user addresses (EPERM otherwise), so the MSR write cannot fault and no segment can point into the kernel. The kernel never uses FS or GS (ADR 0005). Other codes EINVAL. |
 | 218 | `set_tid_address` | Partial: stores the address, returns the TID | none | The clear-on-exit write needs futexes and threads (Phase 2 onward). |
 | 228 | `clock_gettime` | MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE, BOOTTIME, REALTIME, REALTIME_COARSE | none | No real-time clock yet: the REALTIME clocks count from boot as if boot were 1970-01-01. CPU-time and other clocks EINVAL. |
 | 231 | `exit_group` | Partial: same as `exit` until processes have several threads | none | |
-| 257 | `openat` | Files, directories and devices in the tmpfs | ENUMERATE on `dirfd` when it is not AT_FDCWD; also CREATE with O_CREAT | Lookups never leave the process root (SR-4 groundwork). A relative path through a directory handle is confined to that directory: `..` stops there, as with Linux's `openat2` RESOLVE_IN_ROOT, unlike plain Linux `openat` (ADR 0012). Directory handles get CREATE by default. Flags outside the supported set (O_DSYNC, O_SYNC, O_DIRECT, O_NOATIME, O_PATH, O_TMPFILE and unknown bits) are EINVAL (SR-10; Linux ignores unknown bits). O_CREAT applies umask 022; ENOSPC once the tmpfs holds 65536 nodes (F-0011). No permission checks by mode or user ID (SR-6). Rights granted: READ/WRITE by access mode, plus STAT, SEEK, DUPLICATE; ENUMERATE for directories; MAP_EXEC with READ on regular files (Linux compatibility; compartment manifests can withhold it from Phase 3). |
+| 257 | `openat` | Files, directories and devices in the tmpfs | ENUMERATE on `dirfd` when it is not AT_FDCWD; also CREATE with O_CREAT | Lookups never leave the process root, which is its compartment's root (SR-4, ADR 0014): absolute paths and AT_FDCWD start there and `..` stops there. A relative path through a directory handle is confined to that directory: `..` stops there, as with Linux's `openat2` RESOLVE_IN_ROOT, unlike plain Linux `openat` (ADR 0012). Directory handles get CREATE by default. Flags outside the supported set (O_DSYNC, O_SYNC, O_DIRECT, O_NOATIME, O_PATH, O_TMPFILE and unknown bits) are EINVAL (SR-10; Linux ignores unknown bits). O_CREAT applies umask 022; ENOSPC once the tmpfs holds 65536 nodes (F-0011). No permission checks by mode or user ID (SR-6). Rights granted: READ/WRITE by access mode, plus STAT, SEEK, DUPLICATE; ENUMERATE for directories; MAP_EXEC with READ on regular files (Linux compatibility; compartment manifests can withhold it from Phase 3). |
 | 318 | `getrandom` | Complete | none | Unknown flags, and GRND_RANDOM with GRND_INSECURE, are EINVAL, as Linux. Bytes come from the kernel generator (`hal::random`: BLAKE2s pool, ChaCha20 with fast key erasure, seeded from RDSEED/RDRAND and timing, reseeded every 60 s). GRND_NONBLOCK never matters: the generator is seeded before the first process starts. |
 
 Numbers checked against Linux v6.12 `arch/x86/entry/syscalls/syscall_64.tbl`,

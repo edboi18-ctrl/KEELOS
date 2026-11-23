@@ -69,6 +69,13 @@ pub const PHASES: &[Phase] = &[
         expect_lines: &["Hello from a Windows executable on Keel"],
         expect_prefixes: &[],
     },
+    Phase {
+        number: 3,
+        complete: false,
+        scenarios: &[],
+        expect_lines: &[],
+        expect_prefixes: &[],
+    },
 ];
 
 /// First line of the kernel's panic output (`keel-kernel/src/main.rs`).

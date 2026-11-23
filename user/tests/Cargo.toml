@@ -75,3 +75,13 @@ bench = false
 name = "longcall"
 test = false
 bench = false
+
+[[bin]]
+name = "compprobe"
+test = false
+bench = false
+
+[[bin]]
+name = "nap"
+test = false
+bench = false

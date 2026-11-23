@@ -59,7 +59,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 49 | `pread64` | 2845 | 23 | 2835 | missing |  |
 | 50 | `pwritev2` | 3 | 0 | 3 | missing |  |
 | 51 | `ftruncate` | 24 | 0 | 24 | missing |  |
-| 52 | `getpid` | 46 | 0 | 48 | missing |  |
+| 52 | `getpid` | 46 | 0 | 48 | complete | `compartment.pid_space` |
 | 53 | `setpriority` | 2 | 1 | 2 | missing |  |
 | 54 | `epoll_pwait` | 21525 | 0 | 21483 | missing |  |
 | 55 | `accept` | 1 | 0 | 1 | missing |  |

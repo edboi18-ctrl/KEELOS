@@ -1,14 +1,16 @@
 //! Processes (P1-T13): an address space, a handle table with rights
 //! (P1-S1), the program break, and a root and working directory. One
-//! thread per process until clone(2) arrives.
+//! thread per process until clone(2) arrives. Every process belongs to a
+//! compartment (P3-S1, ADR 0014), which fixes its root and numbers it.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
+use keel_core::compartment::{Compartment, Member};
 use keel_core::errno::Errno;
 use keel_core::handle::{Handle, HandleTable, Rights};
 use keel_core::signal::SignalState;
-use keel_core::vfs::{Device, Ino, Kind, ROOT};
+use keel_core::vfs::{Device, Ino, Kind};
 use keel_hal::sched::{self, ThreadId};
 use keel_hal::sync::IrqMutex;
 use keel_hal::vm::AddressSpace;
@@ -60,14 +62,16 @@ pub fn file_rights(read: bool, write: bool, kind: Kind) -> Rights {
 }
 
 pub struct Process {
-    pub pid: u32,
+    /// Its compartment and its PID there. Dropping the process gives the
+    /// compartment's process slot back.
+    pub member: Member,
     pub space: Arc<AddressSpace>,
     pub handles: HandleTable<Object>,
     /// Program break: start (fixed) and current end, both page-aligned
     /// in use; `brk` may be any address at or above `brk_start`.
     pub brk_start: u64,
     pub brk: u64,
-    /// Lookups never leave `root` (SR-4 groundwork).
+    /// Lookups never leave `root`: the compartment's root (SR-4).
     pub root: Ino,
     pub cwd: Ino,
     /// set_tid_address(2): where the TID is cleared at thread exit (used
@@ -80,11 +84,18 @@ pub struct Process {
 
 /// Processes by thread ID.
 static PROCESSES: IrqMutex<BTreeMap<u64, Arc<IrqMutex<Process>>>> = IrqMutex::new(BTreeMap::new());
-static NEXT_PID: IrqMutex<u32> = IrqMutex::new(1);
+
+impl Process {
+    /// Its PID inside its compartment (what getpid(2) returns).
+    pub fn pid(&self) -> u32 {
+        self.member.pid()
+    }
+}
 
 /// A started process.
 #[derive(Clone, Copy, Debug)]
 pub struct Spawned {
+    /// Its PID inside its compartment.
     pub pid: u32,
     pub thread: ThreadId,
 }
@@ -109,26 +120,35 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Starts a loaded program as a new process with the console on fds 0-2.
-/// The first process started gets PID 1.
+/// Starts a loaded program as a new process in the system compartment,
+/// with the console on fds 0-2. The first process started gets PID 1.
 pub fn spawn(name: &'static str, loaded: &Loaded) -> Result<Spawned, Errno> {
+    spawn_in(&crate::compartment::system(), name, loaded)
+}
+
+/// Starts a loaded program as a new process in `compartment`, with the
+/// console on fds 0-2: its root and working directory are the
+/// compartment's root, and its PID is the compartment's next. EAGAIN at
+/// the compartment's process limit.
+pub fn spawn_in(
+    compartment: &Arc<Compartment>,
+    name: &'static str,
+    loaded: &Loaded,
+) -> Result<Spawned, Errno> {
+    let member = compartment.admit()?;
     let mut handles = HandleTable::new(HANDLE_LIMIT);
     console_handles(&mut handles)?;
     let mut processes = PROCESSES.lock();
-    let pid = {
-        let mut next = NEXT_PID.lock();
-        let pid = *next;
-        *next = next.checked_add(1).ok_or(Errno::EAGAIN)?;
-        pid
-    };
+    let pid = member.pid();
+    let root = compartment.root();
     let process = Process {
-        pid,
+        member,
         space: loaded.space.clone(),
         handles,
         brk_start: loaded.brk_start,
         brk: loaded.brk_start,
-        root: ROOT,
-        cwd: ROOT,
+        root,
+        cwd: root,
         clear_child_tid: 0,
         signals: SignalState::new(),
     };
