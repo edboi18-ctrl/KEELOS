@@ -29,6 +29,8 @@ pub mod nr {
     pub const IOCTL: u64 = 16;
     pub const PREAD64: u64 = 17;
     pub const FCNTL: u64 = 72;
+    pub const FTRUNCATE: u64 = 77;
+    pub const UNLINK: u64 = 87;
     pub const WRITEV: u64 = 20;
     pub const GETPID: u64 = 39;
     pub const CLONE: u64 = 56;
@@ -338,6 +340,16 @@ pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> i64 {
     )
 }
 
+/// ftruncate(2).
+pub fn ftruncate(fd: i32, length: i64) -> i64 {
+    call3(nr::FTRUNCATE, fd as u64, length as u64, 0)
+}
+
+/// unlink(2).
+pub fn unlink(path: &CStr) -> i64 {
+    call3(nr::UNLINK, path.as_ptr() as u64, 0, 0)
+}
+
 pub fn close(fd: i32) -> i64 {
     call3(nr::CLOSE, fd as u64, 0, 0)
 }
@@ -592,6 +604,27 @@ impl Region {
         let result = call6(
             nr::MMAP,
             [0, length, prot, MAP_PRIVATE, fd as u32 as u64, offset],
+        );
+        if result < 0 {
+            Err(result)
+        } else {
+            Ok(Region {
+                address: result as u64,
+                length,
+            })
+        }
+    }
+
+    /// A shared mapping of `fd` from file offset `offset` (mmap with
+    /// MAP_SHARED), placed by the kernel. Stores reach the file and every
+    /// other mapping of it, in this process or another; no Rust object
+    /// lives in it, so another process's stores change nothing Rust relies
+    /// on.
+    pub fn map_file_shared(length: u64, prot: u64, fd: i32, offset: u64) -> Result<Region, i64> {
+        const MAP_SHARED: u64 = 0x01;
+        let result = call6(
+            nr::MMAP,
+            [0, length, prot, MAP_SHARED, fd as u32 as u64, offset],
         );
         if result < 0 {
             Err(result)

@@ -65,6 +65,7 @@ pub mod nr {
     pub const CLOCK_GETTIME: u64 = 228;
     pub const EXIT_GROUP: u64 = 231;
     pub const OPENAT: u64 = 257;
+    pub const FTRUNCATE: u64 = 77;
     pub const GETRANDOM: u64 = 318;
 }
 
@@ -113,6 +114,7 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::OPEN as usize] = Some(|p, a| openat(p, AT_FDCWD, a[0], a[1] | O_LARGEFILE, a[2]));
     t[nr::PREAD64 as usize] = Some(|p, a| pread64(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     t[nr::FCNTL as usize] = Some(|p, a| fcntl(p, a[0] as u32 as i32, a[1] as u32, a[2]));
+    t[nr::FTRUNCATE as usize] = Some(|p, a| ftruncate(p, a[0] as u32 as i32, a[1] as i64));
     t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
     t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
     t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
@@ -336,7 +338,9 @@ fn vm_error(error: AsError) -> Errno {
         AsError::Vm(VmError::Invalid) => Errno::EINVAL,
         AsError::Vm(VmError::NoMemory) | AsError::OutOfMemory => Errno::ENOMEM,
         AsError::Vm(VmError::Exists) => Errno::EEXIST,
-        AsError::Vm(VmError::WriteExec | VmError::NotExecutable) => Errno::EACCES,
+        AsError::Vm(VmError::WriteExec | VmError::NotExecutable | VmError::NotWritable) => {
+            Errno::EACCES
+        }
         AsError::Vm(VmError::BadOffset) => Errno::EINVAL,
     }
 }
@@ -629,6 +633,8 @@ fn read_at(
                     None => f.offset,
                 };
                 let n = fs::with(|fs| fs.read(f.node, from, &mut chunk[..want]))?;
+                // Stores through shared mappings are the newest data.
+                keel_hal::vm::shared_read(u64::from(f.node), from, &mut chunk[..n]);
                 if at.is_none() {
                     f.offset += n as u64;
                 }
@@ -713,6 +719,12 @@ fn write_to(
                     });
                     match result {
                         Ok((n, end)) => {
+                            // Shared mappings of the file see the write.
+                            keel_hal::vm::shared_write(
+                                u64::from(node),
+                                end - n as u64,
+                                &chunk[..n],
+                            );
                             f.offset = end;
                             n
                         }
@@ -853,6 +865,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         }
         if kind == Kind::File && write && flags & O_TRUNC != 0 {
             fs.set_len_as(node, 0, quota.as_ref())?;
+            keel_hal::vm::shared_truncate(u64::from(node), 0);
         }
         Ok((node, kind))
     })?;
@@ -908,10 +921,15 @@ fn mmap(
     }
     let prot = prot(protection)?;
     let length = page_length(length)?;
-    if flags & MAP_TYPE != MAP_PRIVATE {
-        // Shared mappings arrive with fork and file mappings (Phase 3).
-        return Err(Errno::EINVAL);
-    }
+    // MAP_SHARED and MAP_SHARED_VALIDATE (which differ only in refusing
+    // unknown flags, which Keel refuses for both: SR-10) map a file's own
+    // pages (ADR 0021). Shared anonymous memory (and shared /dev/zero,
+    // which Linux makes the same) is not supported yet: EINVAL.
+    let shared = match flags & MAP_TYPE {
+        MAP_PRIVATE => false,
+        MAP_SHARED | MAP_SHARED_VALIDATE if flags & MAP_ANONYMOUS == 0 => true,
+        _ => return Err(Errno::EINVAL),
+    };
     // A private file mapping (P3-T7). The handle must allow reading, and
     // mapping executable if PROT_EXEC is asked for; whether it allows
     // MAP_EXEC is recorded, so mprotect cannot add PROT_EXEC later
@@ -927,13 +945,20 @@ fn mmap(
     let mut backing = None;
     if flags & MAP_ANONYMOUS == 0 {
         let open = file(p, fd, Rights::NONE)?;
-        let (may_read, may_exec) = {
+        let (may_read, may_exec, may_write) = {
             let process = p.lock();
             (
                 process.handles.check(fd, Rights::READ).is_ok(),
                 process.handles.check(fd, Rights::MAP_EXEC).is_ok(),
+                process.handles.check(fd, Rights::WRITE).is_ok(),
             )
         };
+        // mmap(2): "EACCES ... MAP_SHARED was requested and PROT_WRITE is
+        // set, but fd is not open in read/write (O_RDWR) mode".
+        if shared && prot.write && !may_write {
+            RIGHTS_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return Err(Errno::EACCES);
+        }
         if !may_read || (prot.exec && !may_exec) {
             RIGHTS_REFUSALS.fetch_add(1, Ordering::Relaxed);
             return Err(if may_read {
@@ -952,9 +977,11 @@ fn mmap(
                     object: u64::from(node),
                     offset,
                     may_exec,
+                    shared,
+                    may_write,
                 });
             }
-            Kind::Device(Device::Zero) => {}
+            Kind::Device(Device::Zero) if !shared => {}
             _ => return Err(Errno::ENODEV),
         }
     }
@@ -981,14 +1008,45 @@ fn mmap(
 /// nothing; it takes only the filesystem lock.
 fn read_mapped_page(object: u64, offset: u64, page: &mut [u8; 4096]) -> Option<usize> {
     let ino = keel_core::vfs::Ino::try_from(object).ok()?;
-    fs::with(|fs| {
+    let n = fs::with(|fs| {
         if offset >= fs.stat(ino)?.size {
             return Ok(None);
         }
         fs.read(ino, offset, page).map(Some)
     })
     .ok()
-    .flatten()
+    .flatten()?;
+    // A private page first touched after a shared mapping wrote the file
+    // gets those stores, as read(2) would (ADR 0021).
+    keel_hal::vm::shared_read(object, offset, &mut page[..n]);
+    Some(n)
+}
+
+/// ftruncate(2): sets the length of the regular file open on `fd`,
+/// charged to the caller's compartment quota as a write is (ENOSPC), and
+/// shared mappings of it follow (`shared_truncate`). As Linux's
+/// do_sys_ftruncate and do_ftruncate (`fs/open.c`): a negative length
+/// EINVAL, no handle EBADF, not a regular file or not open for writing
+/// EINVAL.
+fn ftruncate(p: &Arc<IrqMutex<Process>>, fd: i32, length: i64) -> SysResult {
+    if length < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let open = file(p, fd, Rights::NONE)?;
+    if p.lock().handles.check(fd, Rights::WRITE).is_err() {
+        return Err(Errno::EINVAL);
+    }
+    let (kind, node) = {
+        let f = open.lock();
+        (f.kind, f.node)
+    };
+    if kind != Kind::File {
+        return Err(Errno::EINVAL);
+    }
+    let quota = quota_of(p);
+    fs::with(|fs| fs.set_len_as(node, length as u64, quota.as_ref()))?;
+    keel_hal::vm::shared_truncate(u64::from(node), length as u64);
+    Ok(0)
 }
 
 fn munmap(p: &Arc<IrqMutex<Process>>, address: u64, length: u64) -> SysResult {

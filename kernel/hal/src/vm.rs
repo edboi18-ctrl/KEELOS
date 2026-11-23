@@ -103,6 +103,122 @@ pub fn set_file_reader(reader: FileReader) {
     *FILE_READER.lock() = Some(reader);
 }
 
+/// The frames of file pages mapped MAP_SHARED (ADR 0021), by (file,
+/// page-aligned offset). Every shared mapping of a page maps this frame,
+/// so their stores are seen by each other; the cache holds one reference
+/// to each frame, each mapping one more. Pages enter at a mapping's first
+/// fault and stay while the file has them: `shared_truncate` drops those
+/// past a new end, `shared_forget` all of a file's. They are file data,
+/// bounded by the file's size (and so by the tmpfs limits and the owner's
+/// quota); each mapping charges its address space one frame per page, as
+/// for any present page.
+///
+/// Lock order: an address-space lock, then this one. The `FileReader` is
+/// called with neither this lock nor the filesystem's held by the caller
+/// beyond the call, and `keel-linux-abi` takes this lock after the
+/// filesystem's, never the reverse.
+static SHARED_PAGES: IrqMutex<BTreeMap<(u64, u64), Frame>> = IrqMutex::new(BTreeMap::new());
+
+/// Copies the bytes of `object` from `offset` that shared pages hold over
+/// `buf` (which read(2) filled from the file): a store through a shared
+/// mapping is the file's newest data.
+pub fn shared_read(object: u64, offset: u64, buf: &mut [u8]) {
+    each_shared_page(object, offset, buf.len(), |frame, at, range| {
+        let _ = memory::read_frame_at(frame, at, &mut buf[range]);
+    });
+}
+
+/// Copies `data`, just written to `object` at `offset` by write(2), into
+/// the shared pages that hold that part of the file, so every mapping
+/// sees it.
+pub fn shared_write(object: u64, offset: u64, data: &[u8]) {
+    each_shared_page(object, offset, data.len(), |frame, at, range| {
+        let _ = memory::write_frame_at(frame, at, &data[range]);
+    });
+}
+
+/// Calls `f(frame, offset in frame, range of the caller's buffer)` for
+/// each shared page of `object` overlapping `[offset, offset + len)`.
+fn each_shared_page(
+    object: u64,
+    offset: u64,
+    len: usize,
+    mut f: impl FnMut(Frame, usize, core::ops::Range<usize>),
+) {
+    let Some(end) = offset.checked_add(len as u64) else {
+        return;
+    };
+    let pages = SHARED_PAGES.lock();
+    let first = offset & !(PAGE - 1);
+    for (&(_, page), &frame) in pages.range((object, first)..(object, end)) {
+        let from = page.max(offset);
+        let to = (page + PAGE).min(end);
+        f(
+            frame,
+            (from - page) as usize,
+            (from - offset) as usize..(to - offset) as usize,
+        );
+    }
+}
+
+/// The file `object` now ends at `len` (ftruncate(2)): its shared pages
+/// wholly past the end leave the cache, and the bytes past the end in the
+/// page that holds it become zero, as the file's own bytes do ("the
+/// extended part reads as null bytes" if it grows again). A mapping that
+/// already has a dropped page keeps its frame until unmapped; Linux would
+/// unmap it, so that a later access gets SIGBUS (ADR 0021).
+pub fn shared_truncate(object: u64, len: u64) {
+    let mut pages = SHARED_PAGES.lock();
+    let keep_to = len.next_multiple_of(PAGE);
+    let gone: alloc::vec::Vec<u64> = pages
+        .range((object, keep_to)..=(object, u64::MAX))
+        .map(|(&(_, page), _)| page)
+        .collect();
+    for page in gone {
+        if let Some(frame) = pages.remove(&(object, page)) {
+            let _ = memory::release(frame);
+        }
+    }
+    if !len.is_multiple_of(PAGE)
+        && let Some(&frame) = pages.get(&(object, len & !(PAGE - 1)))
+    {
+        let at = (len % PAGE) as usize;
+        let zeros = [0u8; PAGE as usize];
+        let _ = memory::write_frame_at(frame, at, &zeros[at..]);
+    }
+}
+
+/// Drops every shared page of `object` (the file is gone).
+pub fn shared_forget(object: u64) {
+    shared_truncate(object, 0);
+}
+
+/// Shared pages held in the cache (tests).
+pub fn shared_pages() -> usize {
+    SHARED_PAGES.lock().len()
+}
+
+/// The cached frame of `object`'s page at `offset`, made on first use
+/// from the file's bytes (zero past its end). None if the page starts at
+/// or past the end of the file, or memory runs out.
+fn shared_frame(object: u64, offset: u64) -> Option<Frame> {
+    if let Some(&frame) = SHARED_PAGES.lock().get(&(object, offset)) {
+        return Some(frame);
+    }
+    // Read the file before taking a frame (a page past the end costs
+    // nothing), without holding the cache lock.
+    let mut contents = [0u8; 4096];
+    let reader = (*FILE_READER.lock())?;
+    let filled = reader(object, offset, &mut contents)?.min(contents.len());
+    let frame = memory::allocate_zeroed_user()?;
+    if filled > 0 && memory::fill_frame(frame, &contents[..filled]).is_err() {
+        let _ = memory::release(frame);
+        return None;
+    }
+    SHARED_PAGES.lock().insert((object, offset), frame);
+    Some(frame)
+}
+
 /// Page-table rights for a user page with VMA protection `prot`.
 /// `writable` is false for pages shared copy-on-write.
 fn user_flags(prot: Prot, writable: bool) -> Flags {
@@ -302,6 +418,13 @@ impl AddressSpace {
         // Only present pages and parked frames are visited, never every
         // page of the range: a range can be terabytes (a reservation).
         for (from, to) in inner.layout.protect(start, length, prot)? {
+            // A shared file page is writable whoever else maps it; a
+            // private one only if no one else does (copy-on-write).
+            let file_shared = inner
+                .layout
+                .find(from)
+                .and_then(|v| v.backing)
+                .is_some_and(|b| b.shared);
             let mut at = from;
             while let Some(page) =
                 paging::next_present_small(&mut DirectMapTables, self.root, at, to)
@@ -314,7 +437,8 @@ impl AddressSpace {
                         inner.parked.insert(page, Frame::containing(phys));
                     }
                 } else if let Some(t) = paging::translate(&mut DirectMapTables, self.root, page) {
-                    let exclusive = memory::references(Frame::containing(t.phys)) == 1;
+                    let exclusive =
+                        file_shared || memory::references(Frame::containing(t.phys)) == 1;
                     let _ = paging::replace_small(
                         &mut DirectMapTables,
                         self.root,
@@ -338,7 +462,7 @@ impl AddressSpace {
                 let Some(frame) = inner.parked.remove(&page) else {
                     continue;
                 };
-                let exclusive = memory::references(frame) == 1;
+                let exclusive = file_shared || memory::references(frame) == 1;
                 let mapped = paging::map(
                     &mut UserTables(DirectMapTables, &mut inner.account),
                     self.root,
@@ -404,6 +528,11 @@ impl AddressSpace {
                 object,
                 offset,
             } => self.populate(&mut inner, page, prot, Some((object, offset))),
+            FaultAction::Shared {
+                prot,
+                object,
+                offset,
+            } => self.map_shared(&mut inner, page, prot, object, offset),
             FaultAction::CopyOnWrite(prot) => {
                 let Some(old) = paging::translate(&mut DirectMapTables, self.root, page) else {
                     return false;
@@ -486,8 +615,59 @@ impl AddressSpace {
         matches!(mapped, Ok(()) | Err(paging::MapError::AlreadyMapped))
     }
 
+    /// Maps the shared frame of `object` at `offset` at `page` (ADR 0021),
+    /// or, if the page is present (a write to it while it was mapped
+    /// read-only), gives it the VMA's rights: a shared page is never
+    /// copied. Charged one frame, as any present page.
+    fn map_shared(
+        &self,
+        inner: &mut Inner,
+        page: u64,
+        prot: Prot,
+        object: u64,
+        offset: u64,
+    ) -> bool {
+        if let Some(t) = paging::translate(&mut DirectMapTables, self.root, page) {
+            let replaced = paging::replace_small(
+                &mut DirectMapTables,
+                self.root,
+                page,
+                t.phys,
+                user_flags(prot, true),
+            );
+            cpu::invalidate_page(page);
+            return replaced.is_ok();
+        }
+        let Some(frame) = shared_frame(object, offset) else {
+            return false;
+        };
+        if !inner.account.charge(1) {
+            return false;
+        }
+        if memory::retain(frame).is_err() {
+            inner.account.uncharge(1);
+            return false;
+        }
+        let mapped = paging::map(
+            &mut UserTables(DirectMapTables, &mut inner.account),
+            self.root,
+            page,
+            frame.address(),
+            PageSize::Small,
+            user_flags(prot, true),
+        );
+        if mapped.is_err() {
+            let _ = memory::release(frame);
+            inner.account.uncharge(1);
+        }
+        self.sync_user_view();
+        matches!(mapped, Ok(()) | Err(paging::MapError::AlreadyMapped))
+    }
+
     /// A copy of this address space in which every present page is shared
-    /// copy-on-write (for fork). Both copies lose write access to shared
+    /// copy-on-write (for fork), except pages of shared file mappings,
+    /// which both copies keep mapping with their rights (fork(2): "the
+    /// child inherits ... memory mappings"; MAP_SHARED ones stay shared). Both copies lose write access to shared
     /// pages until they write.
     pub fn duplicate(&self) -> Result<Arc<AddressSpace>, AsError> {
         let child = AddressSpace::new()?;
@@ -512,7 +692,8 @@ impl AddressSpace {
                 child_inner.account.uncharge(1);
                 return Err(AsError::OutOfMemory);
             }
-            let shared = user_flags(vma.prot, false);
+            let file_shared = vma.backing.is_some_and(|b| b.shared);
+            let shared = user_flags(vma.prot, file_shared);
             if paging::map(
                 &mut UserTables(DirectMapTables, &mut child_inner.account),
                 child.root,
@@ -528,8 +709,10 @@ impl AddressSpace {
                 child_inner.account.uncharge(1);
                 return Err(AsError::OutOfMemory);
             }
-            let _ = paging::replace_small(&mut DirectMapTables, self.root, virt, phys, shared);
-            cpu::invalidate_page(virt);
+            if !file_shared {
+                let _ = paging::replace_small(&mut DirectMapTables, self.root, virt, phys, shared);
+                cpu::invalidate_page(virt);
+            }
         }
         // Parked (PROT_NONE) pages are shared the same way: the child
         // parks the same frame, and whichever side raises the protection

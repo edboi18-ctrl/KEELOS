@@ -91,6 +91,14 @@ pub fn init() -> Result<Report, InitError> {
         fs.create_device(dev, name, device)
             .map_err(InitError::Unpack)?;
     }
+    // /tmp, as on Linux (the Filesystem Hierarchy Standard 3.0, section
+    // 3.18: "/tmp : Temporary files"); Wine keeps its server directory
+    // under it. Mode 1777 (world-writable and sticky), as Linux
+    // distributions create it.
+    if fs.lookup(ROOT, ROOT, b"/tmp").is_err() {
+        fs.create_dir(ROOT, b"tmp", 0o1777)
+            .map_err(InitError::Unpack)?;
+    }
     *FS.lock() = Some(fs);
     Ok(Report {
         archive_bytes: module.data.len(),

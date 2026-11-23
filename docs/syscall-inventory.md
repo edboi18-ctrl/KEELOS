@@ -12,7 +12,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 2 | `arch_prctl` | 82 | 0 | 79 | partial | `syscalls.conformance` |
 | 3 | `set_tid_address` | 38 | 0 | 38 | partial | `syscalls.conformance` |
 | 4 | `brk` | 53 | 0 | 53 | partial | `syscalls.conformance` |
-| 5 | `mmap` | 7825 | 187 | 7820 | partial (no MAP_SHARED) | `syscalls.conformance`, `exec.file_mappings` |
+| 5 | `mmap` | 7825 | 187 | 7820 | partial (no shared anonymous) | `syscalls.conformance`, `exec.file_mappings`, `exec.shared_mappings` |
 | 6 | `mprotect` | 6646 | 0 | 6644 | partial | `syscalls.conformance` |
 | 7 | `readlink` | 5418 | 5000 | 5418 | missing |  |
 | 8 | `open` | 1080 | 89 | 1077 | complete | `exec.file_mappings`, `exec.shared_library` |
@@ -58,7 +58,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 48 | `fstatfs` | 242 | 0 | 232 | missing |  |
 | 49 | `pread64` | 2845 | 23 | 2835 | complete | `exec.file_mappings` |
 | 50 | `pwritev2` | 3 | 0 | 3 | missing |  |
-| 51 | `ftruncate` | 24 | 0 | 24 | missing |  |
+| 51 | `ftruncate` | 24 | 0 | 24 | complete | `exec.shared_mappings` |
 | 52 | `getpid` | 47 | 0 | 44 | complete | `compartment.pid_space` |
 | 53 | `setpriority` | 2 | 1 | 2 | missing |  |
 | 54 | `epoll_pwait` | 21615 | 0 | 21623 | missing |  |

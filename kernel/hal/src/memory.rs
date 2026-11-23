@@ -363,6 +363,60 @@ pub(crate) fn fill_frame(to: Frame, bytes: &[u8]) -> Result<(), FrameError> {
     Ok(())
 }
 
+/// Copies `bytes` into allocated frame `to` from byte `at`; fails if they
+/// would run past the frame's end. A shared file page's frame (ADR 0021)
+/// is written this way when write(2) changes the file.
+#[cfg_attr(not(target_os = "none"), expect(dead_code))]
+pub(crate) fn write_frame_at(to: Frame, at: usize, bytes: &[u8]) -> Result<(), FrameError> {
+    if at
+        .checked_add(bytes.len())
+        .is_none_or(|end| end > FRAME_SIZE as usize)
+    {
+        return Err(FrameError::NotAllocated);
+    }
+    let guard = FRAMES.lock();
+    let allocator = guard.as_ref().ok_or(FrameError::NotAllocated)?;
+    if allocator.references(to) == 0 {
+        return Err(FrameError::NotAllocated);
+    }
+    // SAFETY: `to` is allocated (checked under the lock) and mapped
+    // read-write in the direct map, 4096 bytes long; `at + bytes.len()`
+    // is within it (checked above); `bytes` borrows memory the caller
+    // owns, which cannot overlap a frame only the allocator hands out.
+    // User code may store to the same frame through its own mapping;
+    // with one CPU and interrupts off (the FRAMES lock) it cannot run
+    // during the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), frame_pointer(to).add(at), bytes.len());
+    }
+    Ok(())
+}
+
+/// Copies bytes of allocated frame `from`, starting at byte `at`, into
+/// `buf`; fails if they would run past the frame's end. read(2) of a
+/// file with shared pages (ADR 0021) reads them this way.
+#[cfg_attr(not(target_os = "none"), expect(dead_code))]
+pub(crate) fn read_frame_at(from: Frame, at: usize, buf: &mut [u8]) -> Result<(), FrameError> {
+    if at
+        .checked_add(buf.len())
+        .is_none_or(|end| end > FRAME_SIZE as usize)
+    {
+        return Err(FrameError::NotAllocated);
+    }
+    let guard = FRAMES.lock();
+    let allocator = guard.as_ref().ok_or(FrameError::NotAllocated)?;
+    if allocator.references(from) == 0 {
+        return Err(FrameError::NotAllocated);
+    }
+    // SAFETY: as `write_frame_at`, the other way: the frame is allocated,
+    // `at + buf.len()` is within it, and `buf` is the caller's exclusive
+    // borrow, so it cannot be the frame.
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame_pointer(from).add(at), buf.as_mut_ptr(), buf.len());
+    }
+    Ok(())
+}
+
 /// Copies the contents of allocated frame `from` into allocated frame `to`.
 // Only the page-fault path (copy-on-write) calls this, and it exists only
 // for the kernel target, so a host build sees no caller.

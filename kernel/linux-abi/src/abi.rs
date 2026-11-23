@@ -52,6 +52,8 @@ pub const PROT_WRITE: u64 = 0x2;
 pub const PROT_EXEC: u64 = 0x4;
 pub const MAP_SHARED: u64 = 0x01;
 pub const MAP_PRIVATE: u64 = 0x02;
+/// MAP_SHARED with unknown flags refused (`include/uapi/linux/mman.h`).
+pub const MAP_SHARED_VALIDATE: u64 = 0x03;
 pub const MAP_TYPE: u64 = 0x0f;
 pub const MAP_FIXED: u64 = 0x10;
 pub const MAP_ANONYMOUS: u64 = 0x20;

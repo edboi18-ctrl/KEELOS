@@ -1919,6 +1919,7 @@ fn phase3(t: &mut Runner) {
     phase3_exit_status_order(t);
     phase3_threads(t);
     phase3_signals(t);
+    phase3_shared_mappings(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -1981,6 +1982,48 @@ fn phase3_signals(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  signals: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T7, shared file mappings (ADR 0021): user/tests/sharemap, which
+/// passes under Linux too (`host.sharemap`): MAP_SHARED stores reach the
+/// file and other mappings (in the process and across fork), write(2)
+/// reaches the mappings, read-only descriptors refuse writable shared
+/// mappings at mmap and mprotect, and ftruncate works as Linux's. Unlink
+/// does not exist yet, so the kernel then drops the shared pages of the
+/// files it left in /tmp (as deleting them will); every frame and process
+/// must come back.
+fn phase3_shared_mappings(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/sharemap";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let (frames, processes) = (outside_heap(), process::count());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let cached = keel_hal::vm::shared_pages();
+    let left = fs::with(|f| {
+        let tmp = f.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/tmp")?;
+        f.entries(tmp)
+    })
+    .unwrap_or_default();
+    for (_, ino) in &left {
+        keel_hal::vm::shared_forget(u64::from(*ino));
+    }
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = status == Some((0, None))
+        && cached > 0
+        && keel_hal::vm::shared_pages() == 0
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.shared_mappings",
+        ok,
+        "MAP_SHARED file mappings as on Linux: stores reach the file, other mappings and a forked child, write(2) reaches them, read-only descriptors refuse PROT_WRITE (mmap and mprotect), ftruncate grows, shrinks and zeroes; every frame back once the pages are dropped",
+    );
+    if !ok {
+        kprintln!(
+            "  sharemap: {status:?}; cached pages {cached}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }
@@ -2241,6 +2284,8 @@ fn phase3_file_mappings(t: &mut Runner) {
                     object: u64::from(ino),
                     offset,
                     may_exec: false,
+                    shared: false,
+                    may_write: false,
                 };
                 space.map_file(
                     Placement::Fixed(at),

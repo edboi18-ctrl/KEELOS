@@ -60,15 +60,16 @@ pub struct Vma {
     pub start: u64,
     pub end: u64,
     pub prot: Prot,
-    /// For a private file mapping (P3-T7): which file, and where in it
-    /// `start` is. Pages are read from the file when first touched; until
+    /// For a file mapping (P3-T7): which file, and where in it `start`
+    /// is. Private: pages are read from the file when first touched; until
     /// then the file's later changes show through, which mmap(2) allows
     /// for MAP_PRIVATE ("It is unspecified whether changes made to the
     /// file after the mmap() call are visible in the mapped region").
+    /// Shared (ADR 0021): every mapping of the file maps the same frames.
     pub backing: Option<Backing>,
 }
 
-/// What a private file mapping maps.
+/// What a file mapping maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Backing {
     /// The file, as the owner of the layout names it (an inode number).
@@ -78,6 +79,17 @@ pub struct Backing {
     /// Whether the mapping may be made executable: the handle it came from
     /// had MAP_EXEC (SR-1). mprotect cannot add PROT_EXEC otherwise.
     pub may_exec: bool,
+    /// MAP_SHARED: stores reach the file and every other mapping of it
+    /// (mmap(2): "Updates to the mapping are visible to other processes
+    /// mapping the same region, and ... are carried through to the
+    /// underlying file").
+    pub shared: bool,
+    /// Whether a shared mapping may be made writable: its handle was open
+    /// for writing. Linux clears VM_MAYWRITE for a shared mapping of a
+    /// file not open for writing (`do_mmap`, `mm/mmap.c`), so mmap with
+    /// PROT_WRITE and a later mprotect adding it are EACCES. Private
+    /// mappings may always be written (their copies are private).
+    pub may_write: bool,
 }
 
 impl Vma {
@@ -99,6 +111,8 @@ impl Vma {
             (Some(a), Some(b)) => {
                 a.object == b.object
                     && a.may_exec == b.may_exec
+                    && a.shared == b.shared
+                    && a.may_write == b.may_write
                     && a.offset.checked_add(self.end - self.start) == Some(b.offset)
             }
             _ => false,
@@ -119,6 +133,9 @@ pub enum VmError {
     WriteExec,
     /// EACCES: PROT_EXEC on a file mapping whose handle lacked MAP_EXEC.
     NotExecutable,
+    /// EACCES: PROT_WRITE on a shared file mapping whose handle was not
+    /// open for writing.
+    NotWritable,
     /// EINVAL: a file offset that overflows with the mapping's length.
     BadOffset,
 }
@@ -317,6 +334,9 @@ impl Layout {
             if prot.exec && !b.may_exec {
                 return Err(VmError::NotExecutable);
             }
+            if prot.write && b.shared && !b.may_write {
+                return Err(VmError::NotWritable);
+            }
             // Every page's file offset must fit (checked once here).
             b.offset.checked_add(length).ok_or(VmError::BadOffset)?;
         }
@@ -444,6 +464,9 @@ impl Layout {
                 Some(v) if prot.exec && v.backing.is_some_and(|b| !b.may_exec) => {
                     return Err(VmError::NotExecutable);
                 }
+                Some(v) if prot.write && v.backing.is_some_and(|b| b.shared && !b.may_write) => {
+                    return Err(VmError::NotWritable);
+                }
                 Some(v) => cursor = v.end,
                 None => return Err(VmError::NoMemory),
             }
@@ -476,6 +499,14 @@ pub enum FaultAction {
     /// A write to a page shared copy-on-write: give the writer its own
     /// copy (or reuse the page if it is the only user).
     CopyOnWrite(Prot),
+    /// A page of a shared file mapping: map the file's own frame for
+    /// `offset` (never a copy), or, if it is mapped already and this is an
+    /// allowed write, make it writable.
+    Shared {
+        prot: Prot,
+        object: u64,
+        offset: u64,
+    },
     /// The access is not allowed: SIGSEGV for user code, EFAULT for the
     /// kernel's user-copy routines.
     Violation,
@@ -501,6 +532,15 @@ pub fn classify_fault(
     } else {
         vma.prot.read || vma.prot.write || vma.prot.exec
     };
+    if let (true, Some(b), Some(offset)) = (allowed, vma.backing, vma.file_offset(address))
+        && b.shared
+    {
+        return FaultAction::Shared {
+            prot: vma.prot,
+            object: b.object,
+            offset,
+        };
+    }
     match (allowed, present) {
         (false, _) => FaultAction::Violation,
         (true, false) => match (vma.backing, vma.file_offset(address)) {
@@ -793,7 +833,69 @@ mod tests {
             object,
             offset,
             may_exec,
+            shared: false,
+            may_write: true,
         })
+    }
+
+    fn shared(object: u64, offset: u64, may_write: bool) -> Option<Backing> {
+        Some(Backing {
+            object,
+            offset,
+            may_exec: false,
+            shared: true,
+            may_write,
+        })
+    }
+
+    #[test]
+    fn shared_mappings_fault_to_the_file_and_keep_may_write() {
+        let mut l = Layout::new();
+        // Read-only handle: PROT_WRITE refused at mmap and at mprotect,
+        // as Linux without VM_MAYWRITE.
+        assert_eq!(
+            l.map_backed(Placement::Fixed(0x10_0000), 0x2000, RW, shared(7, 0, false)),
+            Err(VmError::NotWritable)
+        );
+        l.map_backed(Placement::Fixed(0x10_0000), 0x2000, RO, shared(7, 0, false))
+            .unwrap();
+        assert_eq!(l.protect(0x10_0000, 0x1000, RW), Err(VmError::NotWritable));
+        // A private mapping of a read-only handle may still be written.
+        l.map_backed(Placement::Fixed(0x20_0000), 0x1000, RO, file(7, 0, false))
+            .unwrap();
+        assert!(l.protect(0x20_0000, 0x1000, RW).is_ok());
+        // Writable handle: faults map the file's page, present or not,
+        // never copy-on-write.
+        l.map_backed(
+            Placement::Fixed(0x30_0000),
+            0x2000,
+            RW,
+            shared(8, 0x5000, true),
+        )
+        .unwrap();
+        let expect = FaultAction::Shared {
+            prot: RW,
+            object: 8,
+            offset: 0x6000,
+        };
+        assert_eq!(classify_fault(&l, 0x30_1234, true, false, false), expect);
+        assert_eq!(classify_fault(&l, 0x30_1234, true, false, true), expect);
+        // Still refused where the VMA forbids it.
+        assert_eq!(
+            classify_fault(&l, 0x10_0000, true, false, true),
+            FaultAction::Violation
+        );
+        // Shared and private mappings of one file never merge.
+        l.map_backed(Placement::Fixed(0x40_0000), 0x1000, RO, shared(9, 0, true))
+            .unwrap();
+        l.map_backed(
+            Placement::Fixed(0x40_1000),
+            0x1000,
+            RO,
+            file(9, 0x1000, false),
+        )
+        .unwrap();
+        assert_eq!(l.find(0x40_1000).unwrap().start, 0x40_1000);
     }
 
     #[test]
