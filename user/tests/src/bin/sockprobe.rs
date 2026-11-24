@@ -311,7 +311,10 @@ fn pairs() -> i32 {
     }
     // Unnamed peers; each side's credentials are ours.
     let me = sys::getpid() as i32;
-    if name_of(a, true).map(|r| r.1) != Ok(2) || peercred(a) != Some((me, 0, 0)) {
+    // (The uid and gid are the caller's, which need not be root: they
+    // must agree between the two ends, not be 0.)
+    let ours = |fd: i32| peercred(fd).filter(|c| c.0 == me);
+    if name_of(a, true).map(|r| r.1) != Ok(2) || ours(a).is_none() || ours(a) != ours(b) {
         return 35;
     }
     // 2. Bytes in order as one stream: two writes read as one; FIONREAD
@@ -600,7 +603,8 @@ fn named() -> i32 {
     }
     // Credentials: ours, both ways.
     let me = sys::getpid() as i32;
-    if peercred(s) != Some((me, 0, 0)) || peercred(c) != Some((me, 0, 0)) {
+    let ours = |fd: i32| peercred(fd).filter(|c| c.0 == me);
+    if ours(s).is_none() || ours(s) != ours(c) {
         return 77;
     }
     // recvfrom on the client reports the sender: the listener's name.
