@@ -265,6 +265,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/scmprobe",
+        binary: "scmprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/execprobe",
         binary: "execprobe",
         args: &[],

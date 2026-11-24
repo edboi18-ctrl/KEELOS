@@ -1466,3 +1466,71 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, val: &mut [u8], len: &mut i32)
         ],
     )
 }
+
+/// sendmsg(2) with a name, the vectors `parts` (up to 8) and control
+/// data, each optional.
+pub fn sendmsg_full(
+    fd: i32,
+    name: Option<&[u8]>,
+    parts: &[&[u8]],
+    control: Option<&[u8]>,
+    flags: u32,
+) -> i64 {
+    let mut iov = [0u64; 16];
+    let n = parts.len().min(8);
+    for (i, p) in parts[..n].iter().enumerate() {
+        iov[2 * i] = p.as_ptr() as u64;
+        iov[2 * i + 1] = p.len() as u64;
+    }
+    let mut hdr = [0u64; 7];
+    if let Some(nm) = name {
+        hdr[0] = nm.as_ptr() as u64;
+        hdr[1] = nm.len() as u64;
+    }
+    hdr[2] = iov.as_ptr() as u64;
+    hdr[3] = n as u64;
+    if let Some(c) = control {
+        hdr[4] = c.as_ptr() as u64;
+        hdr[5] = c.len() as u64;
+    }
+    call3(46, fd as u64, hdr.as_ptr() as u64, u64::from(flags))
+}
+
+/// What recvmsg wrote back: the result, msg_namelen, msg_controllen and
+/// msg_flags.
+pub struct Received {
+    pub result: i64,
+    pub namelen: i32,
+    pub controllen: u64,
+    pub flags: i32,
+}
+
+/// recvmsg(2) into `buf`, with an optional name buffer and control
+/// buffer (None: NULL).
+pub fn recvmsg_full(
+    fd: i32,
+    buf: &mut [u8],
+    name: Option<&mut [u8]>,
+    control: Option<&mut [u8]>,
+    flags: u32,
+) -> Received {
+    let iov = [buf.as_mut_ptr() as u64, buf.len() as u64];
+    let mut hdr = [0u64; 7];
+    if let Some(n) = name {
+        hdr[0] = n.as_mut_ptr() as u64;
+        hdr[1] = n.len() as u64;
+    }
+    hdr[2] = iov.as_ptr() as u64;
+    hdr[3] = 1;
+    if let Some(c) = control {
+        hdr[4] = c.as_mut_ptr() as u64;
+        hdr[5] = c.len() as u64;
+    }
+    let result = call3(47, fd as u64, hdr.as_mut_ptr() as u64, u64::from(flags));
+    Received {
+        result,
+        namelen: hdr[1] as u32 as i32,
+        controllen: hdr[5],
+        flags: hdr[6] as u32 as i32,
+    }
+}

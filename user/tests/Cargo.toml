@@ -137,6 +137,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "scmprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "execprobe"
 test = false
 bench = false

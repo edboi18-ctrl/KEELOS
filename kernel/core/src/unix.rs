@@ -155,43 +155,336 @@ pub fn addr_copy_len(room: i32, len: usize) -> Result<usize, Errno> {
     Ok((room as usize).min(len))
 }
 
-/// The bytes a stream socket has received and not yet read
-/// (`sk_receive_queue`), as one byte queue.
-#[derive(Debug, Default)]
-pub struct StreamQueue {
-    data: VecDeque<u8>,
+/// The credentials a message carries (`UNIXCB(skb)`'s pid, uid, gid): the
+/// sender's process, by compartment and PID there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Creds {
+    pub compartment: u32,
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
-impl StreamQueue {
+/// One received message part (Linux's `sk_buff` on `sk_receive_queue`):
+/// its bytes (and how many are read), the descriptors sent with it (`F`),
+/// the sender's credentials if any were attached, the sender's name (for
+/// datagrams), and a token `X` dropped when the part goes (the sender's
+/// send-buffer charge).
+#[derive(Debug)]
+pub struct Segment<F, X> {
+    pub data: Vec<u8>,
+    pub consumed: usize,
+    pub fds: Option<Vec<F>>,
+    pub creds: Option<Creds>,
+    pub from: Option<Name>,
+    pub token: X,
+}
+
+impl<F, X> Segment<F, X> {
+    fn remaining(&self) -> usize {
+        self.data.len() - self.consumed
+    }
+}
+
+/// What a stream read may take (`unix_stream_read_generic`), worked out
+/// before anything is consumed, so a fault on the way out loses nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Bytes copied into the caller's buffer.
+    pub n: usize,
+    /// The read must end here: it reached a part with descriptors (`if
+    /// (scm.fp) break`), a part with other credentials, or the middle of
+    /// a part.
+    pub stop: bool,
+}
+
+/// The state a stream read keeps across its waits: the credentials of
+/// the first part it read, when the reader has SO_PASSCRED (later parts
+/// must carry the same, `unix_skb_scm_eq`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadState {
+    pub creds: Option<Option<Creds>>,
+}
+
+/// A socket's receive queue.
+#[derive(Debug)]
+pub struct Queue<F, X> {
+    parts: VecDeque<Segment<F, X>>,
+}
+
+impl<F, X> Default for Queue<F, X> {
+    fn default() -> Self {
+        Queue {
+            parts: VecDeque::new(),
+        }
+    }
+}
+
+impl<F, X> Queue<F, X> {
+    /// Unread bytes in all parts (SIOCINQ for a stream socket).
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.parts.iter().map(Segment::remaining).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.parts.is_empty()
     }
 
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.data.extend(bytes);
+    /// Parts waiting (a datagram socket's queue length, for
+    /// `max_dgram_qlen`).
+    pub fn count(&self) -> usize {
+        self.parts.len()
     }
 
-    /// Up to `out.len()` bytes into `out`, taken off the queue unless
-    /// `peek`; how many.
-    pub fn take(&mut self, out: &mut [u8], peek: bool) -> usize {
-        let n = out.len().min(self.data.len());
-        for (slot, byte) in out.iter_mut().zip(self.data.iter()) {
-            *slot = *byte;
+    /// The first part's unread length (SIOCINQ for a datagram socket).
+    pub fn first_len(&self) -> usize {
+        self.parts.front().map_or(0, Segment::remaining)
+    }
+
+    pub fn push(&mut self, part: Segment<F, X>) {
+        self.parts.push_back(part);
+    }
+
+    /// Drops every part (`skb_queue_purge`); their descriptors close.
+    pub fn purge(&mut self) {
+        self.parts.clear();
+    }
+
+    /// A stream read's next step, as `unix_stream_read_generic` walks
+    /// the queue: bytes from the parts in order into `out`, stopping
+    /// after a part with descriptors, in the middle of a part, or (when
+    /// `passcred`) before a part whose credentials differ from the first
+    /// part read's. Nothing is taken: [`Queue::consume`] does that.
+    pub fn stream_plan(&self, out: &mut [u8], passcred: bool, st: &mut ReadState) -> Plan {
+        let mut n = 0;
+        for part in &self.parts {
+            if passcred {
+                match st.creds {
+                    Some(c) if c != part.creds => return Plan { n, stop: true },
+                    Some(_) => {}
+                    None => st.creds = Some(part.creds),
+                }
+            }
+            let take = part.remaining().min(out.len() - n);
+            out[n..n + take].copy_from_slice(&part.data[part.consumed..part.consumed + take]);
+            n += take;
+            if part.fds.is_some() || take < part.remaining() {
+                return Plan { n, stop: true };
+            }
+            if n == out.len() {
+                break;
+            }
         }
-        if !peek {
-            self.data.drain(..n);
-        }
-        n
+        Plan { n, stop: false }
     }
 
-    /// Puts bytes back at the front (a read whose copy out faulted).
-    pub fn unread(&mut self, bytes: &[u8]) {
-        for &b in bytes.iter().rev() {
-            self.data.push_front(b);
+    /// Takes `n` bytes off the front of a stream queue; the descriptors
+    /// of any part they reach are detached and returned
+    /// (`unix_detach_fds`).
+    pub fn consume(&mut self, mut n: usize) -> Option<Vec<F>> {
+        let mut fds = None;
+        while n > 0 {
+            let Some(part) = self.parts.front_mut() else {
+                break;
+            };
+            let take = part.remaining().min(n);
+            part.consumed += take;
+            n -= take;
+            if let Some(f) = part.fds.take() {
+                fds = Some(f);
+            }
+            if part.remaining() == 0 {
+                self.parts.pop_front();
+            }
+        }
+        fds
+    }
+
+    /// The first part, taken off unless `peek` (`__skb_try_recv_datagram`).
+    pub fn pop(&mut self) -> Option<Segment<F, X>> {
+        self.parts.pop_front()
+    }
+
+    pub fn front(&self) -> Option<&Segment<F, X>> {
+        self.parts.front()
+    }
+}
+
+impl<F: Clone, X> Queue<F, X> {
+    /// MSG_PEEK of a stream: the descriptors of the part the first `n`
+    /// bytes end in, if it has any, as copies (`unix_peek_fds`).
+    pub fn peek_fds(&self, n: usize) -> Option<Vec<F>> {
+        let mut left = n;
+        for part in &self.parts {
+            if left == 0 {
+                break;
+            }
+            let take = part.remaining().min(left);
+            left -= take;
+            if let Some(f) = &part.fds {
+                return Some(f.clone());
+            }
+        }
+        None
+    }
+}
+
+/// `struct cmsghdr` on x86-64: cmsg_len (size_t), cmsg_level (int),
+/// cmsg_type (int); 16 bytes, and CMSG_ALIGN rounds to 8.
+pub const CMSG_HDR: usize = 16;
+pub const SOL_SOCKET: i32 = 1;
+pub const SCM_RIGHTS: i32 = 1;
+pub const SCM_CREDENTIALS: i32 = 2;
+/// The most descriptors one message may carry (`SCM_MAX_FD`).
+pub const SCM_MAX_FD: usize = 253;
+
+pub fn cmsg_align(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// CMSG_LEN and CMSG_SPACE.
+pub fn cmsg_len(data: usize) -> usize {
+    CMSG_HDR + data
+}
+
+pub fn cmsg_space(data: usize) -> usize {
+    CMSG_HDR + cmsg_align(data)
+}
+
+/// What a sendmsg's control data asks for (`__scm_send`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Control {
+    /// Descriptor numbers, from every SCM_RIGHTS in order.
+    pub fds: Vec<i32>,
+    /// SCM_CREDENTIALS: pid, uid, gid (the last one given).
+    pub creds: Option<(i32, u32, u32)>,
+}
+
+/// `__scm_send`'s walk over the control data (`for_each_cmsghdr`, with
+/// `CMSG_OK` and `__cmsg_nxthdr`): a header whose length is below the
+/// header's or past the data left EINVAL; other levels skipped; at
+/// SOL_SOCKET, SCM_RIGHTS (none if empty; more than SCM_MAX_FD in all
+/// EINVAL) and SCM_CREDENTIALS (exactly CMSG_LEN(12), else EINVAL; uid
+/// or gid -1 EINVAL); any other type EINVAL. A next header that would
+/// not fit ends the walk.
+pub fn parse_control(c: &[u8]) -> Result<Control, Errno> {
+    let mut out = Control::default();
+    let mut at = 0usize;
+    while c.len() >= at + CMSG_HDR {
+        let word = |o: usize| u64::from_le_bytes(c[o..o + 8].try_into().unwrap_or_default());
+        let int = |o: usize| i32::from_le_bytes(c[o..o + 4].try_into().unwrap_or_default());
+        let len = word(at);
+        if len < CMSG_HDR as u64 || len > (c.len() - at) as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let len = len as usize;
+        let (level, ty) = (int(at + 8), int(at + 12));
+        if level == SOL_SOCKET {
+            match ty {
+                SCM_RIGHTS => {
+                    let num = (len - CMSG_HDR) / 4;
+                    if num > SCM_MAX_FD || out.fds.len() + num > SCM_MAX_FD {
+                        return Err(Errno::EINVAL);
+                    }
+                    for i in 0..num {
+                        out.fds.push(int(at + CMSG_HDR + 4 * i));
+                    }
+                }
+                SCM_CREDENTIALS => {
+                    if len != cmsg_len(12) {
+                        return Err(Errno::EINVAL);
+                    }
+                    let d = at + CMSG_HDR;
+                    let (pid, uid, gid) = (int(d), int(d + 4) as u32, int(d + 8) as u32);
+                    if uid == u32::MAX || gid == u32::MAX {
+                        return Err(Errno::EINVAL);
+                    }
+                    out.creds = Some((pid, uid, gid));
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        at += cmsg_align(len);
+    }
+    Ok(out)
+}
+
+/// recvmsg's control buffer as `put_cmsg` and `scm_detach_fds` fill it.
+#[derive(Debug)]
+pub struct ControlOut {
+    pub bytes: Vec<u8>,
+    room: usize,
+    /// MSG_CTRUNC: something did not fit.
+    pub truncated: bool,
+}
+
+impl ControlOut {
+    /// A buffer of `room` bytes (0 for none given).
+    pub fn new(room: usize) -> Self {
+        ControlOut {
+            bytes: Vec::new(),
+            room,
+            truncated: false,
+        }
+    }
+
+    fn header(&mut self, len: usize, ty: i32) {
+        self.bytes.extend_from_slice(&(len as u64).to_le_bytes());
+        self.bytes.extend_from_slice(&SOL_SOCKET.to_le_bytes());
+        self.bytes.extend_from_slice(&ty.to_le_bytes());
+    }
+
+    fn left(&self) -> usize {
+        self.room - self.bytes.len()
+    }
+
+    /// `put_cmsg`: no room for a header, MSG_CTRUNC and nothing; less room
+    /// than the whole, as much as fits (its length the room) and
+    /// MSG_CTRUNC; then the buffer advances by CMSG_SPACE, at most to its
+    /// end.
+    pub fn put(&mut self, ty: i32, data: &[u8]) {
+        let left = self.left();
+        if left < CMSG_HDR {
+            self.truncated = true;
+            return;
+        }
+        let mut cmlen = cmsg_len(data.len());
+        if left < cmlen {
+            self.truncated = true;
+            cmlen = left;
+        }
+        self.header(cmlen, ty);
+        self.bytes.extend_from_slice(&data[..cmlen - CMSG_HDR]);
+        let space = cmsg_space(data.len()).min(left);
+        self.bytes.resize(self.bytes.len() + space - cmlen, 0);
+    }
+
+    /// How many of `count` descriptors fit (`scm_max_fds`).
+    pub fn fd_room(&self, count: usize) -> usize {
+        let left = self.left();
+        if left <= CMSG_HDR {
+            0
+        } else {
+            ((left - CMSG_HDR) / 4).min(count)
+        }
+    }
+
+    /// `scm_detach_fds` once `fds` (the numbers installed) are known, of
+    /// `count` sent: the header if any went in; MSG_CTRUNC if some did not
+    /// (or none could).
+    pub fn put_fds(&mut self, fds: &[i32], count: usize) {
+        let left = self.left();
+        if !fds.is_empty() {
+            let cmlen = cmsg_len(fds.len() * 4);
+            self.header(cmlen, SCM_RIGHTS);
+            for fd in fds {
+                self.bytes.extend_from_slice(&fd.to_le_bytes());
+            }
+            let space = cmsg_space(fds.len() * 4).min(left);
+            self.bytes.resize(self.bytes.len() + space - cmlen, 0);
+        }
+        if fds.len() < count {
+            self.truncated = true;
         }
     }
 }
@@ -297,20 +590,154 @@ mod tests {
         assert_eq!(unnamed_sockaddr().len(), 2);
     }
 
+    fn part(data: &[u8], fds: Option<Vec<u8>>, pid: Option<u32>) -> Segment<u8, ()> {
+        Segment {
+            data: data.to_vec(),
+            consumed: 0,
+            fds,
+            creds: pid.map(|pid| Creds {
+                compartment: 1,
+                pid,
+                uid: 0,
+                gid: 0,
+            }),
+            from: None,
+            token: (),
+        }
+    }
+
     #[test]
-    fn the_stream_queue_reads_peeks_and_puts_back() {
-        let mut q = StreamQueue::default();
-        q.push(b"hello");
-        let mut b = [0u8; 3];
-        assert_eq!(q.take(&mut b, true), 3);
-        assert_eq!(q.len(), 5, "a peek takes nothing");
-        assert_eq!(q.take(&mut b, false), 3);
-        assert_eq!(&b, b"hel");
-        q.unread(b"el");
-        let mut rest = [0u8; 8];
-        assert_eq!(q.take(&mut rest, false), 4);
-        assert_eq!(&rest[..4], b"ello");
-        assert!(q.is_empty());
+    fn stream_reads_stop_where_linux_stops() {
+        let mut q: Queue<u8, ()> = Queue::default();
+        q.push(part(b"ab", None, None));
+        q.push(part(b"cd", Some(alloc::vec![7]), None));
+        q.push(part(b"ef", None, None));
+        let mut out = [0u8; 8];
+        let mut st = ReadState::default();
+        // Across the first part, and stopping after the one with
+        // descriptors.
+        assert_eq!(
+            q.stream_plan(&mut out, false, &mut st),
+            Plan { n: 4, stop: true }
+        );
+        assert_eq!(&out[..4], b"abcd");
+        assert_eq!(q.peek_fds(4), Some(alloc::vec![7]));
+        assert_eq!(q.peek_fds(2), None, "the descriptors' part not reached");
+        // Consuming only the first part leaves its descriptors.
+        assert_eq!(q.consume(2), None);
+        assert_eq!(q.consume(1), Some(alloc::vec![7]), "touched: detached");
+        assert_eq!(q.len(), 3);
+        let mut st = ReadState::default();
+        assert_eq!(
+            q.stream_plan(&mut out, false, &mut st),
+            Plan { n: 3, stop: false }
+        );
+        assert_eq!(&out[..3], b"def");
+    }
+
+    #[test]
+    fn credentials_divide_a_stream_for_a_passcred_reader() {
+        let mut q: Queue<u8, ()> = Queue::default();
+        q.push(part(b"a", None, Some(5)));
+        q.push(part(b"b", None, Some(5)));
+        q.push(part(b"c", None, Some(6)));
+        let mut out = [0u8; 8];
+        let mut st = ReadState::default();
+        assert_eq!(q.stream_plan(&mut out, true, &mut st).n, 2);
+        let mut st = ReadState::default();
+        assert_eq!(
+            q.stream_plan(&mut out, false, &mut st).n,
+            3,
+            "without SO_PASSCRED"
+        );
+        // Partial reads stop in the middle of a part.
+        let mut st = ReadState::default();
+        assert_eq!(
+            q.stream_plan(&mut out[..1], true, &mut st),
+            Plan { n: 1, stop: false }
+        );
+        assert_eq!(q.count(), 3);
+        assert_eq!(q.first_len(), 1);
+    }
+
+    #[test]
+    fn control_data_parses_as_linux() {
+        let cmsg = |len: u64, level: i32, ty: i32, data: &[u8]| {
+            let mut v = len.to_le_bytes().to_vec();
+            v.extend_from_slice(&level.to_le_bytes());
+            v.extend_from_slice(&ty.to_le_bytes());
+            v.extend_from_slice(data);
+            while !v.len().is_multiple_of(8) {
+                v.push(0);
+            }
+            v
+        };
+        let mut fds = Vec::new();
+        for fd in [3i32, 4] {
+            fds.extend_from_slice(&fd.to_le_bytes());
+        }
+        let mut c = cmsg(24, SOL_SOCKET, SCM_RIGHTS, &fds);
+        c.extend(cmsg(20, 99, 1, b"junk"));
+        let mut cred = Vec::new();
+        for v in [7i32, 0, 0] {
+            cred.extend_from_slice(&v.to_le_bytes());
+        }
+        c.extend(cmsg(28, SOL_SOCKET, SCM_CREDENTIALS, &cred));
+        assert_eq!(
+            parse_control(&c),
+            Ok(Control {
+                fds: alloc::vec![3, 4],
+                creds: Some((7, 0, 0)),
+            })
+        );
+        assert_eq!(
+            parse_control(&cmsg(8, SOL_SOCKET, SCM_RIGHTS, &[])),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_control(&cmsg(64, SOL_SOCKET, SCM_RIGHTS, &fds)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_control(&cmsg(24, SOL_SOCKET, 9, &fds)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_control(&cmsg(24, SOL_SOCKET, SCM_CREDENTIALS, &cred)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_control(&[0u8; 8]),
+            Ok(Control::default()),
+            "no room for a header"
+        );
+        let many = alloc::vec![0u8; 4 * 254];
+        assert_eq!(
+            parse_control(&cmsg(16 + 4 * 254, SOL_SOCKET, SCM_RIGHTS, &many)),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn control_out_truncates_as_linux() {
+        let mut out = ControlOut::new(cmsg_space(12) + CMSG_HDR);
+        out.put(SCM_CREDENTIALS, &[1u8; 12]);
+        assert_eq!(out.bytes.len(), 32);
+        assert_eq!(out.fd_room(3), 0, "exactly a header left: no room");
+        let mut out = ControlOut::new(cmsg_space(8));
+        assert_eq!(out.fd_room(3), 2);
+        out.put_fds(&[5, 6], 3);
+        assert!(out.truncated);
+        assert_eq!(out.bytes.len(), 24);
+        assert_eq!(out.bytes[..8], 24u64.to_le_bytes());
+        let mut none = ControlOut::new(8);
+        none.put(SCM_CREDENTIALS, &[0u8; 12]);
+        assert!(none.truncated && none.bytes.is_empty());
+        let mut short = ControlOut::new(20);
+        short.put(SCM_CREDENTIALS, &[0u8; 12]);
+        assert!(short.truncated);
+        assert_eq!(short.bytes.len(), 20);
+        assert_eq!(short.bytes[..8], 20u64.to_le_bytes());
     }
 
     #[test]

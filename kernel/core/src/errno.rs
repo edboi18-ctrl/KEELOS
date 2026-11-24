@@ -58,6 +58,7 @@ pub enum Errno {
     ENOBUFS = 105,
     EISCONN = 106,
     ENOTCONN = 107,
+    ETOOMANYREFS = 109,
     ETIMEDOUT = 110,
     ECONNREFUSED = 111,
 }

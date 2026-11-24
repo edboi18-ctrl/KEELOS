@@ -45,7 +45,8 @@ sockets. Neither is P3-T11's.
       Linux has AF_INET, AF_NETLINK and the rest;
    5. a protocol other than 0 or PF_UNIX is EPROTONOSUPPORT;
    6. only SOCK_STREAM is supported. SOCK_DGRAM (and SOCK_RAW, which is
-      SOCK_DGRAM) arrives in part 2; SOCK_SEQPACKET is not planned.
+      SOCK_DGRAM) arrives in part 2 (ADR 0028); SOCK_SEQPACKET is not
+      planned.
       Until then, and for any other type, ESOCKTNOSUPPORT.
 
    The socket's own inode is S_IFSOCK | 0777 on sockfs (`sock_alloc`,
@@ -69,7 +70,8 @@ sockets. Neither is P3-T11's.
      - when the socket goes, the node stays and names nothing: a connect
        to it is ECONNREFUSED, as on Linux.
    - **An abstract name** (first byte NUL) is the bytes as given. It lives
-     in a table of the socket's compartment, as Linux's names are per
+     in a table of the socket's compartment (and, since ADR 0028, its
+     type: Linux's abstract names are per type), as Linux's names are per
      network namespace. EADDRINUSE if taken, EINVAL if the socket is
      already named; it is freed when the socket goes.
    - **Autobind** (`unix_autobind`) gives an abstract name of a NUL and
@@ -135,7 +137,7 @@ sockets. Neither is P3-T11's.
        a length of 0 (`unix_copy_addr`).
      - recvmsg writes back the name length, msg_flags (MSG_CMSG_CLOEXEC
        kept) and a control length of 0.
-     - Ancillary data on sendmsg is EINVAL until part 2.
+     - Ancillary data on sendmsg was EINVAL until part 2 (ADR 0028).
 8. **shutdown** (`unix_shutdown`): `how` outside 0..2 is EINVAL. The
    socket's shutdown gains how + 1, and a peer gains the mirror (reading
    shut here is writing shut there). An unconnected socket is fine.

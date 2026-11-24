@@ -1,8 +1,14 @@
-//! Unix domain stream sockets (P3-T11 part 1, ADR 0027): socket,
+//! Unix domain sockets (P3-T11, ADR 0027 and ADR 0028): socket,
 //! socketpair, bind, listen, connect, accept and accept4, getsockname,
 //! getpeername, shutdown, setsockopt and getsockopt, and the data calls
-//! (read, write, sendto, recvfrom, sendmsg, recvmsg without ancillary
-//! data), as Linux v6.12's `net/socket.c` and `net/unix/af_unix.c`.
+//! (read, write, sendto, recvfrom, sendmsg, recvmsg), for stream and
+//! datagram sockets, with descriptors (SCM_RIGHTS) and credentials
+//! (SCM_CREDENTIALS) passed alongside, as Linux v6.12's `net/socket.c`,
+//! `net/core/scm.c` and `net/unix/af_unix.c`.
+//!
+//! The receive queue holds message parts, as Linux's sk_buffs
+//! (`keel_core::unix::Queue`): the bytes, the descriptors sent with them,
+//! the sender's credentials and (for a datagram) the sender's name.
 //!
 //! A socket is an object of its own (`Object::Socket`). A connected pair
 //! points at each other weakly; each side keeps the bytes it has received
@@ -25,7 +31,7 @@ use keel_core::signal::{SI_USER, SIGPIPE, SigInfo};
 use keel_core::unix::{
     self as un, AF_UNIX, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_WAITALL, Name,
     RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX, SOCK_NONBLOCK,
-    SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOCK_TYPE_MASK, StreamQueue, Target,
+    SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOCK_TYPE_MASK, Target,
 };
 use keel_core::vfs::{Ino, Kind, Last};
 use keel_hal::sched::{self, Waited};
@@ -51,6 +57,74 @@ const MIN_RCVBUF: u32 = 2304;
 /// (room appeared) announce.
 const KEY_READABLE: u32 = 0x1 | 0x2 | 0x40 | 0x80;
 const KEY_WRITABLE: u32 = 0x4 | 0x100 | 0x200;
+
+/// A descriptor in flight (SCM_RIGHTS): the object and the rights of the
+/// handle it was sent from, which the receiver's new handle gets (no more
+/// than the sender had). The ticket counts it against its compartment's
+/// in-flight limit while it is queued; a copy made by MSG_PEEK has none.
+pub struct Passed {
+    object: Object,
+    rights: Rights,
+    _ticket: Option<InFlight>,
+}
+
+impl Clone for Passed {
+    fn clone(&self) -> Self {
+        Passed {
+            object: self.object.clone(),
+            rights: self.rights,
+            _ticket: None,
+        }
+    }
+}
+
+/// The most descriptors a compartment may have in flight at once. Linux
+/// limits each user to RLIMIT_NOFILE (`too_many_unix_fds`, ETOOMANYREFS)
+/// but exempts root, which all Keel processes are; Keel holds every
+/// compartment to it, so in-flight descriptors (which a socket passed to
+/// itself keeps alive: there is no garbage collector, ADR 0028) stay
+/// bounded.
+const INFLIGHT_LIMIT: usize = crate::process::HANDLE_LIMIT;
+
+/// In-flight counts by compartment.
+static INFLIGHT: IrqMutex<BTreeMap<u32, usize>> = IrqMutex::new(BTreeMap::new());
+
+/// One descriptor counted as in flight; uncounted when dropped.
+pub struct InFlight(u32);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(n) = INFLIGHT.lock().get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
+/// A datagram's charge to its sender's send buffer (its `sk_wmem_alloc`),
+/// released when the datagram is read or dropped, which wakes the sender
+/// (`sock_wfree`, `unix_write_space`).
+pub struct Charge {
+    sender: Weak<Socket>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(s) = self.sender.upgrade() {
+            s.wmem
+                .fetch_sub(self.bytes, core::sync::atomic::Ordering::Relaxed);
+            s.wake(KEY_WRITABLE);
+            changed();
+        }
+    }
+}
+
+type Part = un::Segment<Passed, Option<Charge>>;
+type Queue = un::Queue<Passed, Option<Charge>>;
+
+/// `max_dgram_qlen`: a datagram socket's queue is full past this many
+/// (`unix_recvq_full`; the sysctl's default, 10).
+const MAX_DGRAM_QLEN: usize = 10;
 
 /// Who a socket's peer credentials name (`sk_peer_pid`, `sk_peer_cred`):
 /// a process, by its compartment and PID there. Keel's processes are all
@@ -81,7 +155,7 @@ struct State {
     name: Option<Name>,
     /// The socket node it is bound to, pinned while bound.
     node: Option<Ino>,
-    recv: StreamQueue,
+    recv: Queue,
     shutdown: u8,
     /// `sk_err`, reported once.
     err: Option<Errno>,
@@ -108,6 +182,8 @@ pub struct Socket {
     kind: u32,
     /// The compartment it was made in: its abstract names are there.
     compartment: u32,
+    /// A datagram socket's bytes sent and not yet read.
+    wmem: core::sync::atomic::AtomicUsize,
     state: IrqMutex<State>,
 }
 
@@ -115,7 +191,9 @@ pub struct Socket {
 /// node (`unix_find_socket_byinode`).
 #[derive(Default)]
 struct Names {
-    abstract_names: BTreeMap<(u32, Vec<u8>), Weak<Socket>>,
+    /// By compartment, type and name: Linux's abstract names are per
+    /// type (`unix_abstract_hash` mixes the type into the bucket).
+    abstract_names: BTreeMap<(u32, u32, Vec<u8>), Weak<Socket>>,
     paths: BTreeMap<Ino, Weak<Socket>>,
 }
 
@@ -136,11 +214,12 @@ impl Socket {
             ino: new_ino(),
             kind,
             compartment,
+            wmem: core::sync::atomic::AtomicUsize::new(0),
             state: IrqMutex::new(State {
                 conn: Conn::Unconnected,
                 name: None,
                 node: None,
-                recv: StreamQueue::default(),
+                recv: Queue::default(),
                 shutdown: 0,
                 err: None,
                 embryo: false,
@@ -160,6 +239,13 @@ impl Socket {
         *self.status.lock() & O_NONBLOCK != 0
     }
 
+    fn peer_weak(&self) -> Option<Weak<Socket>> {
+        match &self.state.lock().conn {
+            Conn::Connected { peer, .. } => Some(peer.clone()),
+            _ => None,
+        }
+    }
+
     fn peer(&self) -> Option<Arc<Socket>> {
         match &self.state.lock().conn {
             Conn::Connected { peer, .. } => peer.upgrade(),
@@ -176,14 +262,16 @@ impl Socket {
         self.state.lock().wakes.wake(key);
     }
 
-    /// `unix_poll` for a stream socket:
+    /// `unix_poll` (stream) and `unix_dgram_poll`:
     /// - EPOLLERR with an error pending;
-    /// - EPOLLHUP when shut down both ways, or not connected (TCP_CLOSE);
+    /// - EPOLLHUP when shut down both ways, or (a stream socket) not
+    ///   connected (TCP_CLOSE);
     /// - readable with data, a connection to accept, or the reading side
     ///   shut down (EPOLLRDHUP too);
-    /// - writable unless listening, while what it has sent and its peer
-    ///   has not read is at most a quarter of its send buffer
-    ///   (`unix_writable`).
+    /// - writable unless listening, while what it has sent and is not yet
+    ///   read is at most a quarter of its send buffer (`unix_writable`);
+    ///   a datagram socket also not while its peer's queue is full and
+    ///   that peer is not connected back to it.
     pub fn poll(&self) -> u16 {
         use keel_core::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
         const POLLWRBAND: u16 = 0x200;
@@ -214,32 +302,51 @@ impl Socket {
                 s.sndbuf,
             )
         };
-        if closed {
+        if closed && self.kind == SOCK_STREAM {
             mask |= POLLHUP;
         }
-        if !listening && self.in_flight() * 4 <= sndbuf as usize {
+        let mut writable = !listening && self.in_flight() * 4 <= sndbuf as usize;
+        if writable
+            && self.kind == SOCK_DGRAM
+            && let Some(peer) = self.peer()
+        {
+            let ps = peer.state.lock();
+            let back = matches!(&ps.conn, Conn::Connected { peer, .. } if core::ptr::eq(peer.as_ptr(), self));
+            if !back && ps.recv.count() > MAX_DGRAM_QLEN {
+                writable = false;
+            }
+        }
+        if writable {
             mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
         }
         mask
     }
 
-    /// The bytes it has sent that its peer has not read (its
-    /// `sk_wmem_alloc`, counted in bytes).
+    /// The bytes it has sent that are not yet read (its `sk_wmem_alloc`,
+    /// counted in bytes): a stream socket's are its peer's queue; a
+    /// datagram socket's, its charges.
     fn in_flight(&self) -> usize {
+        if self.kind == SOCK_DGRAM {
+            return self.wmem.load(core::sync::atomic::Ordering::Relaxed);
+        }
         self.peer().map_or(0, |p| p.state.lock().recv.len())
     }
 
-    /// SIOCINQ (FIONREAD): the bytes waiting; EINVAL for a listening
-    /// socket (`unix_inq_len`).
+    /// SIOCINQ (FIONREAD): the bytes waiting, for a datagram socket the
+    /// first datagram's; EINVAL for a listening socket (`unix_inq_len`).
     pub fn inq(&self) -> Result<usize, Errno> {
         let s = self.state.lock();
         if matches!(s.conn, Conn::Listening { .. }) {
             return Err(Errno::EINVAL);
         }
-        Ok(s.recv.len())
+        Ok(if self.kind == SOCK_DGRAM {
+            s.recv.first_len()
+        } else {
+            s.recv.len()
+        })
     }
 
-    /// SIOCOUTQ: what it has sent that its peer has not read.
+    /// SIOCOUTQ: what it has sent that is not yet read.
     pub fn outq(&self) -> usize {
         self.in_flight()
     }
@@ -267,7 +374,7 @@ impl Drop for Socket {
         {
             let mut names = NAMES.lock();
             if let Some(Name::Abstract(a)) = &name {
-                let key = (self.compartment, a.clone());
+                let key = (self.compartment, self.kind, a.clone());
                 if names
                     .abstract_names
                     .get(&key)
@@ -289,6 +396,10 @@ impl Drop for Socket {
             });
         }
         match conn {
+            // A datagram socket's peer is not told (`unix_release_sock`
+            // shuts down only stream peers); its next send there is
+            // ECONNREFUSED.
+            Conn::Connected { .. } if self.kind == SOCK_DGRAM => {}
             Conn::Connected { peer, .. } => {
                 if let Some(peer) = peer.upgrade() {
                     let mut ps = peer.state.lock();
@@ -344,9 +455,9 @@ fn install(p: &ProcessRef, socket: Arc<Socket>, cloexec: bool) -> Result<i32, Er
 ///   SOCK_MAX or past EINVAL; any family but AF_UNIX EAFNOSUPPORT (Keel
 ///   has no other: ADR 0027);
 /// - a protocol other than 0 and PF_UNIX EPROTONOSUPPORT;
-/// - SOCK_STREAM; SOCK_DGRAM, SOCK_RAW (which is SOCK_DGRAM) and
-///   SOCK_SEQPACKET are ESOCKTNOSUPPORT for now (part 1); any other type
-///   ESOCKTNOSUPPORT.
+/// - SOCK_STREAM and SOCK_DGRAM; SOCK_RAW is SOCK_DGRAM (`unix_create`);
+///   SOCK_SEQPACKET is not supported (ESOCKTNOSUPPORT, ADR 0028), nor is
+///   any other type.
 fn socket_kind(family: i32, ty: u32, protocol: i32) -> Result<(u32, bool, bool), Errno> {
     let flags = ty & !SOCK_TYPE_MASK;
     if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
@@ -365,11 +476,12 @@ fn socket_kind(family: i32, ty: u32, protocol: i32) -> Result<(u32, bool, bool),
     if protocol != 0 && protocol != i32::from(AF_UNIX) {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    match kind {
-        SOCK_STREAM => {}
-        SOCK_DGRAM | SOCK_RAW | SOCK_SEQPACKET => return Err(Errno::ESOCKTNOSUPPORT),
+    let kind = match kind {
+        SOCK_STREAM => SOCK_STREAM,
+        SOCK_DGRAM | SOCK_RAW => SOCK_DGRAM,
+        SOCK_SEQPACKET => return Err(Errno::ESOCKTNOSUPPORT),
         _ => return Err(Errno::ESOCKTNOSUPPORT),
-    }
+    };
     Ok((kind, flags & SOCK_CLOEXEC != 0, flags & SOCK_NONBLOCK != 0))
 }
 
@@ -458,7 +570,7 @@ fn autobind(s: &Arc<Socket>) -> Result<(), Errno> {
         let Name::Abstract(bytes) = &name else {
             continue;
         };
-        let key = (s.compartment, bytes.clone());
+        let key = (s.compartment, s.kind, bytes.clone());
         if names
             .abstract_names
             .get(&key)
@@ -495,7 +607,7 @@ pub fn bind(p: &ProcessRef, fd: i32, addr: u64, len: i32) -> SysResult {
             if s.state.lock().name.is_some() {
                 return Err(Errno::EINVAL);
             }
-            let key = (s.compartment, bytes.clone());
+            let key = (s.compartment, s.kind, bytes.clone());
             let mut names = NAMES.lock();
             if names
                 .abstract_names
@@ -585,7 +697,8 @@ pub fn listen(p: &ProcessRef, fd: i32, backlog: i32) -> SysResult {
 /// (following links; its errors as lookup's); a node that is not a socket,
 /// or that no socket is bound to (any more), ECONNREFUSED; a socket of
 /// another type EPROTOTYPE. An abstract name not bound in the caller's
-/// compartment ECONNREFUSED.
+/// compartment for this type ECONNREFUSED (abstract names are per type,
+/// so never EPROTOTYPE).
 fn find(p: &ProcessRef, name: &Name, kind: u32) -> Result<Arc<Socket>, Errno> {
     let found = match name {
         Name::Path(path) => {
@@ -596,7 +709,7 @@ fn find(p: &ProcessRef, name: &Name, kind: u32) -> Result<Arc<Socket>, Errno> {
             NAMES.lock().paths.get(&node).and_then(Weak::upgrade)
         }
         Name::Abstract(bytes) => {
-            let key = (compartment_of(p), bytes.clone());
+            let key = (compartment_of(p), kind, bytes.clone());
             NAMES
                 .lock()
                 .abstract_names
@@ -638,6 +751,9 @@ fn wait_for(ready: impl FnMut() -> bool, timeout: Option<u64>) -> Result<(), Err
 pub fn connect(p: &ProcessRef, fd: i32, addr: u64, len: i32) -> SysResult {
     let s = socket_of(p, fd)?;
     let raw = addr_in(addr, len)?;
+    if s.kind == SOCK_DGRAM {
+        return connect_dgram(p, &s, &raw);
+    }
     let Target::Name(name) = un::parse(&raw, false)? else {
         return Err(Errno::EINVAL);
     };
@@ -713,6 +829,82 @@ pub fn connect(p: &ProcessRef, fd: i32, addr: u64, len: i32) -> SysResult {
     }
     changed();
     Ok(0)
+}
+
+/// connect(2) on a datagram socket (`unix_dgram_connect`):
+/// - shorter than the family EINVAL; AF_UNSPEC disconnects;
+/// - otherwise the address (EINVAL), an autobind name with SO_PASSCRED,
+///   the target ([`find`]), which must not be connected to another socket
+///   (EPERM, `unix_may_send`);
+/// - connecting elsewhere, or disconnecting, drops what this socket had
+///   received (`unix_dgram_disconnected`), and if anything was dropped and
+///   the old peer was connected back to it, the old peer gets ECONNRESET.
+fn connect_dgram(p: &ProcessRef, s: &Arc<Socket>, raw: &[u8]) -> SysResult {
+    const AF_UNSPEC: u16 = 0;
+    if raw.len() < 2 {
+        return Err(Errno::EINVAL);
+    }
+    let other = if u16::from_le_bytes([raw[0], raw[1]]) == AF_UNSPEC {
+        None
+    } else {
+        let Target::Name(name) = un::parse(raw, false)? else {
+            return Err(Errno::EINVAL);
+        };
+        if s.state.lock().passcred {
+            autobind(s)?;
+        }
+        let other = find(p, &name, s.kind)?;
+        if !may_send(s, &other) {
+            return Err(Errno::EPERM);
+        }
+        Some(other)
+    };
+    let old = {
+        let mut st = s.state.lock();
+        let old = match &st.conn {
+            Conn::Connected { peer, .. } => Some(peer.clone()),
+            _ => None,
+        };
+        st.conn = match &other {
+            Some(o) => Conn::Connected {
+                peer: Arc::downgrade(o),
+                peer_name: o.state.lock().name.clone(),
+            },
+            None => Conn::Unconnected,
+        };
+        old
+    };
+    if let Some(old) = old
+        && other
+            .as_ref()
+            .is_none_or(|o| !core::ptr::eq(old.as_ptr(), Arc::as_ptr(o)))
+    {
+        let dropped = core::mem::take(&mut s.state.lock().recv);
+        if !dropped.is_empty()
+            && let Some(old) = old.upgrade()
+            && points_at(&old, s)
+        {
+            old.state.lock().err = Some(Errno::ECONNRESET);
+            old.wake(0);
+        }
+        drop(dropped);
+    }
+    changed();
+    Ok(0)
+}
+
+/// Whether `a` is connected to `b`.
+fn points_at(a: &Arc<Socket>, b: &Arc<Socket>) -> bool {
+    matches!(&a.state.lock().conn, Conn::Connected { peer, .. } if core::ptr::eq(peer.as_ptr(), Arc::as_ptr(b)))
+}
+
+/// `unix_may_send`: `other` takes datagrams from `s` if it is connected to
+/// no one, or to `s`.
+fn may_send(s: &Arc<Socket>, other: &Arc<Socket>) -> bool {
+    match &other.state.lock().conn {
+        Conn::Connected { peer, .. } => core::ptr::eq(peer.as_ptr(), Arc::as_ptr(s)),
+        _ => true,
+    }
 }
 
 /// accept(2) and accept4(2) (`__sys_accept4_file`, `do_accept`,
@@ -811,8 +1003,8 @@ pub fn getname(p: &ProcessRef, fd: i32, addr: u64, len_at: u64, peer: bool) -> S
 
 /// shutdown(2) (`unix_shutdown`): `how` outside SHUT_RD..SHUT_RDWR
 /// EINVAL; the socket's shutdown gains how + 1; a stream peer gains the
-/// mirror (reading shut here is writing shut there). An unconnected
-/// socket is fine (0).
+/// mirror (reading shut here is writing shut there; a datagram peer
+/// nothing). An unconnected socket is fine (0).
 pub fn shutdown(p: &ProcessRef, fd: i32, how: i32) -> SysResult {
     let s = socket_of(p, fd)?;
     if !(un::SHUT_RD..=un::SHUT_RDWR).contains(&how) {
@@ -824,7 +1016,7 @@ pub fn shutdown(p: &ProcessRef, fd: i32, how: i32) -> SysResult {
         st.shutdown |= mode;
         st.wakes.wake(0);
     }
-    if let Some(peer) = s.peer() {
+    if let Some(peer) = s.peer().filter(|_| s.kind == SOCK_STREAM) {
         let mut mirror = 0;
         if mode & RCV_SHUTDOWN != 0 {
             mirror |= SEND_SHUTDOWN;
@@ -840,24 +1032,117 @@ pub fn shutdown(p: &ProcessRef, fd: i32, how: i32) -> SysResult {
     Ok(0)
 }
 
-/// `unix_stream_sendmsg` from the user segments `segs` (`flags` with
-/// MSG_DONTWAIT added for a non-blocking descriptor), in Linux's order:
-/// - MSG_OOB EOPNOTSUPP (Keel has no out-of-band data: ADR 0027);
-/// - an address: EISCONN if connected, else EOPNOTSUPP;
-/// - no peer ENOTCONN;
-/// - sending shut down: EPIPE, and SIGPIPE unless MSG_NOSIGNAL;
-/// - then the bytes go to the peer as room appears: its unread bytes from
-///   this side may reach the send buffer (SO_SNDBUF). Without room:
-///   EAGAIN if non-blocking and nothing was sent, else a wait (up to
-///   SO_SNDTIMEO; a signal or the timeout ends it with what was sent, or
-///   EINTR or EAGAIN); the peer gone or shut for reading: EPIPE (with
-///   SIGPIPE if nothing was sent), or the count so far.
+/// What a sendmsg's control data carries, checked (`__scm_send`).
+#[derive(Default)]
+pub struct Ancillary {
+    fds: Vec<Passed>,
+    creds: Option<un::Creds>,
+}
+
+/// `scm_send`: the control data parsed ([`un::parse_control`]: EINVAL);
+/// each descriptor must be open with DUPLICATE (EBADF: passing one is
+/// duplicating it, and a handle without DUPLICATE may not be, SR-1);
+/// SCM_CREDENTIALS must name a process of the sender's compartment
+/// (ESRCH, `find_get_pid`), with any uid and gid (Keel's processes are
+/// root, which may claim them: `scm_check_creds`).
+fn ancillary(p: &ProcessRef, control: &[u8]) -> Result<Ancillary, Errno> {
+    let parsed = un::parse_control(control)?;
+    let mut out = Ancillary::default();
+    {
+        let process = p.lock();
+        for fd in parsed.fds {
+            if fd < 0 {
+                return Err(Errno::EBADF);
+            }
+            let object = process.handles.get(fd, Rights::DUPLICATE)?.clone();
+            let rights = process.handles.rights(fd)?;
+            out.fds.push(Passed {
+                object,
+                rights,
+                _ticket: None,
+            });
+        }
+    }
+    if let Some((pid, uid, gid)) = parsed.creds {
+        let compartment = p.lock().member.compartment().clone();
+        let pid = u32::try_from(pid).map_err(|_| Errno::ESRCH)?;
+        crate::process::find_in(&compartment, pid).ok_or(Errno::ESRCH)?;
+        out.creds = Some(un::Creds {
+            compartment: compartment.id(),
+            pid,
+            uid,
+            gid,
+        });
+    }
+    Ok(out)
+}
+
+/// `unix_attach_fds`: ETOOMANYREFS if the compartment already has more
+/// than its limit in flight (`too_many_unix_fds`, held to all, ADR 0028);
+/// else each descriptor is counted until it is received or dropped.
+fn attach(compartment: u32, fds: Vec<Passed>) -> Result<Option<Vec<Passed>>, Errno> {
+    if fds.is_empty() {
+        return Ok(None);
+    }
+    let mut counts = INFLIGHT.lock();
+    let n = counts.entry(compartment).or_insert(0);
+    if *n > INFLIGHT_LIMIT {
+        return Err(Errno::ETOOMANYREFS);
+    }
+    *n += fds.len();
+    drop(counts);
+    Ok(Some(
+        fds.into_iter()
+            .map(|f| Passed {
+                _ticket: Some(InFlight(compartment)),
+                ..f
+            })
+            .collect(),
+    ))
+}
+
+/// `maybe_add_creds`: a part with no credentials gets the sender's if the
+/// sender or the receiver has SO_PASSCRED, or the receiver is not yet
+/// accepted (`!other->sk_socket`).
+fn creds_for(
+    p: &ProcessRef,
+    given: Option<un::Creds>,
+    sender_passcred: bool,
+    receiver: &State,
+) -> Option<un::Creds> {
+    if given.is_some() {
+        return given;
+    }
+    if sender_passcred || receiver.passcred || receiver.embryo {
+        let c = cred_of(p);
+        return Some(un::Creds {
+            compartment: c.compartment,
+            pid: c.pid,
+            uid: 0,
+            gid: 0,
+        });
+    }
+    None
+}
+
+fn sigpipe(p: &ProcessRef) {
+    let pid = p.lock().pid();
+    crate::signal::send_to_thread(
+        p,
+        sched::current(),
+        SigInfo::from_process(SIGPIPE, SI_USER, pid, 0),
+    );
+}
+
+/// sendmsg's work for either type (`flags` with MSG_DONTWAIT added for a
+/// non-blocking descriptor); `to` is an address given (its bytes).
 pub fn send(
     p: &ProcessRef,
     s: &Arc<Socket>,
     segs: &[(u64, u64)],
     flags: u32,
-    has_addr: bool,
+    to: Option<&[u8]>,
+    anc: Ancillary,
 ) -> SysResult {
     let flags = if s.nonblocking() {
         flags | MSG_DONTWAIT
@@ -867,7 +1152,34 @@ pub fn send(
     if flags & MSG_OOB != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    let (peer, shut, sndbuf, sndtimeo) = {
+    if s.kind == SOCK_DGRAM {
+        send_dgram(p, s, segs, flags, to, anc)
+    } else {
+        send_stream(p, s, segs, flags, to.is_some(), anc)
+    }
+}
+
+/// `unix_stream_sendmsg`, in Linux's order:
+/// - an address: EISCONN if connected, else EOPNOTSUPP;
+/// - no peer ENOTCONN;
+/// - sending shut down: EPIPE, and SIGPIPE unless MSG_NOSIGNAL;
+/// - then the bytes go to the peer as room appears: its unread bytes from
+///   this side may reach the send buffer (SO_SNDBUF). Without room:
+///   EAGAIN if non-blocking and nothing was sent, else a wait (up to
+///   SO_SNDTIMEO); the peer gone or shut for reading: EPIPE (with SIGPIPE
+///   if nothing was sent), or the count so far.
+/// - descriptors go with the first part (and with nothing, as a send of
+///   no bytes sends no part, they are dropped); credentials with every
+///   part ([`creds_for`]).
+fn send_stream(
+    p: &ProcessRef,
+    s: &Arc<Socket>,
+    segs: &[(u64, u64)],
+    flags: u32,
+    has_addr: bool,
+    anc: Ancillary,
+) -> SysResult {
+    let (peer, shut, sndbuf, sndtimeo, passcred) = {
         let st = s.state.lock();
         if has_addr {
             return Err(if matches!(st.conn, Conn::Connected { .. }) {
@@ -885,16 +1197,12 @@ pub fn send(
             st.shutdown & SEND_SHUTDOWN != 0,
             st.sndbuf as usize,
             st.sndtimeo,
+            st.passcred,
         )
     };
     let pipe = |sent: u64| -> SysResult {
         if sent == 0 && flags & MSG_NOSIGNAL == 0 {
-            let pid = p.lock().pid();
-            crate::signal::send_to_thread(
-                p,
-                sched::current(),
-                SigInfo::from_process(SIGPIPE, SI_USER, pid, 0),
-            );
+            sigpipe(p);
         }
         if sent > 0 {
             Ok(sent)
@@ -906,6 +1214,7 @@ pub fn send(
         return pipe(0);
     }
     let total = crate::ready::total(segs);
+    let mut fds = Some(anc.fds);
     let mut sent = 0u64;
     let mut chunk = alloc::vec![0u8; (total as usize).min(sndbuf).max(1)];
     while sent < total {
@@ -952,9 +1261,21 @@ pub fn send(
                 Err(Errno::EFAULT)
             };
         }
+        let passed = match attach(s.compartment, fds.take().unwrap_or_default()) {
+            Ok(f) => f,
+            Err(e) => return if sent > 0 { Ok(sent) } else { Err(e) },
+        };
         {
             let mut os = other.state.lock();
-            os.recv.push(&chunk[..n]);
+            let creds = creds_for(p, anc.creds, passcred, &os);
+            os.recv.push(un::Segment {
+                data: chunk[..n].to_vec(),
+                consumed: 0,
+                fds: passed,
+                creds,
+                from: None,
+                token: None,
+            });
             os.wakes.wake(KEY_READABLE);
         }
         changed();
@@ -963,33 +1284,204 @@ pub fn send(
     Ok(sent)
 }
 
-/// `unix_stream_read_generic` into the user segments `segs`:
-/// - not connected EINVAL; MSG_OOB EOPNOTSUPP;
-/// - what is waiting, up to the total (all of it with MSG_WAITALL, else
-///   at least one byte); MSG_PEEK leaves it;
-/// - nothing waiting: a pending error (ECONNRESET, reported once), then
-///   reading shut down (0), then EAGAIN if non-blocking, else a wait (up
-///   to SO_RCVTIMEO; EINTR on a signal);
-/// - bytes that fault on the way out stay; a fault before any EFAULT.
-///
-/// Returns the count and the peer's address (for recvfrom's address: the
-/// sender's, `unix_copy_addr`), if anything was read.
-pub fn recv(
+/// `unix_dgram_sendmsg`, in Linux's order:
+/// - an address (EINVAL as connect's), else the connected peer (none:
+///   ENOTCONN);
+/// - with SO_PASSCRED and no name, an autobind name;
+/// - longer than the send buffer less 32 bytes EMSGSIZE;
+/// - room in this socket's send buffer (its datagrams not yet read below
+///   SO_SNDBUF; this socket shut for sending EPIPE): without it EAGAIN if
+///   non-blocking, else a wait (up to SO_SNDTIMEO);
+/// - the bytes (EFAULT);
+/// - the target ([`find`] for an address; a connected peer that has gone
+///   disconnects this socket, dropping what it had received, and is
+///   ECONNREFUSED); one connected to another socket EPERM; one shut for
+///   reading EPIPE (no SIGPIPE);
+/// - its queue full (more than `max_dgram_qlen`), unless it is this
+///   socket or connected back to it: EAGAIN if non-blocking, else a wait;
+/// - the datagram is queued whole, with this socket's name, its
+///   descriptors and credentials; the call returns its length.
+fn send_dgram(
+    p: &ProcessRef,
     s: &Arc<Socket>,
     segs: &[(u64, u64)],
     flags: u32,
-) -> Result<(u64, Option<Vec<u8>>), Errno> {
+    to: Option<&[u8]>,
+    anc: Ancillary,
+) -> SysResult {
+    let name = match to {
+        Some(raw) => match un::parse(raw, false)? {
+            Target::Name(n) => Some(n),
+            Target::Autobind => return Err(Errno::EINVAL),
+        },
+        None => {
+            if s.peer_weak().is_none() {
+                return Err(Errno::ENOTCONN);
+            }
+            None
+        }
+    };
+    if s.state.lock().passcred {
+        autobind(s)?;
+    }
+    let len = crate::ready::total(segs) as usize;
+    let (sndbuf, sndtimeo, passcred) = {
+        let st = s.state.lock();
+        (st.sndbuf as usize, st.sndtimeo, st.passcred)
+    };
+    if len > sndbuf.saturating_sub(32) {
+        return Err(Errno::EMSGSIZE);
+    }
+    let nonblock = flags & MSG_DONTWAIT != 0 || sndtimeo == Some(0);
+    // `sock_alloc_send_pskb`.
+    loop {
+        if s.state.lock().shutdown & SEND_SHUTDOWN != 0 {
+            return Err(Errno::EPIPE);
+        }
+        if s.in_flight() < sndbuf {
+            break;
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        let me = s.clone();
+        wait_for(
+            || me.in_flight() < sndbuf || me.state.lock().shutdown & SEND_SHUTDOWN != 0,
+            sndtimeo,
+        )?;
+    }
+    let mut data = alloc::vec![0u8; len];
+    if !crate::ready::copy_in(segs, 0, &mut data) {
+        return Err(Errno::EFAULT);
+    }
+    let other = loop {
+        let other = match &name {
+            Some(n) => find(p, n, s.kind)?,
+            None => match s.peer_weak().and_then(|w| w.upgrade()) {
+                Some(o) => o,
+                None => {
+                    // The peer has gone: disconnect (`unix_dgram_disconnected`).
+                    let dropped = {
+                        let mut st = s.state.lock();
+                        st.conn = Conn::Unconnected;
+                        core::mem::take(&mut st.recv)
+                    };
+                    drop(dropped);
+                    return Err(Errno::ECONNREFUSED);
+                }
+            },
+        };
+        if !may_send(s, &other) {
+            return Err(Errno::EPERM);
+        }
+        let (shut, full) = {
+            let os = other.state.lock();
+            (
+                os.shutdown & RCV_SHUTDOWN != 0,
+                os.recv.count() > MAX_DGRAM_QLEN,
+            )
+        };
+        if shut {
+            return Err(Errno::EPIPE);
+        }
+        if !full || Arc::ptr_eq(&other, s) || points_at(&other, s) {
+            break other;
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        let target = Arc::downgrade(&other);
+        drop(other);
+        wait_for(
+            || {
+                target
+                    .upgrade()
+                    .is_none_or(|o| o.state.lock().recv.count() <= MAX_DGRAM_QLEN)
+            },
+            sndtimeo,
+        )?;
+    };
+    let passed = attach(s.compartment, anc.fds)?;
+    let from = s.state.lock().name.clone();
+    s.wmem.fetch_add(len, core::sync::atomic::Ordering::Relaxed);
+    let charge = Charge {
+        sender: Arc::downgrade(s),
+        bytes: len,
+    };
+    {
+        let mut os = other.state.lock();
+        let creds = creds_for(p, anc.creds, passcred, &os);
+        os.recv.push(un::Segment {
+            data,
+            consumed: 0,
+            fds: passed,
+            creds,
+            from,
+            token: Some(charge),
+        });
+        os.wakes.wake(KEY_READABLE);
+    }
+    changed();
+    Ok(len as u64)
+}
+
+/// What a receive got besides its bytes.
+#[derive(Default)]
+pub struct Received {
+    pub n: u64,
+    /// The sender's address (empty: none to report, length 0).
+    pub from: Vec<u8>,
+    pub fds: Vec<Passed>,
+    /// The `struct ucred` SO_PASSCRED reports, if the reader has it.
+    pub creds: Option<[u8; 12]>,
+    /// MSG_TRUNC: a datagram was longer than the buffer.
+    pub truncated: bool,
+}
+
+/// The `struct ucred` for a part's credentials (`__scm_recv_common`): its
+/// pid if of the reader's compartment (the socket's; else 0), its uid and gid; a part
+/// with none, pid 0 and the overflow uid and gid (65534, as
+/// `from_kuid_munged` of INVALID_UID); nothing read, all 0 (the zeroed
+/// cookie).
+fn ucred_of(read: Option<Option<un::Creds>>, me: u32) -> [u8; 12] {
+    const OVERFLOW: u32 = 65534;
+    match read {
+        Some(Some(c)) => un::ucred_bytes(if c.compartment == me { c.pid } else { 0 }, c.uid, c.gid),
+        Some(None) => un::ucred_bytes(0, OVERFLOW, OVERFLOW),
+        None => un::ucred_bytes(0, 0, 0),
+    }
+}
+
+/// recvmsg's work for either type.
+pub fn recv(s: &Arc<Socket>, segs: &[(u64, u64)], flags: u32) -> Result<Received, Errno> {
     let flags = if s.nonblocking() {
         flags | MSG_DONTWAIT
     } else {
         flags
     };
+    if s.kind == SOCK_DGRAM {
+        return recv_dgram(s, segs, flags);
+    }
     if !matches!(s.state.lock().conn, Conn::Connected { .. }) {
         return Err(Errno::EINVAL);
     }
     if flags & MSG_OOB != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
+    recv_stream(s, segs, flags)
+}
+
+/// `unix_stream_read_generic` into the user segments `segs`:
+/// - what is waiting, up to the total (all of it with MSG_WAITALL, else
+///   at least one byte); MSG_PEEK leaves it (and copies any descriptors);
+/// - it stops after a part with descriptors, and (with SO_PASSCRED)
+///   before a part whose credentials differ from the first one's
+///   ([`un::Queue::stream_plan`]);
+/// - nothing waiting: a pending error (ECONNRESET, reported once), then
+///   reading shut down (0), then EAGAIN if non-blocking, else a wait (up
+///   to SO_RCVTIMEO; EINTR on a signal);
+/// - bytes that fault on the way out stay; a fault before any EFAULT.
+fn recv_stream(s: &Arc<Socket>, segs: &[(u64, u64)], flags: u32) -> Result<Received, Errno> {
     let size = crate::ready::total(segs);
     let peek = flags & MSG_PEEK != 0;
     let target = if flags & MSG_WAITALL != 0 {
@@ -997,34 +1489,38 @@ pub fn recv(
     } else {
         1
     };
+    let passcred = s.state.lock().passcred;
+    let mut rs = un::ReadState::default();
+    let mut out = Received::default();
     let mut copied = 0u64;
     let mut buf = alloc::vec![0u8; (size as usize).min(65536)];
     let mut from = None;
+    let mut fds: Option<Vec<Passed>> = None;
     loop {
-        let (got, rcvtimeo) = {
+        let (plan, rcvtimeo, peeked) = {
             let mut st = s.state.lock();
             if st.recv.is_empty() {
                 if copied >= target {
                     break;
                 }
                 if let Some(e) = st.err.take() {
-                    return if copied > 0 {
-                        Ok((copied, from))
-                    } else {
-                        Err(e)
-                    };
+                    if copied > 0 {
+                        break;
+                    }
+                    return Err(e);
                 }
                 if st.shutdown & RCV_SHUTDOWN != 0 {
                     break;
                 }
-                (None, st.rcvtimeo)
+                (None, st.rcvtimeo, None)
             } else {
                 let want = ((size - copied) as usize).min(buf.len());
-                let n = st.recv.take(&mut buf[..want], peek);
-                (Some(n), st.rcvtimeo)
+                let plan = st.recv.stream_plan(&mut buf[..want], passcred, &mut rs);
+                let peeked = if peek { st.recv.peek_fds(plan.n) } else { None };
+                (Some(plan), st.rcvtimeo, peeked)
             }
         };
-        let Some(n) = got else {
+        let Some(plan) = plan else {
             if flags & MSG_DONTWAIT != 0 || rcvtimeo == Some(0) {
                 if copied > 0 {
                     break;
@@ -1046,14 +1542,25 @@ pub fn recv(
             }
             continue;
         };
-        // Copy out at the right place in the segments.
-        let out = skip_segments(segs, copied);
-        let done = crate::ready::copy_out(&out, &buf[..n]);
-        if done < n && !peek {
-            s.state.lock().recv.unread(&buf[done..n]);
-        }
-        if from.is_none() {
+        let n = plan.n;
+        let out_segs = skip_segments(segs, copied);
+        let done = crate::ready::copy_out(&out_segs, &buf[..n]);
+        if from.is_none() && n > 0 {
             from = Some(sender_name(&s.state.lock()));
+        }
+        if !peek && done > 0 {
+            let got = s.state.lock().recv.consume(done);
+            if got.is_some() {
+                fds = got;
+            }
+            // `unix_write_space`: the writer may have room now.
+            if let Some(peer) = s.peer() {
+                peer.wake(KEY_WRITABLE);
+            }
+            changed();
+        }
+        if peek && fds.is_none() {
+            fds = peeked;
         }
         copied += done as u64;
         if done < n {
@@ -1062,18 +1569,103 @@ pub fn recv(
             }
             break;
         }
-        if !peek {
-            // `unix_write_space`: the writer may have room now.
-            if let Some(peer) = s.peer() {
-                peer.wake(KEY_WRITABLE);
-            }
-            changed();
-        }
-        if peek || copied >= size || copied >= target && s.state.lock().recv.is_empty() {
+        if plan.stop || peek || copied >= size || copied >= target && s.state.lock().recv.is_empty()
+        {
             break;
         }
     }
-    Ok((copied, from))
+    out.n = copied;
+    out.from = from.unwrap_or_default();
+    out.fds = fds.unwrap_or_default();
+    if passcred {
+        out.creds = Some(ucred_of(rs.creds, s.compartment));
+    }
+    Ok(out)
+}
+
+/// `__unix_dgram_recvmsg`: one datagram (MSG_PEEK leaves it, copying its
+/// descriptors):
+/// - none waiting: a pending error first, then reading shut down (0),
+///   then EAGAIN if non-blocking, else a wait (up to SO_RCVTIMEO);
+/// - a buffer shorter than the datagram takes what fits, and MSG_TRUNC
+///   is set; with MSG_TRUNC in the flags the call returns the datagram's
+///   whole length;
+/// - a fault copying it out loses it (it was taken): EFAULT;
+/// - the sender's name if it had one; descriptors; credentials with
+///   SO_PASSCRED.
+fn recv_dgram(s: &Arc<Socket>, segs: &[(u64, u64)], flags: u32) -> Result<Received, Errno> {
+    if flags & MSG_OOB != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let peek = flags & MSG_PEEK != 0;
+    let size = crate::ready::total(segs) as usize;
+    let passcred = s.state.lock().passcred;
+    let (data, fds, creds, from_name, part) = loop {
+        let (got, rcvtimeo) = {
+            let mut st = s.state.lock();
+            if peek {
+                let got = st.recv.front().map(|f| {
+                    (
+                        f.data[f.consumed..].to_vec(),
+                        f.fds.clone(),
+                        f.creds,
+                        f.from.clone(),
+                        None::<Part>,
+                    )
+                });
+                (got, st.rcvtimeo)
+            } else if let Some(mut part) = st.recv.pop() {
+                let data = core::mem::take(&mut part.data);
+                let fds = part.fds.take();
+                (
+                    Some((data, fds, part.creds, part.from.clone(), Some(part))),
+                    st.rcvtimeo,
+                )
+            } else {
+                (None, st.rcvtimeo)
+            }
+        };
+        if let Some(g) = got {
+            break g;
+        }
+        {
+            let mut st = s.state.lock();
+            if let Some(e) = st.err.take() {
+                return Err(e);
+            }
+            if st.shutdown & RCV_SHUTDOWN != 0 {
+                return Ok(Received::default());
+            }
+        }
+        if flags & MSG_DONTWAIT != 0 || rcvtimeo == Some(0) {
+            return Err(Errno::EAGAIN);
+        }
+        let me = s.clone();
+        wait_for(
+            || {
+                let st = me.state.lock();
+                !st.recv.is_empty() || st.err.is_some() || st.shutdown & RCV_SHUTDOWN != 0
+            },
+            rcvtimeo,
+        )?;
+    };
+    // The datagram has left the queue: its charge goes, waking its sender.
+    drop(part);
+    let n = size.min(data.len());
+    if crate::ready::copy_out(segs, &data[..n]) < n {
+        return Err(Errno::EFAULT);
+    }
+    Ok(Received {
+        n: if flags & un::MSG_TRUNC != 0 {
+            data.len() as u64
+        } else {
+            n as u64
+        },
+        from: from_name.map_or_else(Vec::new, |n| n.sockaddr()),
+        fds: fds.unwrap_or_default(),
+        creds: passcred.then(|| ucred_of(Some(creds), s.compartment)),
+        truncated: data.len() > size,
+    })
 }
 
 /// The sender's address as recvfrom reports it (`unix_copy_addr`): the
@@ -1104,22 +1696,24 @@ fn skip_segments(segs: &[(u64, u64)], mut skip: u64) -> Vec<(u64, u64)> {
 }
 
 /// read(2) and readv(2) on a socket (`sock_read_iter`): nothing asked is
-/// 0 at once; otherwise recv with no flags.
+/// 0 at once; otherwise recv with no flags (descriptors that come with the
+/// bytes are closed, as `scm_destroy`).
 pub fn read(s: &Arc<Socket>, segs: &[(u64, u64)]) -> SysResult {
     if crate::ready::total(segs) == 0 {
         return Ok(0);
     }
-    recv(s, segs, 0).map(|(n, _)| n)
+    recv(s, segs, 0).map(|r| r.n)
 }
 
 /// write(2) and writev(2) on a socket (`sock_write_iter`): send with no
 /// flags.
 pub fn write(p: &ProcessRef, s: &Arc<Socket>, segs: &[(u64, u64)]) -> SysResult {
-    send(p, s, segs, 0, false)
+    send(p, s, segs, 0, None, Ancillary::default())
 }
 
 /// sendto(2) (`__sys_sendto`): the descriptor (EBADF, ENOTSOCK), then
-/// the address if any (EINVAL, EFAULT), then the send.
+/// the address if any (EINVAL, EFAULT; a length of 0 is none), then the
+/// send.
 pub fn sendto(
     p: &ProcessRef,
     fd: i32,
@@ -1130,18 +1724,24 @@ pub fn sendto(
     alen: i32,
 ) -> SysResult {
     let s = socket_of(p, fd)?;
-    let has_addr = if addr != 0 {
-        addr_in(addr, alen)?;
-        alen != 0
+    let to = if addr != 0 {
+        let raw = addr_in(addr, alen)?;
+        (alen != 0).then_some(raw)
     } else {
-        false
+        None
     };
-    send(p, &s, &[(buf, len)], flags, has_addr)
+    send(
+        p,
+        &s,
+        &[(buf, len)],
+        flags,
+        to.as_deref(),
+        Ancillary::default(),
+    )
 }
 
 /// recvfrom(2) (`__sys_recvfrom`): the sender's address is written if
-/// asked and something was read; with nothing to report its length is 0
-/// (`msg_namelen` stays 0).
+/// asked; with nothing to report its length is 0 (`msg_namelen` stays 0).
 pub fn recvfrom(
     p: &ProcessRef,
     fd: i32,
@@ -1152,11 +1752,11 @@ pub fn recvfrom(
     len_at: u64,
 ) -> SysResult {
     let s = socket_of(p, fd)?;
-    let (n, from) = recv(&s, &[(buf, len)], flags)?;
+    let r = recv(&s, &[(buf, len)], flags)?;
     if addr != 0 {
-        addr_out(from.as_deref().unwrap_or(&[]), addr, len_at)?;
+        addr_out(&r.from, addr, len_at)?;
     }
-    Ok(n)
+    Ok(r.n)
 }
 
 /// `struct user_msghdr` on x86-64: msg_name 0, msg_namelen 8 (int),
@@ -1166,6 +1766,7 @@ struct MsgHdr {
     name: u64,
     namelen: i32,
     iov: Vec<(u64, u64)>,
+    control: u64,
     controllen: u64,
 }
 
@@ -1193,47 +1794,116 @@ fn msghdr(at: u64) -> Result<MsgHdr, Errno> {
         name,
         namelen,
         iov,
+        control: word(32),
         controllen: word(40),
     })
 }
 
-/// sendmsg(2) (`____sys_sendmsg`): a control length past INT_MAX
-/// ENOBUFS. Ancillary data is part 2: any is EINVAL for now (ADR 0027).
+/// sendmsg(2) (`____sys_sendmsg`): the name (EINVAL, EFAULT); a control
+/// length past INT_MAX ENOBUFS; the control data copied in (EFAULT) and
+/// checked ([`ancillary`]); then the send.
 pub fn sendmsg(p: &ProcessRef, fd: i32, msg: u64, flags: u32) -> SysResult {
     let s = socket_of(p, fd)?;
     let m = msghdr(msg)?;
-    if m.namelen > 0 {
-        addr_in(m.name, m.namelen)?;
-    }
+    let to = if m.namelen > 0 {
+        Some(addr_in(m.name, m.namelen)?)
+    } else {
+        None
+    };
     if m.controllen > i32::MAX as u64 {
         return Err(Errno::ENOBUFS);
     }
-    if m.controllen != 0 {
-        return Err(Errno::EINVAL);
-    }
-    send(p, &s, &m.iov, flags, m.namelen > 0)
+    let anc = if m.controllen > 0 {
+        let mut control = alloc::vec![0u8; m.controllen as usize];
+        copy_from_user(&mut control, m.control).map_err(|_| Errno::EFAULT)?;
+        ancillary(p, &control)?
+    } else {
+        Ancillary::default()
+    };
+    send(p, &s, &m.iov, flags, to.as_deref(), anc)
 }
 
-/// recvmsg(2) (`____sys_recvmsg`): after the read, the name length (and
-/// the name if asked), msg_flags (MSG_CMSG_CLOEXEC kept from the flags)
-/// and a control length of 0 are written back.
+/// recvmsg(2) (`____sys_recvmsg`, `scm_recv_unix`): after the read:
+/// - the name (if asked) and its length;
+/// - the control data: SCM_CREDENTIALS first (with SO_PASSCRED), then
+///   SCM_RIGHTS, each as `put_cmsg` and `scm_detach_fds` fit them; with
+///   no control buffer, MSG_CTRUNC if either was due. Each descriptor
+///   received is a new handle with the sender's rights, close-on-exec
+///   with MSG_CMSG_CLOEXEC; those that do not fit (or find no free
+///   number: EMFILE) are closed, and MSG_CTRUNC set;
+/// - msg_controllen (the bytes used) and msg_flags (MSG_CMSG_CLOEXEC
+///   kept, MSG_TRUNC, MSG_CTRUNC).
 pub fn recvmsg(p: &ProcessRef, fd: i32, msg: u64, flags: u32) -> SysResult {
+    const MSG_CTRUNC: u32 = 0x8;
     let s = socket_of(p, fd)?;
     let m = msghdr(msg)?;
-    let (n, from) = recv(&s, &m.iov, flags)?;
+    let r = recv(&s, &m.iov, flags)?;
     if m.name != 0 {
-        let from = from.unwrap_or_default();
-        let room = m.namelen as usize;
-        let k = room.min(from.len());
-        copy_to_user(m.name, &from[..k]).map_err(|_| Errno::EFAULT)?;
-        copy_to_user(msg + 8, &(from.len() as i32).to_le_bytes()).map_err(|_| Errno::EFAULT)?;
+        let k = (m.namelen as usize).min(r.from.len());
+        copy_to_user(m.name, &r.from[..k]).map_err(|_| Errno::EFAULT)?;
+        copy_to_user(msg + 8, &(r.from.len() as i32).to_le_bytes()).map_err(|_| Errno::EFAULT)?;
     } else {
         copy_to_user(msg + 8, &0i32.to_le_bytes()).map_err(|_| Errno::EFAULT)?;
     }
-    let out_flags = flags & un::MSG_CMSG_CLOEXEC;
+    let room = if m.control == 0 {
+        0
+    } else {
+        m.controllen as usize
+    };
+    let mut out = un::ControlOut::new(room);
+    let has_control = m.control != 0;
+    if let Some(c) = r.creds {
+        if has_control {
+            out.put(un::SCM_CREDENTIALS, &c);
+        } else {
+            out.truncated = true;
+        }
+    }
+    let count = r.fds.len();
+    let mut installed = Vec::new();
+    if count > 0 {
+        if has_control {
+            let fit = out.fd_room(count);
+            let cloexec = flags & un::MSG_CMSG_CLOEXEC != 0;
+            for passed in r.fds.into_iter().take(fit) {
+                let inserted = p.lock().handles.insert(Handle {
+                    object: passed.object,
+                    rights: passed.rights,
+                    close_on_exec: cloexec,
+                });
+                match inserted {
+                    Ok(n) => installed.push(n),
+                    Err(_) => break,
+                }
+            }
+            out.put_fds(&installed, count);
+        } else {
+            out.truncated = true;
+        }
+    }
+    if !out.bytes.is_empty() && copy_to_user(m.control, &out.bytes).is_err() {
+        // `put_cmsg`'s EFAULT: nothing delivered; the new handles go.
+        let gone: Vec<_> = {
+            let mut process = p.lock();
+            installed
+                .iter()
+                .map(|&n| process.handles.close(n))
+                .collect()
+        };
+        drop(gone);
+        out.bytes.clear();
+        out.truncated = true;
+    }
+    let mut out_flags = flags & un::MSG_CMSG_CLOEXEC;
+    if out.truncated {
+        out_flags |= MSG_CTRUNC;
+    }
+    if r.truncated {
+        out_flags |= un::MSG_TRUNC;
+    }
     copy_to_user(msg + 48, &out_flags.to_le_bytes()).map_err(|_| Errno::EFAULT)?;
-    copy_to_user(msg + 40, &0u64.to_le_bytes()).map_err(|_| Errno::EFAULT)?;
-    Ok(n)
+    copy_to_user(msg + 40, &(out.bytes.len() as u64).to_le_bytes()).map_err(|_| Errno::EFAULT)?;
+    Ok(r.n)
 }
 
 const SOL_SOCKET: i32 = 1;

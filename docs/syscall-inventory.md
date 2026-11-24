@@ -35,14 +35,14 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 25 | `lstat` | 162 | 17 | 163 | complete | `exec.filesystem` |
 | 26 | `pipe2` | 166 | 0 | 157 | partial (no O_DIRECT) | `exec.pipes` |
 | 27 | `clone` | 48 | 0 | 45 | partial (threads, fork-like) | `exec.threads`, `exec.thread_calls` |
-| 28 | `socketpair` | 11 | 0 | 11 | partial (AF_UNIX stream) | `exec.sockets` |
+| 28 | `socketpair` | 11 | 0 | 11 | partial (AF_UNIX stream and datagram) | `exec.sockets`, `exec.socket_messages` |
 | 29 | `shutdown` | 1 | 0 | 1 | complete | `exec.sockets` |
 | 30 | `poll` | 1 | 0 | 1 | complete | `syscalls.conformance`, `exec.pipes` |
 | 31 | `pipe` | 17 | 0 | 17 | complete | `exec.pipes` |
 | 32 | `fork` | 25 | 0 | 25 | complete | `exec.fork_wait`, `compartment.fork_bomb` |
 | 33 | `setsid` | 10 | 0 | 10 | missing |  |
 | 34 | `unlink` | 9 | 1 | 9 | complete | `exec.filesystem` |
-| 35 | `socket` | 8 | 0 | 8 | partial (AF_UNIX stream) | `exec.sockets` |
+| 35 | `socket` | 8 | 0 | 8 | partial (AF_UNIX stream and datagram; the traced AF_INET and AF_NETLINK are not) | `exec.sockets`, `exec.socket_messages` |
 | 36 | `bind` | 2 | 0 | 2 | complete | `exec.sockets` |
 | 37 | `chmod` | 1 | 0 | 1 | complete | `exec.filesystem` |
 | 38 | `listen` | 1 | 0 | 1 | complete | `exec.sockets` |
@@ -63,8 +63,8 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 53 | `setpriority` | 2 | 1 | 2 | missing |  |
 | 54 | `epoll_pwait` | 21615 | 0 | 21623 | complete | `exec.epoll` |
 | 55 | `accept` | 1 | 0 | 1 | complete | `exec.sockets` |
-| 56 | `sendmsg` | 829 | 0 | 820 | partial (no ancillary data) | `exec.sockets` |
-| 57 | `recvmsg` | 833 | 4 | 822 | partial (no ancillary data) | `exec.sockets` |
+| 56 | `sendmsg` | 829 | 0 | 820 | complete | `exec.sockets`, `exec.socket_messages` |
+| 57 | `recvmsg` | 833 | 4 | 822 | complete | `exec.sockets`, `exec.socket_messages` |
 | 58 | `sigaltstack` | 58 | 0 | 55 | complete | `syscalls.conformance`, `exec.signals` |
 | 59 | `gettid` | 58 | 0 | 55 | complete | `exec.thread_calls` |
 | 60 | `sched_getaffinity` | 12 | 0 | 12 | missing |  |
