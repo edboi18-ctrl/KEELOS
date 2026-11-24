@@ -412,15 +412,26 @@ fn selects() -> i32 {
     if sys::select(51, sets, None) != EBADF {
         return 44;
     }
-    let mut xs = [0u8; 128];
-    set_bit(&mut xs, 100);
-    let mut tv = timespec(0, 0);
-    let sets = FdSets {
-        read: None,
-        write: None,
-        except: Some(&mut xs),
-    };
-    if sys::select(101, sets, Some(&mut tv)) != 0 {
+    // Bits past the table's size are ignored. The table this process
+    // started with depends on what its parent had open, so the check runs
+    // in a child forked with nothing at or above 64 open: Linux's `dup_fd`
+    // starts the child at NR_OPEN_DEFAULT (64) and grows it only to cover
+    // the parent's highest open descriptor (`sane_fdtable_size`).
+    for fd in 64..1024 {
+        sys::close(fd);
+    }
+    let status = in_child(|| {
+        let mut xs = [0u8; 128];
+        set_bit(&mut xs, 100);
+        let mut tv = timespec(0, 0);
+        let sets = FdSets {
+            read: None,
+            write: None,
+            except: Some(&mut xs),
+        };
+        i32::from(sys::select(101, sets, Some(&mut tv)) != 0)
+    });
+    if status != Some(0) {
         return 95;
     }
     // A descriptor ready in two sets counts twice (an eventfd with a
