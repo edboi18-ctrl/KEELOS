@@ -123,10 +123,17 @@ wait.
 6. **Temporary signal masks** (ppoll, pselect6; `set_user_sigmask`): a
    mask (its size must be 8, else EINVAL) is blocked for the call, and
    the mask it replaced is kept in the thread's signal state:
-   - if a handler runs on the way out, its frame saves the kept mask
-     (`sigmask_to_save`), so sigreturn restores it;
-   - otherwise the way back to user mode restores it
+   - a call that was not interrupted puts it back at once, before any
+     signal is delivered (`restore_saved_sigmask_unless`), so a signal
+     only the call's mask let in stays pending;
+   - after an interrupted call, if a handler runs on the way out, its
+     frame saves the kept mask (`sigmask_to_save`), so sigreturn restores
+     it; otherwise the way back to user mode restores it
      (`restore_saved_sigmask`).
+
+   (The first rule was missing from part 1's commit, which restored the
+   mask only on the way out and so could deliver such a signal; part 2
+   restored it and added a check, ADR 0026.)
 
    pselect6 reads its mask and size from the "argpack" its sixth argument
    points at.

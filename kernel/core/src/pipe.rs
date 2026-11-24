@@ -4,6 +4,7 @@
 
 use alloc::collections::VecDeque;
 
+use crate::epoll::{EPOLLIN, EPOLLOUT, EPOLLRDNORM, EPOLLWRNORM, Wakes};
 use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 
 /// Writes of at most this many bytes are atomic (`PIPE_BUF`,
@@ -32,6 +33,10 @@ pub struct Pipe {
     data: VecDeque<u8>,
     pub readers: u32,
     pub writers: u32,
+    /// The wakes of the readers' queue (`rd_wait`) and the writers'
+    /// (`wr_wait`), for epoll (ADR 0026).
+    pub rd_wakes: Wakes,
+    pub wr_wakes: Wakes,
 }
 
 impl Default for Pipe {
@@ -47,6 +52,8 @@ impl Pipe {
             data: VecDeque::new(),
             readers: 1,
             writers: 1,
+            rd_wakes: Wakes::default(),
+            wr_wakes: Wakes::default(),
         }
     }
 
@@ -69,11 +76,30 @@ impl Pipe {
                 Io::WouldBlock
             };
         }
+        let was_full = self.data.len() == PIPE_CAPACITY;
         let n = buf.len().min(self.data.len());
         for (slot, byte) in buf.iter_mut().zip(self.data.drain(..n)) {
             *slot = byte;
         }
+        // `pipe_read` wakes the writers only if the pipe was full.
+        if was_full {
+            self.wr_wakes.wake(EPOLLOUT | EPOLLWRNORM);
+        }
         Io::Done(n)
+    }
+
+    /// `pipe_release` for one end: when the last reader or the last
+    /// writer goes but not both, both queues are woken for everything.
+    pub fn close_end(&mut self, writer: bool) {
+        if writer {
+            self.writers -= 1;
+        } else {
+            self.readers -= 1;
+        }
+        if (self.readers == 0) != (self.writers == 0) {
+            self.rd_wakes.wake(0);
+            self.wr_wakes.wake(0);
+        }
     }
 
     /// Puts bytes back at the front, as if never read (a read whose copy
@@ -108,6 +134,10 @@ impl Pipe {
             room.min(data.len())
         };
         self.data.extend(&data[..n]);
+        // `pipe_write` wakes the readers after every write once the pipe
+        // has been polled ("Epoll nonsensically wants a wakeup whether the
+        // pipe was already empty or not").
+        self.rd_wakes.wake(EPOLLIN | EPOLLRDNORM);
         Io::Done(n)
     }
 
@@ -141,6 +171,9 @@ pub struct EventCounter {
     pub count: u64,
     /// EFD_SEMAPHORE: a read takes 1, not everything.
     pub semaphore: bool,
+    /// The wakes of its queue (`wqh`), for epoll: EPOLLOUT after a read,
+    /// EPOLLIN after a write (ADR 0026).
+    pub wakes: Wakes,
 }
 
 impl EventCounter {
@@ -152,6 +185,7 @@ impl EventCounter {
         }
         let n = if self.semaphore { 1 } else { self.count };
         self.count -= n;
+        self.wakes.wake(EPOLLOUT);
         Some(n)
     }
 
@@ -161,6 +195,7 @@ impl EventCounter {
     pub fn write(&mut self, n: u64) -> bool {
         if u64::MAX - self.count > n {
             self.count += n;
+            self.wakes.wake(EPOLLIN);
             true
         } else {
             false
@@ -237,10 +272,35 @@ mod tests {
     }
 
     #[test]
+    fn pipes_count_their_wakes_as_linux_wakes() {
+        let mut p = Pipe::new();
+        let (rd, wr) = (p.rd_wakes, p.wr_wakes);
+        p.write(b"x", true);
+        assert!(p.rd_wakes.fired_since(&rd, EPOLLIN));
+        assert_eq!(p.wr_wakes, wr, "a write wakes only readers");
+        let mut b = [0u8; 1];
+        p.read(&mut b);
+        assert_eq!(
+            p.wr_wakes, wr,
+            "a read of a pipe that was not full wakes no one"
+        );
+        p.write(&alloc::vec![0u8; PIPE_CAPACITY], false);
+        p.read(&mut b);
+        assert!(p.wr_wakes.fired_since(&wr, EPOLLOUT));
+        let (rd, wr) = (p.rd_wakes, p.wr_wakes);
+        p.readers += 1;
+        p.close_end(false);
+        assert_eq!((p.rd_wakes, p.wr_wakes), (rd, wr), "a reader is left");
+        p.close_end(false);
+        assert!(p.rd_wakes.fired_since(&rd, EPOLLIN) && p.wr_wakes.fired_since(&wr, EPOLLOUT));
+    }
+
+    #[test]
     fn eventfd_counts_as_linux() {
         let mut c = EventCounter {
             count: 3,
             semaphore: false,
+            wakes: Wakes::default(),
         };
         assert_eq!(c.poll(), POLLIN | POLLOUT);
         assert_eq!(c.read(), Some(3));
@@ -252,6 +312,7 @@ mod tests {
         let mut s = EventCounter {
             count: 2,
             semaphore: true,
+            wakes: Wakes::default(),
         };
         assert_eq!((s.read(), s.read(), s.read()), (Some(1), Some(1), None));
     }

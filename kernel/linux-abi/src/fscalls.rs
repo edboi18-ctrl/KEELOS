@@ -192,8 +192,8 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
     match object(p, fd, Rights::NONE)? {
         // `stream_open` takes FMODE_LSEEK away: vfs_llseek ESPIPE.
         Object::Pipe(_) => return Err(Errno::ESPIPE),
-        // eventfd's `noop_llseek`: the position, always 0.
-        Object::EventFd(_) => return Ok(0),
+        // eventfd's and eventpoll's `noop_llseek`: the position, always 0.
+        Object::EventFd(_) | Object::Epoll(_) => return Ok(0),
         Object::File(_) => {}
     }
     let open = file(p, fd, Rights::SEEK)?;

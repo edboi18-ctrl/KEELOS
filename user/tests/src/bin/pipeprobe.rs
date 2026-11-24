@@ -565,7 +565,25 @@ fn selects() -> i32 {
             return 98 + wait;
         }
     }
-    if !disposition(SIGUSR1, 0) {
+    // A call that returns without being interrupted puts its mask back
+    // before any delivery (`restore_saved_sigmask_unless`): ppoll with a
+    // descriptor ready returns it even with a signal pending that its mask
+    // lets in, and that signal stays pending, its handler not run.
+    let efd = sys::eventfd2(1, None) as i32;
+    sys::kill(pid(), SIGUSR1);
+    let mut fds = [pollfd(efd, POLLIN)];
+    let mut ts = timespec(5, 0);
+    let mut now = 0u64;
+    if sys::ppoll(&mut fds, Some(&mut ts), Some(&open), 8) != 1
+        || keel_rt::signal::caught(SIGUSR1) != 2
+        || sys::rt_sigprocmask(SIG_BLOCK, Arg::Null, Out::Buf(&mut now), 8) != 0
+        || now & usr1 == 0
+    {
+        return 101;
+    }
+    sys::close(efd);
+    // Ignoring SIGUSR1 drops the pending one; then its default back.
+    if !disposition(SIGUSR1, 1) || !disposition(SIGUSR1, 0) {
         return 100;
     }
     if sys::rt_sigprocmask(SIG_SETMASK, Arg::Buf(&old), Out::Null, 8) != 0 {
@@ -726,7 +744,7 @@ fn main(_: &Startup) -> i32 {
     }
     sys::close(r);
     sys::close(w);
-    sys::write(1, b"pipeprobe: 83 checks passed\n");
+    sys::write(1, b"pipeprobe: 84 checks passed\n");
     0
 }
 

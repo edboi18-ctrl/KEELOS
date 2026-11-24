@@ -12,6 +12,7 @@ pub mod cpio;
 pub mod cpuvuln;
 pub mod crypto;
 pub mod elf;
+pub mod epoll;
 pub mod errno;
 pub mod exec;
 

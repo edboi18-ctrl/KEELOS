@@ -16,6 +16,8 @@ pub mod names;
 #[cfg(target_os = "none")]
 pub mod compartment;
 #[cfg(target_os = "none")]
+pub mod epoll;
+#[cfg(target_os = "none")]
 pub mod exec;
 #[cfg(target_os = "none")]
 pub mod fs;

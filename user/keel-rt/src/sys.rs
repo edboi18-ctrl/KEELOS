@@ -1204,3 +1204,97 @@ pub fn pselect6(
     let pack = [mask.map_or(0, |m| m as *const u64 as u64), size];
     call6(270, [n as u64, r, w, e, ts, pack.as_ptr() as u64])
 }
+
+/// epoll_create1(2) (epoll_create(2) with `size` when `flags` is None).
+pub fn epoll_create1(flags: Option<u64>, size: i32) -> i64 {
+    match flags {
+        None => call3(213, size as u32 as u64, 0, 0),
+        Some(f) => call3(291, f, 0, 0),
+    }
+}
+
+/// epoll_ctl(2) with a raw 12-byte `struct epoll_event` (None: NULL).
+pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: Option<&[u8; 12]>) -> i64 {
+    let at = event.map_or(0, |e| e.as_ptr() as u64);
+    call6(233, [epfd as u64, op as u64, fd as u64, at, 0, 0])
+}
+
+/// epoll_ctl(2) reading the event from an address the kernel may refuse.
+pub fn epoll_ctl_from(epfd: i32, op: i32, fd: i32, event: Hostile) -> i64 {
+    call6(233, [epfd as u64, op as u64, fd as u64, event.0, 0, 0])
+}
+
+/// epoll_wait(2) into `events`, raw 12-byte `struct epoll_event`s.
+pub fn epoll_wait(epfd: i32, events: &mut [[u8; 12]], timeout_ms: i32) -> i64 {
+    call6(
+        232,
+        [
+            epfd as u64,
+            events.as_mut_ptr() as u64,
+            events.len() as u64,
+            timeout_ms as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// epoll_wait(2) writing to an address no Rust object occupies.
+pub fn epoll_wait_into(epfd: i32, target: Hostile, maxevents: i32, timeout_ms: i32) -> i64 {
+    call6(
+        232,
+        [
+            epfd as u64,
+            target.0,
+            maxevents as u32 as u64,
+            timeout_ms as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// epoll_pwait(2): a mask of `size` bytes (the kernel reads 8).
+pub fn epoll_pwait(
+    epfd: i32,
+    events: &mut [[u8; 12]],
+    timeout_ms: i32,
+    mask: Option<&u64>,
+    size: u64,
+) -> i64 {
+    let mask = mask.map_or(0, |m| m as *const u64 as u64);
+    call6(
+        281,
+        [
+            epfd as u64,
+            events.as_mut_ptr() as u64,
+            events.len() as u64,
+            timeout_ms as u64,
+            mask,
+            size,
+        ],
+    )
+}
+
+/// epoll_pwait2(2): `ts` a raw `struct timespec` (None: no limit).
+pub fn epoll_pwait2(
+    epfd: i32,
+    events: &mut [[u8; 12]],
+    ts: Option<&[u8; 16]>,
+    mask: Option<&u64>,
+    size: u64,
+) -> i64 {
+    let ts = ts.map_or(0, |t| t.as_ptr() as u64);
+    let mask = mask.map_or(0, |m| m as *const u64 as u64);
+    call6(
+        441,
+        [
+            epfd as u64,
+            events.as_mut_ptr() as u64,
+            events.len() as u64,
+            ts,
+            mask,
+            size,
+        ],
+    )
+}

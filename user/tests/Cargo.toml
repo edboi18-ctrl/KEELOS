@@ -127,6 +127,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "epollprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "execprobe"
 test = false
 bench = false

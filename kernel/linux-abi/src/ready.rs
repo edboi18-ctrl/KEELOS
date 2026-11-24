@@ -58,14 +58,7 @@ pub struct PipeEnd {
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
-        {
-            let mut pipe = self.pipe.lock();
-            if self.write {
-                pipe.writers -= 1;
-            } else {
-                pipe.readers -= 1;
-            }
-        }
+        self.pipe.lock().close_end(self.write);
         changed();
     }
 }
@@ -150,6 +143,7 @@ pub fn eventfd2(p: &ProcessRef, initval: u32, flags: u64) -> SysResult {
         counter: IrqMutex::new(EventCounter {
             count: u64::from(initval),
             semaphore: flags & EFD_SEMAPHORE != 0,
+            wakes: keel_core::epoll::Wakes::default(),
         }),
         status: IrqMutex::new(crate::abi::O_RDWR | (flags & O_NONBLOCK)),
     };
@@ -442,12 +436,14 @@ fn write_eventfd(file: &EventFile, segs: &[(u64, u64)]) -> SysResult {
     }
 }
 
-/// The poll mask of a pipe end or eventfd, or None for any other object.
+/// The poll mask of a pipe end, eventfd or epoll instance, or None for a
+/// file.
 pub fn poll_mask(object: &Object) -> Option<u16> {
     Some(match object {
         Object::Pipe(end) => end.pipe.lock().poll(!end.write),
         Object::EventFd(file) => file.counter.lock().poll(),
-        _ => return None,
+        Object::Epoll(ep) => crate::epoll::poll_mask(ep),
+        Object::File(_) => return None,
     })
 }
 
@@ -474,8 +470,9 @@ pub fn stat_bytes(object: &Object) -> Option<[u8; 144]> {
     const S_IFIFO: u32 = 0o010000;
     let (ino, mode, dev) = match object {
         Object::Pipe(end) => (end.ino, S_IFIFO | 0o600, PIPEFS_DEV),
-        Object::EventFd(_) => (ANON_INODE_INO, 0o600, ANON_INODE_DEV),
-        _ => return None,
+        // An epoll instance is the same anonymous inode.
+        Object::EventFd(_) | Object::Epoll(_) => (ANON_INODE_INO, 0o600, ANON_INODE_DEV),
+        Object::File(_) => return None,
     };
     let now = crate::fs::with(|fs| Ok(fs.time_now())).unwrap_or(Timespec::default());
     let stat = Stat {
@@ -496,8 +493,8 @@ pub fn stat_bytes(object: &Object) -> Option<[u8; 144]> {
 pub fn statfs_magic(object: &Object) -> Option<u64> {
     match object {
         Object::Pipe(_) => Some(0x5049_5045),
-        Object::EventFd(_) => Some(0x0904_1934),
-        _ => None,
+        Object::EventFd(_) | Object::Epoll(_) => Some(0x0904_1934),
+        Object::File(_) => None,
     }
 }
 
@@ -506,7 +503,8 @@ pub fn status(object: &Object) -> Option<&IrqMutex<u64>> {
     match object {
         Object::Pipe(end) => Some(&end.status),
         Object::EventFd(file) => Some(&file.status),
-        _ => None,
+        Object::Epoll(ep) => Some(&ep.status),
+        Object::File(_) => None,
     }
 }
 
@@ -525,13 +523,19 @@ pub fn bytes_waiting(object: &Object) -> Option<usize> {
 /// readiness for an operation the handle cannot perform
 /// (docs/syscalls.md). None if `fd` is not open.
 pub fn fd_ready(p: &ProcessRef, fd: i32) -> Option<u16> {
-    use keel_core::poll::*;
     let (object, rights) = {
         let process = p.lock();
         let object = process.handles.get(fd, Rights::NONE).ok()?.clone();
         (object, process.handles.rights(fd).ok()?)
     };
-    let ready = match &object {
+    Some(object_ready(&object, rights))
+}
+
+/// What `object` is ready for, through a handle with `rights` (as
+/// [`fd_ready`]).
+pub fn object_ready(object: &Object, rights: Rights) -> u16 {
+    use keel_core::poll::*;
+    let ready = match object {
         Object::File(file) => {
             // Copy the kind out: the file lock is not held while the
             // terminal's is taken.
@@ -562,7 +566,7 @@ pub fn fd_ready(p: &ProcessRef, fd: i32) -> Option<u16> {
     if rights.contains(Rights::WRITE) {
         allowed |= POLLOUT | POLLWRNORM;
     }
-    Some(ready & allowed)
+    ready & allowed
 }
 
 /// The wait poll, select and their variants share (`do_poll`,
@@ -675,12 +679,19 @@ enum TimeForm {
     Timespec,
 }
 
-/// `poll_select_finish`: writes the time left (0 if none) to `at`,
-/// unless the timeout was zero. A failed write is ignored, as on Linux
-/// ("an application puts its timeval in read-only memory"). A mask the
-/// call replaced is put back on the way to user mode, after any handler's
-/// frame has saved it (`restore_saved_sigmask_unless`, ADR 0025).
-fn finish(at: u64, timeout: Option<(u64, bool)>, form: TimeForm, result: SysResult) -> SysResult {
+/// `poll_select_finish`: puts back a mask the call replaced unless a
+/// signal interrupted it (`restore_saved_sigmask_unless`), and writes the
+/// time left (0 if none) to `at`, unless the timeout was zero. A failed
+/// write is ignored, as on Linux ("an application puts its timeval in
+/// read-only memory").
+fn finish(
+    p: &ProcessRef,
+    at: u64,
+    timeout: Option<(u64, bool)>,
+    form: TimeForm,
+    result: SysResult,
+) -> SysResult {
+    crate::signal::end_temporary_mask(p, result == Err(Errno::EINTR));
     if let Some((deadline, false)) = timeout {
         let left = deadline.saturating_sub(keel_hal::time::monotonic_nanos());
         let sec = left / 1_000_000_000;
@@ -705,7 +716,7 @@ pub fn ppoll(p: &ProcessRef, fds: u64, nfds: u32, tsp: u64, mask: u64, size: u64
     let timeout = timespec_deadline(tsp)?;
     crate::signal::temporary_mask(p, mask, size)?;
     let result = do_poll(p, fds, nfds, timeout.map(|t| t.0));
-    finish(tsp, timeout, TimeForm::Timespec, result)
+    finish(p, tsp, timeout, TimeForm::Timespec, result)
 }
 
 /// `fd_set` bytes for `n` descriptors: whole longs (`FDS_BYTES`).
@@ -826,7 +837,7 @@ pub fn select(p: &ProcessRef, n: i32, sets: [u64; 3], tvp: u64) -> SysResult {
         )?
     };
     let result = do_select(p, n, sets, timeout.map(|t| t.0));
-    finish(tvp, timeout, TimeForm::Timeval, result)
+    finish(p, tvp, timeout, TimeForm::Timeval, result)
 }
 
 /// pselect6(2): a timespec timeout, and a mask from the "argpack" at
@@ -846,5 +857,5 @@ pub fn pselect6(p: &ProcessRef, n: i32, sets: [u64; 3], tsp: u64, sig: u64) -> S
     let timeout = timespec_deadline(tsp)?;
     crate::signal::temporary_mask(p, mask, size)?;
     let result = do_select(p, n, sets, timeout.map(|t| t.0));
-    finish(tsp, timeout, TimeForm::Timespec, result)
+    finish(p, tsp, timeout, TimeForm::Timespec, result)
 }

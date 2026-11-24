@@ -73,6 +73,8 @@ pub enum Object {
     Pipe(Arc<crate::ready::PipeEnd>),
     /// An eventfd (P3-T10, ADR 0025).
     EventFd(Arc<crate::ready::EventFile>),
+    /// An epoll instance (P3-T10, ADR 0026).
+    Epoll(Arc<crate::epoll::EpollFile>),
 }
 
 /// Rights given to an open regular file or device, by access mode. Reading

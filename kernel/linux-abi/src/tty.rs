@@ -45,7 +45,13 @@ fn on_keyboard_byte(byte: u8) {
         } = &mut *t;
         if let Some(c) = decoder.feed(byte) {
             let mut out = Vec::new();
+            let before = line.completed();
             line.input(c, &mut out);
+            if line.completed() != before {
+                // n_tty wakes its readers with EPOLLIN | EPOLLRDNORM at
+                // each finished line (ADR 0026).
+                crate::epoll::console_line();
+            }
             let room = ECHO_MAX.saturating_sub(echo.len());
             echo.extend_from_slice(&out[..out.len().min(room)]);
         }

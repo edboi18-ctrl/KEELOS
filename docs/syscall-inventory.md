@@ -46,8 +46,8 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 36 | `bind` | 2 | 0 | 2 | missing |  |
 | 37 | `chmod` | 1 | 0 | 1 | complete | `exec.filesystem` |
 | 38 | `listen` | 1 | 0 | 1 | missing |  |
-| 39 | `epoll_create1` | 1 | 0 | 1 | missing |  |
-| 40 | `epoll_ctl` | 155 | 0 | 149 | missing |  |
+| 39 | `epoll_create1` | 1 | 0 | 1 | complete | `exec.epoll` |
+| 40 | `epoll_ctl` | 155 | 0 | 149 | partial (no nesting) | `exec.epoll` |
 | 41 | `dup2` | 22 | 0 | 22 | complete | `exec.descriptors` |
 | 42 | `write` | 28591 | 0 | 28754 | partial | `syscalls.conformance` |
 | 43 | `exit_group` | 27 | 0 |  | partial | `syscalls.conformance` |
@@ -61,7 +61,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 51 | `ftruncate` | 24 | 0 | 24 | complete | `exec.shared_mappings` |
 | 52 | `getpid` | 47 | 0 | 44 | complete | `compartment.pid_space` |
 | 53 | `setpriority` | 2 | 1 | 2 | missing |  |
-| 54 | `epoll_pwait` | 21615 | 0 | 21623 | missing |  |
+| 54 | `epoll_pwait` | 21615 | 0 | 21623 | complete | `exec.epoll` |
 | 55 | `accept` | 1 | 0 | 1 | missing |  |
 | 56 | `sendmsg` | 829 | 0 | 820 | missing |  |
 | 57 | `recvmsg` | 833 | 4 | 822 | missing |  |

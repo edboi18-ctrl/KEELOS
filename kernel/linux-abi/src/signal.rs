@@ -643,10 +643,8 @@ pub fn pending_unblocked(p: &Arc<IrqMutex<Process>>) -> bool {
 }
 
 /// `set_user_sigmask`: with a mask (8 bytes at `mask`; `size` must be
-/// 8, else EINVAL; unreadable EFAULT), blocks it until the call returns
-/// to user mode: a handler's frame then saves the replaced mask (and
-/// sigreturn restores it), and otherwise `on_return` restores it. Without
-/// one (address 0), nothing changes.
+/// 8, else EINVAL; unreadable EFAULT), blocks it for the call; see
+/// [`end_temporary_mask`]. Without one (address 0), nothing changes.
 pub fn temporary_mask(p: &Arc<IrqMutex<Process>>, mask: u64, size: u64) -> Result<(), Errno> {
     if mask == 0 {
         return Ok(());
@@ -658,4 +656,15 @@ pub fn temporary_mask(p: &Arc<IrqMutex<Process>>, mask: u64, size: u64) -> Resul
     copy_from_user(&mut b, mask).map_err(|_| Errno::EFAULT)?;
     let mask = u64::from_le_bytes(b);
     process::with_current_thread(p, |t| t.signals.set_temporary(mask)).ok_or(Errno::ESRCH)
+}
+
+/// `restore_saved_sigmask_unless(interrupted)`: a call that was not
+/// interrupted puts the replaced mask back at once, before any signal is
+/// delivered, so a signal only the call's mask let in stays pending. An
+/// interrupted one leaves it for the way out: a handler's frame saves it
+/// (sigreturn restores it), or `on_return` restores it.
+pub fn end_temporary_mask(p: &Arc<IrqMutex<Process>>, interrupted: bool) {
+    if !interrupted {
+        process::with_current_thread(p, |t| t.signals.restore_saved());
+    }
 }

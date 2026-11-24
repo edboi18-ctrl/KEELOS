@@ -34,6 +34,9 @@ enum Item {
 pub struct LineDiscipline {
     line: Vec<u8>,
     ready: VecDeque<Item>,
+    /// Lines (and ends of file) made ready so far: n_tty wakes its readers
+    /// at each (`n_tty_receive_handle_newline`), which epoll counts.
+    completed: u64,
 }
 
 impl LineDiscipline {
@@ -41,6 +44,7 @@ impl LineDiscipline {
         LineDiscipline {
             line: Vec::new(),
             ready: VecDeque::new(),
+            completed: 0,
         }
     }
 
@@ -84,7 +88,13 @@ impl LineDiscipline {
     fn push_ready(&mut self, item: Item) {
         if self.ready.len() < READY_MAX {
             self.ready.push_back(item);
+            self.completed += 1;
         }
+    }
+
+    /// How many lines (and ends of file) have been made ready.
+    pub fn completed(&self) -> u64 {
+        self.completed
     }
 
     fn finish(&mut self, terminator: Option<u8>) {
@@ -100,6 +110,7 @@ impl LineDiscipline {
             Some(t) => Item::Byte(t),
             None => Item::Break,
         });
+        self.completed += 1;
     }
 
     /// Whether a read would return without waiting.

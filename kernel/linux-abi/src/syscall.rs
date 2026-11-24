@@ -121,6 +121,36 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
         t[23] = Some(|p, a| r::select(p, a[0] as u32 as i32, [a[1], a[2], a[3]], a[4]));
         t[270] = Some(|p, a| r::pselect6(p, a[0] as u32 as i32, [a[1], a[2], a[3]], a[4], a[5]));
         t[271] = Some(|p, a| r::ppoll(p, a[0], a[1] as u32, a[2], a[3], a[4]));
+        // P3-T10 part 2: epoll (ADR 0026).
+        use crate::epoll as e;
+        t[213] = Some(|p, a| e::epoll_create(p, a[0] as u32 as i32));
+        t[291] = Some(|p, a| e::epoll_create1(p, a[0] as u32 as u64));
+        t[233] = Some(|p, a| {
+            e::epoll_ctl(
+                p,
+                a[0] as u32 as i32,
+                a[1] as u32 as i32,
+                a[2] as u32 as i32,
+                a[3],
+            )
+        });
+        t[232] = Some(|p, a| {
+            e::epoll_wait(
+                p,
+                a[0] as u32 as i32,
+                a[1],
+                a[2] as u32 as i32,
+                a[3] as u32 as i32,
+            )
+        });
+        t[281] = Some(|p, a| {
+            let (epfd, max, ms) = (a[0] as u32 as i32, a[2] as u32 as i32, a[3] as u32 as i32);
+            e::epoll_pwait(p, epfd, a[1], max, ms, a[4], a[5])
+        });
+        t[441] = Some(|p, a| {
+            let (epfd, max) = (a[0] as u32 as i32, a[2] as u32 as i32);
+            e::epoll_pwait2(p, epfd, a[1], max, a[3], a[4], a[5])
+        });
     }
     t[nr::OPENAT as usize] = Some(|p, a| openat(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     // open(2) is openat(AT_FDCWD, ...), as Linux's sys_open (`fs/open.c`),
