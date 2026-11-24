@@ -225,7 +225,8 @@ sockets. Neither is P3-T11's.
     - the flag and family errors;
     - stat, fstatfs, ESPIPE, ENOTSOCK, EBADF;
     - SO_TYPE, SO_DOMAIN, SO_PROTOCOL, SO_ACCEPTCONN, SO_ERROR, the
-      default and doubled buffers, the ENOPROTOOPT/EOPNOTSUPP/EINVAL
+      buffers (present: their defaults are the host's sysctls) and SO_SNDBUF
+      doubled, the ENOPROTOOPT/EOPNOTSUPP/EINVAL
       rules, a short getsockopt buffer, SO_RCVTIMEO and EDOM,
       SO_PEERCRED with no peer.
   - **Unconnected:** poll, read EINVAL, write ENOTCONN, getpeername,

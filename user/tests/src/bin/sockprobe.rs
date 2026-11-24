@@ -199,8 +199,8 @@ fn creation() -> i32 {
     }
     sys::close(fds[0]);
     sys::close(fds[1]);
-    // 4. Options: type, domain, protocol; not listening; the default
-    //    buffers; SO_SNDBUF doubled; read-only options ENOPROTOOPT; another
+    // 4. Options: type, domain, protocol; not listening; buffers;
+    //    SO_SNDBUF doubled; read-only options ENOPROTOOPT; another
     //    level EOPNOTSUPP; a short value EINVAL; a negative length EINVAL;
     //    a flag kept; unknown ENOPROTOOPT.
     if get_int(s, SO_TYPE) != Some(1)
@@ -211,7 +211,10 @@ fn creation() -> i32 {
     {
         return 7;
     }
-    if get_int(s, SO_SNDBUF) != Some(212_992) || get_int(s, SO_RCVBUF) != Some(212_992) {
+    // The defaults are the host's net.core.wmem_default and rmem_default
+    // (212992 unless configured; Keel's are that): only present here.
+    if get_int(s, SO_SNDBUF).is_none_or(|v| v <= 0) || get_int(s, SO_RCVBUF).is_none_or(|v| v <= 0)
+    {
         return 8;
     }
     if set_int(s, SO_SNDBUF, 65536) != 0 || get_int(s, SO_SNDBUF) != Some(131_072) {
@@ -503,6 +506,8 @@ fn cstr<'a>(path: &[u8], buf: &'a mut [u8; 80]) -> &'a CStr {
 }
 
 fn named() -> i32 {
+    // The node's mode depends on the umask: set it rather than inherit it.
+    sys::umask(0o022);
     let mut pb = [0u8; 64];
     let path = tmp_path(&mut pb, b"-l");
     let mut addr = [0u8; 110];
