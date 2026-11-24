@@ -108,7 +108,20 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::WRITEV as usize] = Some(|p, a| writev(p, a[0] as u32 as i32, a[1], a[2]));
     t[nr::CLOSE as usize] = Some(|p, a| close(p, a[0] as u32 as i32));
     t[nr::FSTAT as usize] = Some(|p, a| fstat(p, a[0] as u32 as i32, a[1]));
-    t[nr::POLL as usize] = Some(|p, a| poll(p, a[0], a[1] as u32, a[2] as u32 as i32));
+    t[nr::POLL as usize] =
+        Some(|p, a| crate::ready::poll(p, a[0], a[1] as u32, a[2] as u32 as i32));
+    {
+        // P3-T10: pipes, eventfds, memfd and the other waits (ADR 0025).
+        use crate::ready as r;
+        t[22] = Some(|p, a| r::pipe2(p, a[0], 0));
+        t[293] = Some(|p, a| r::pipe2(p, a[0], a[1] as u32 as u64));
+        t[284] = Some(|p, a| r::eventfd2(p, a[0] as u32, 0));
+        t[290] = Some(|p, a| r::eventfd2(p, a[0] as u32, a[1] as u32 as u64));
+        t[319] = Some(|p, a| r::memfd_create(p, a[0], a[1] as u32 as u64));
+        t[23] = Some(|p, a| r::select(p, a[0] as u32 as i32, [a[1], a[2], a[3]], a[4]));
+        t[270] = Some(|p, a| r::pselect6(p, a[0] as u32 as i32, [a[1], a[2], a[3]], a[4], a[5]));
+        t[271] = Some(|p, a| r::ppoll(p, a[0], a[1] as u32, a[2], a[3], a[4]));
+    }
     t[nr::OPENAT as usize] = Some(|p, a| openat(p, a[0] as u32 as i32, a[1], a[2], a[3]));
     // open(2) is openat(AT_FDCWD, ...), as Linux's sys_open (`fs/open.c`),
     // which also sets O_LARGEFILE on 64-bit (no effect here).
@@ -491,13 +504,39 @@ pub fn rights_refusals() -> u64 {
 
 /// The open file behind `fd`, if the handle has `required`. Every system
 /// call that acts on a descriptor's object comes through here.
+/// A pipe or eventfd is EINVAL here (as Linux's calls that need an inode
+/// operation pipefs lacks); callers that answer otherwise use [`file_or`].
 pub(crate) fn file(
     p: &Arc<IrqMutex<Process>>,
     fd: i32,
     required: Rights,
 ) -> Result<Arc<IrqMutex<OpenFile>>, Errno> {
+    file_or(p, fd, required, Errno::EINVAL)
+}
+
+/// As [`file`], with `not_file` for a descriptor that holds no file (a
+/// pipe or eventfd): ENOTDIR where a directory is wanted, ESPIPE for a
+/// seek, ENODEV for a mapping.
+pub(crate) fn file_or(
+    p: &Arc<IrqMutex<Process>>,
+    fd: i32,
+    required: Rights,
+    not_file: Errno,
+) -> Result<Arc<IrqMutex<OpenFile>>, Errno> {
+    match object(p, fd, required)? {
+        Object::File(file) => Ok(file),
+        _ => Err(not_file),
+    }
+}
+
+/// The object behind `fd`, if the handle has `required`.
+pub(crate) fn object(
+    p: &Arc<IrqMutex<Process>>,
+    fd: i32,
+    required: Rights,
+) -> Result<Object, Errno> {
     match p.lock().handles.check(fd, required) {
-        Ok(Object::File(file)) => Ok(file.clone()),
+        Ok(object) => Ok(object.clone()),
         Err(Refusal::MissingRights { .. }) => {
             RIGHTS_REFUSALS.fetch_add(1, Ordering::Relaxed);
             Err(Errno::EBADF)
@@ -786,7 +825,13 @@ fn read_at(
     count: u64,
     at: Option<u64>,
 ) -> SysResult {
-    let file = file(p, fd, Rights::READ)?;
+    let file = match object(p, fd, Rights::READ)? {
+        Object::File(file) => file,
+        // Pipes and eventfds have no position (`stream_open`, and no
+        // FMODE_PREAD for an anonymous inode): pread ESPIPE.
+        _ if at.is_some() => return Err(Errno::ESPIPE),
+        other => return crate::ready::read(&other, &[(buf, count)]).unwrap_or(Err(Errno::EINVAL)),
+    };
     if at.is_some() && file.lock().kind == Kind::Device(Device::Console) {
         return Err(Errno::ESPIPE);
     }
@@ -951,12 +996,17 @@ pub(crate) fn write_at(
 }
 
 fn write(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult {
-    let file = file(p, fd, Rights::WRITE)?;
+    let file = match object(p, fd, Rights::WRITE)? {
+        Object::File(file) => file,
+        other => {
+            return crate::ready::write(p, &other, &[(buf, count)]).unwrap_or(Err(Errno::EINVAL));
+        }
+    };
     write_to(&file, buf, count, quota_of(p).as_ref())
 }
 
 fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResult {
-    let file = file(p, fd, Rights::WRITE)?;
+    let target = object(p, fd, Rights::WRITE)?;
     let quota = quota_of(p);
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);
@@ -983,6 +1033,11 @@ fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResul
             .filter(|&t| t <= i64::MAX as u64)
             .ok_or(Errno::EINVAL)?;
     }
+    let file = match target {
+        Object::File(file) => file,
+        // A pipe takes the vectors as one write (atomic up to PIPE_BUF).
+        other => return crate::ready::write(p, &other, &vectors).unwrap_or(Err(Errno::EINVAL)),
+    };
     let mut done = 0u64;
     for (base, len) in vectors {
         let len = len.min(MAX_RW_COUNT - done);
@@ -1013,7 +1068,14 @@ fn close(p: &Arc<IrqMutex<Process>>, fd: i32) -> SysResult {
 }
 
 fn fstat(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64) -> SysResult {
-    let node = file(p, fd, Rights::STAT)?.lock().node;
+    let node = match object(p, fd, Rights::STAT)? {
+        Object::File(file) => file.lock().node,
+        other => {
+            let b = crate::ready::stat_bytes(&other).ok_or(Errno::EINVAL)?;
+            copy_to_user(buf, &b).map_err(fault)?;
+            return Ok(0);
+        }
+    };
     let stat = fs::with(|fs| fs.stat(node))?;
     copy_to_user(buf, &stat_bytes(&stat)).map_err(fault)?;
     Ok(0)
@@ -1047,6 +1109,8 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         } else {
             Rights::ENUMERATE
         };
+        // A pipe or eventfd is not a directory, whatever its rights.
+        file_or(p, dirfd, Rights::NONE, Errno::ENOTDIR)?;
         let dir = file(p, dirfd, needs)?;
         let dir = dir.lock();
         if dir.kind != Kind::Directory {
@@ -1217,7 +1281,8 @@ fn mmap(
     // that was mounted no-exec").
     let mut backing = None;
     if flags & MAP_ANONYMOUS == 0 {
-        let open = file(p, fd, Rights::NONE)?;
+        // A pipe or eventfd has no mmap operation: do_mmap ENODEV.
+        let open = file_or(p, fd, Rights::NONE, Errno::ENODEV)?;
         let (may_read, may_exec, may_write) = {
             let process = p.lock();
             (
@@ -1384,7 +1449,24 @@ fn brk(p: &Arc<IrqMutex<Process>>, requested: u64) -> u64 {
 }
 
 fn ioctl(p: &Arc<IrqMutex<Process>>, fd: i32, request: u32, argument: u64) -> SysResult {
-    let file = file(p, fd, Rights::STAT)?;
+    /// FIONREAD (`include/uapi/asm-generic/ioctls.h`): an int, the bytes
+    /// waiting in a pipe (`pipe_ioctl`).
+    const FIONREAD: u32 = 0x541B;
+    let file = match object(p, fd, Rights::STAT)? {
+        Object::File(file) => file,
+        other => {
+            let waiting = crate::ready::bytes_waiting(&other);
+            return match (request, waiting) {
+                (FIONREAD, Some(n)) => {
+                    let n = i32::try_from(n).unwrap_or(i32::MAX);
+                    copy_to_user(argument, &n.to_le_bytes()).map_err(fault)?;
+                    Ok(0)
+                }
+                // pipe_ioctl's default and eventfd's absent ioctl.
+                _ => Err(Errno::ENOTTY),
+            };
+        }
+    };
     if file.lock().kind != Kind::Device(Device::Console) {
         return Err(Errno::ENOTTY);
     }
@@ -1512,102 +1594,6 @@ fn getrandom(buf: u64, count: u64, flags: u64) -> SysResult {
         done += n;
     }
     Ok(done as u64)
-}
-
-/// Longest wait between readiness checks in a blocking poll. Phase 1 has
-/// no readiness notification (P3-T10 adds one), so a poll that must wait
-/// re-checks its files at this interval until one is ready or the timeout
-/// passes.
-const POLL_INTERVAL_MS: u64 = 10;
-
-/// What `file` is ready for, as `vfs_poll` would report it, limited to
-/// what the handle's rights allow (SR-1): readable only through a handle
-/// with READ, writable only through one with WRITE. Linux reports both
-/// whatever the access mode; Keel does not reveal readiness for an
-/// operation the handle cannot perform (docs/syscalls.md).
-fn poll_ready(file: &Arc<IrqMutex<OpenFile>>, rights: Rights) -> u16 {
-    use keel_core::poll::*;
-    // Copy the kind out: the file lock is not held while the terminal's
-    // is taken.
-    let kind = file.lock().kind;
-    let ready = match kind {
-        // n_tty_poll: writable while output has room (console output never
-        // waits); readable once a line or end of file is ready.
-        Kind::Device(Device::Console) => {
-            let input = if crate::tty::readable() {
-                POLLIN | POLLRDNORM
-            } else {
-                0
-            };
-            input | POLLOUT | POLLWRNORM
-        }
-        // Regular files, directories, /dev/null, /dev/zero and
-        // /dev/urandom have no poll method: DEFAULT_POLLMASK.
-        _ => DEFAULT_POLLMASK,
-    };
-    let mut allowed = POLLERR | POLLHUP;
-    if rights.contains(Rights::READ) {
-        allowed |= POLLIN | POLLRDNORM | POLLPRI;
-    }
-    if rights.contains(Rights::WRITE) {
-        allowed |= POLLOUT | POLLWRNORM;
-    }
-    ready & allowed
-}
-
-/// poll(2) (`fs/select.c`, `do_sys_poll`): EINVAL above the handle limit
-/// (Linux: RLIMIT_NOFILE); EFAULT if the array cannot be read, or its
-/// `revents` written back; otherwise the number of entries with events.
-/// A negative timeout waits without limit.
-fn poll(p: &Arc<IrqMutex<Process>>, fds: u64, nfds: u32, timeout_ms: i32) -> SysResult {
-    use keel_core::poll::{POLLFD_SIZE, PollFd, REVENTS_OFFSET, revents};
-    if nfds as usize > process::HANDLE_LIMIT {
-        return Err(Errno::EINVAL);
-    }
-    let mut raw = vec![0u8; nfds as usize * POLLFD_SIZE];
-    copy_from_user(&mut raw, fds).map_err(fault)?;
-    let entries: Vec<PollFd> = raw
-        .as_chunks::<POLLFD_SIZE>()
-        .0
-        .iter()
-        .map(PollFd::from_bytes)
-        .collect();
-    let deadline = u64::try_from(timeout_ms)
-        .ok()
-        .map(|ms| time::monotonic_nanos().saturating_add(ms.saturating_mul(1_000_000)));
-    let mut results = vec![0u16; entries.len()];
-    loop {
-        let mut count = 0u64;
-        for (entry, result) in entries.iter().zip(results.iter_mut()) {
-            // A negative fd is skipped without a lookup; any other number
-            // either names an open handle or gets POLLNVAL.
-            let handle = (entry.fd >= 0)
-                .then(|| {
-                    let process = p.lock();
-                    let object = process.handles.get(entry.fd, Rights::NONE).ok()?.clone();
-                    Some((object, process.handles.rights(entry.fd).ok()?))
-                })
-                .flatten();
-            let ready = handle.map(|(Object::File(file), rights)| poll_ready(&file, rights));
-            *result = revents(entry.fd, entry.events, ready);
-            if *result != 0 {
-                count += 1;
-            }
-        }
-        let now = time::monotonic_nanos();
-        let expired = deadline.is_some_and(|d| now >= d);
-        if count > 0 || expired {
-            for (i, result) in results.iter().enumerate() {
-                let at = fds + (i * POLLFD_SIZE + REVENTS_OFFSET) as u64;
-                copy_to_user(at, &result.to_le_bytes()).map_err(fault)?;
-            }
-            return Ok(count);
-        }
-        let wait_ms = deadline.map_or(POLL_INTERVAL_MS, |d| {
-            (d - now).div_ceil(1_000_000).clamp(1, POLL_INTERVAL_MS)
-        });
-        sched::sleep_ms(wait_ms);
-    }
 }
 
 /// rt_sigaction(2): records the action (no delivery until P3-T6). The

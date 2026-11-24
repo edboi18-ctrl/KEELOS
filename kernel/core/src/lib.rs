@@ -20,6 +20,7 @@ pub mod handle;
 pub mod keyboard;
 pub mod lock;
 pub mod paging;
+pub mod pipe;
 pub mod poll;
 pub mod procfs;
 pub mod rng;

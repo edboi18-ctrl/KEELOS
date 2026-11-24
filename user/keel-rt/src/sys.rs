@@ -1124,3 +1124,83 @@ pub fn unassigned_syscall(number: u64) -> i64 {
     }
     call3(number, 0, 0, 0)
 }
+
+/// pipe2(2) (pipe(2) when `flags` is None): the read end, then the write
+/// end, in `fds`.
+pub fn pipe2(fds: &mut [i32; 2], flags: Option<u64>) -> i64 {
+    let at = fds.as_mut_ptr() as u64;
+    match flags {
+        None => call3(22, at, 0, 0),
+        Some(f) => call3(293, at, f, 0),
+    }
+}
+
+/// pipe2(2) writing its descriptors to an address the kernel may refuse.
+pub fn pipe2_into(target: Hostile) -> i64 {
+    call3(293, target.0, 0, 0)
+}
+
+/// eventfd2(2) (eventfd(2) when `flags` is None).
+pub fn eventfd2(initval: u32, flags: Option<u64>) -> i64 {
+    match flags {
+        None => call3(284, u64::from(initval), 0, 0),
+        Some(f) => call3(290, u64::from(initval), f, 0),
+    }
+}
+
+/// memfd_create(2).
+pub fn memfd_create(name: &CStr, flags: u64) -> i64 {
+    call3(319, name.as_ptr() as u64, flags, 0)
+}
+
+/// ppoll(2): `ts` a raw `struct timespec` (written back), `mask` a signal
+/// set of `size` bytes (the kernel reads 8).
+pub fn ppoll(fds: &mut [[u8; 8]], ts: Option<&mut [u8; 16]>, mask: Option<&u64>, size: u64) -> i64 {
+    let ts = ts.map_or(0, |t| t.as_mut_ptr() as u64);
+    let mask = mask.map_or(0, |m| m as *const u64 as u64);
+    call6(
+        271,
+        [fds.as_mut_ptr() as u64, fds.len() as u64, ts, mask, size, 0],
+    )
+}
+
+/// The three descriptor sets of select(2) and pselect6(2), 128 bytes each
+/// (FD_SETSIZE 1024 bits); None is a NULL set.
+pub struct FdSets<'a> {
+    pub read: Option<&'a mut [u8; 128]>,
+    pub write: Option<&'a mut [u8; 128]>,
+    pub except: Option<&'a mut [u8; 128]>,
+}
+
+impl FdSets<'_> {
+    fn addresses(&mut self) -> [u64; 3] {
+        let at = |s: &mut Option<&mut [u8; 128]>| s.as_mut().map_or(0, |b| b.as_mut_ptr() as u64);
+        [
+            at(&mut self.read),
+            at(&mut self.write),
+            at(&mut self.except),
+        ]
+    }
+}
+
+/// select(2): `tv` a raw `struct timeval` (written back).
+pub fn select(n: i32, mut sets: FdSets<'_>, tv: Option<&mut [u8; 16]>) -> i64 {
+    let [r, w, e] = sets.addresses();
+    let tv = tv.map_or(0, |t| t.as_mut_ptr() as u64);
+    call6(23, [n as u64, r, w, e, tv, 0])
+}
+
+/// pselect6(2): `ts` a raw `struct timespec` (written back); the mask and
+/// its size go in the argument pack the sixth argument points to.
+pub fn pselect6(
+    n: i32,
+    mut sets: FdSets<'_>,
+    ts: Option<&mut [u8; 16]>,
+    mask: Option<&u64>,
+    size: u64,
+) -> i64 {
+    let [r, w, e] = sets.addresses();
+    let ts = ts.map_or(0, |t| t.as_mut_ptr() as u64);
+    let pack = [mask.map_or(0, |m| m as *const u64 as u64), size];
+    call6(270, [n as u64, r, w, e, ts, pack.as_ptr() as u64])
+}

@@ -27,8 +27,9 @@ use keel_hal::vm::{copy_from_user, copy_to_user};
 
 use crate::abi::{AT_FDCWD, stat_bytes};
 use crate::fs;
+use crate::process::Object;
 use crate::process::Process;
-use crate::syscall::{fault, file, quota_of, user_path};
+use crate::syscall::{fault, file, file_or, object, quota_of, user_path};
 
 type SysResult = Result<u64, Errno>;
 type ProcessRef = Arc<IrqMutex<Process>>;
@@ -64,7 +65,7 @@ const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
 /// `iterate_dir` and `fchdir` do), and only then must it have ENUMERATE
 /// (EBADF without, as every missing right).
 fn directory(p: &ProcessRef, fd: i32) -> Result<Arc<IrqMutex<crate::process::OpenFile>>, Errno> {
-    if file(p, fd, Rights::NONE)?.lock().kind != Kind::Directory {
+    if file_or(p, fd, Rights::NONE, Errno::ENOTDIR)?.lock().kind != Kind::Directory {
         return Err(Errno::ENOTDIR);
     }
     file(p, fd, Rights::ENUMERATE)
@@ -85,6 +86,8 @@ fn start(p: &ProcessRef, dirfd: i32, path: &[u8], modify: bool) -> Result<(Ino, 
     } else {
         Rights::ENUMERATE
     };
+    // A pipe or eventfd is not a directory, whatever its rights.
+    file_or(p, dirfd, Rights::NONE, Errno::ENOTDIR)?;
     let dir = file(p, dirfd, needs)?;
     let dir = dir.lock();
     if dir.kind != Kind::Directory {
@@ -157,6 +160,13 @@ pub fn newfstatat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, flags: u32) -
             crate::procfs::Hit::Real(ino) => put_stat(ino, buf),
         };
     }
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        let target = object(p, dirfd, Rights::STAT)?;
+        if let Some(b) = crate::ready::stat_bytes(&target) {
+            copy_to_user(buf, &b).map_err(fault)?;
+            return Ok(0);
+        }
+    }
     let node = node_at(p, dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)?;
     put_stat(node, buf)
 }
@@ -173,10 +183,18 @@ pub fn newfstatat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, flags: u32) -
 ///   reports unwritten pages as holes; Keel keeps no holes), so SEEK_DATA
 ///   returns the offset and SEEK_HOLE the size;
 /// - a directory: SEEK_SET and SEEK_CUR set the entry index getdents64
-///   resumes from; SEEK_END and the others are EINVAL.
+///   resumes from; SEEK_END and the others are EINVAL;
+/// - a pipe ESPIPE; an eventfd 0, whatever is asked (ADR 0025).
 pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
     if whence > SEEK_HOLE {
         return Err(Errno::EINVAL);
+    }
+    match object(p, fd, Rights::NONE)? {
+        // `stream_open` takes FMODE_LSEEK away: vfs_llseek ESPIPE.
+        Object::Pipe(_) => return Err(Errno::ESPIPE),
+        // eventfd's `noop_llseek`: the position, always 0.
+        Object::EventFd(_) => return Ok(0),
+        Object::File(_) => {}
     }
     let open = file(p, fd, Rights::SEEK)?;
     let mut f = open.lock();
@@ -691,10 +709,11 @@ pub fn release_locks(owner: u64, file: Option<Ino>) {
 /// process's locks on that file go (`filp_flush` -> `locks_remove_posix`,
 /// whatever other descriptors of it stay open).
 pub fn closed(p: &ProcessRef, handle: keel_core::handle::Handle<crate::process::Object>) {
-    let crate::process::Object::File(file) = &handle.object;
-    let node = file.lock().node;
-    let owner = p.lock().lock_owner;
-    release_locks(owner, Some(node));
+    if let Object::File(file) = &handle.object {
+        let node = file.lock().node;
+        let owner = p.lock().lock_owner;
+        release_locks(owner, Some(node));
+    }
     drop(handle);
 }
 
@@ -766,8 +785,21 @@ pub fn fcntl_more(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
                 .duplicate_from(fd, from, cmd == F_DUPFD_CLOEXEC)
                 .map(|n| n as u64)
         }
-        F_GETFL => Ok(file(p, fd, Rights::NONE)?.lock().status),
+        F_GETFL => match object(p, fd, Rights::NONE)? {
+            Object::File(open) => Ok(open.lock().status),
+            other => Ok(crate::ready::status(&other).map_or(0, |s| *s.lock())),
+        },
         F_SETFL => {
+            let target = object(p, fd, Rights::NONE)?;
+            if let Some(status) = crate::ready::status(&target) {
+                let mut f = status.lock();
+                let arg = arg as u32 as u64;
+                *f = (arg & SETFL_MASK) | (*f & !SETFL_MASK);
+                drop(f);
+                // Waiters on it re-read O_NONBLOCK only when they wake.
+                crate::ready::changed();
+                return Ok(0);
+            }
             let open = file(p, fd, Rights::NONE)?;
             let mut f = open.lock();
             let arg = arg as u32 as u64;
@@ -971,8 +1003,18 @@ pub fn readv(
     at: Option<i64>,
     flags: u32,
 ) -> SysResult {
-    let open = file(p, fd, Rights::READ)?;
+    let target = object(p, fd, Rights::READ)?;
     rw_flags(flags)?;
+    if !matches!(target, Object::File(_)) {
+        // A pipe or eventfd reads the vectors as one read; it has no
+        // position (ESPIPE for preadv, whatever the offset).
+        if at.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        let vectors = iovecs(iov, count)?;
+        return crate::ready::read(&target, &vectors).unwrap_or(Err(Errno::EINVAL));
+    }
+    let open = file(p, fd, Rights::READ)?;
     let at = match at {
         Some(a) if a < 0 => return Err(Errno::EINVAL),
         Some(a) => Some(a as u64),
@@ -1010,8 +1052,15 @@ pub fn pwritev(
     at: Option<i64>,
     flags: u32,
 ) -> SysResult {
-    let open = file(p, fd, Rights::WRITE)?;
+    let target = object(p, fd, Rights::WRITE)?;
     let append = rw_flags(flags)?;
+    if !matches!(target, Object::File(_)) {
+        if at.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        return crate::ready::write(p, &target, iov).unwrap_or(Err(Errno::EINVAL));
+    }
+    let open = file(p, fd, Rights::WRITE)?;
     let at = match at {
         Some(a) if a < 0 => return Err(Errno::EINVAL),
         Some(a) => Some(a as u64),
@@ -1053,7 +1102,7 @@ pub fn pwritev_user(
     at: Option<i64>,
     flags: u32,
 ) -> SysResult {
-    file(p, fd, Rights::WRITE)?;
+    object(p, fd, Rights::WRITE)?;
     let vectors = iovecs(iov, count)?;
     pwritev(p, fd, &vectors, at, flags)
 }
@@ -1125,8 +1174,20 @@ pub fn statfs(p: &ProcessRef, path: u64, buf: u64) -> SysResult {
 
 /// fstatfs(2): of the filesystem holding the descriptor's file.
 pub fn fstatfs(p: &ProcessRef, fd: i32, buf: u64) -> SysResult {
-    file(p, fd, Rights::NONE)?;
-    let b = statfs_bytes(p)?;
+    let target = object(p, fd, Rights::NONE)?;
+    let mut b = statfs_bytes(p)?;
+    if let Some(magic) = crate::ready::statfs_magic(&target) {
+        // pipefs and the anon-inode filesystem are pseudo filesystems:
+        // `simple_statfs` reports only their magic, PAGE_SIZE blocks and
+        // NAME_MAX; `statfs_by_dentry` makes f_frsize f_bsize, and
+        // `calculate_f_flags` adds ST_VALID.
+        b = [0; 120];
+        b[0..8].copy_from_slice(&magic.to_le_bytes());
+        b[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        b[64..72].copy_from_slice(&(vfs::NAME_MAX as u64).to_le_bytes());
+        b[72..80].copy_from_slice(&4096u64.to_le_bytes());
+        b[80..88].copy_from_slice(&0x20u64.to_le_bytes());
+    }
     copy_to_user(buf, &b).map_err(fault)?;
     Ok(0)
 }

@@ -993,6 +993,18 @@ pub fn user_range_ok(address: u64, length: usize) -> bool {
         .is_some_and(|end| address >= vm::USER_START && end <= vm::USER_END)
 }
 
+/// A copy of no bytes touches nothing: it succeeds for any address in the
+/// user half, mapped or not, as Linux's `access_ok(ptr, 0)` checks only
+/// `valid_user_address(ptr)` (`arch/x86/include/asm/uaccess_64.h`). So
+/// poll(2) of no entries at a dangling pointer is not EFAULT.
+fn empty_copy(address: u64) -> Result<(), Fault> {
+    if address < vm::USER_END {
+        Ok(())
+    } else {
+        Err(Fault)
+    }
+}
+
 fn copy(dst: *mut u8, src: *const u8, len: usize) -> Result<(), Fault> {
     if len == 0 {
         return Ok(());
@@ -1013,6 +1025,9 @@ fn copy(dst: *mut u8, src: *const u8, len: usize) -> Result<(), Fault> {
 
 /// Copies `data` to user address `dst` in the active address space.
 pub fn copy_to_user(dst: u64, data: &[u8]) -> Result<(), Fault> {
+    if data.is_empty() {
+        return empty_copy(dst);
+    }
     if !user_range_ok(dst, data.len()) {
         return Err(Fault);
     }
@@ -1021,6 +1036,9 @@ pub fn copy_to_user(dst: u64, data: &[u8]) -> Result<(), Fault> {
 
 /// Copies from user address `src` in the active address space into `buf`.
 pub fn copy_from_user(buf: &mut [u8], src: u64) -> Result<(), Fault> {
+    if buf.is_empty() {
+        return empty_copy(src);
+    }
     if !user_range_ok(src, buf.len()) {
         return Err(Fault);
     }

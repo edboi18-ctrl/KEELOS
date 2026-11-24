@@ -28,6 +28,8 @@ pub mod process;
 #[cfg(target_os = "none")]
 pub mod procfs;
 #[cfg(target_os = "none")]
+pub mod ready;
+#[cfg(target_os = "none")]
 pub mod signal;
 #[cfg(target_os = "none")]
 pub mod syscall;

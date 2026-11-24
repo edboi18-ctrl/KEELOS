@@ -33,12 +33,12 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 23 | `stat` | 2093 | 770 | 2104 | complete | `exec.filesystem` |
 | 24 | `mkdir` | 2 | 2 | 2 | complete | `exec.filesystem` |
 | 25 | `lstat` | 162 | 17 | 163 | complete | `exec.filesystem` |
-| 26 | `pipe2` | 166 | 0 | 157 | missing |  |
+| 26 | `pipe2` | 166 | 0 | 157 | partial (no O_DIRECT) | `exec.pipes` |
 | 27 | `clone` | 48 | 0 | 45 | partial (threads, fork-like) | `exec.threads`, `exec.thread_calls` |
 | 28 | `socketpair` | 11 | 0 | 11 | missing |  |
 | 29 | `shutdown` | 1 | 0 | 1 | missing |  |
-| 30 | `poll` | 1 | 0 | 1 | partial | `syscalls.conformance` |
-| 31 | `pipe` | 17 | 0 | 17 | missing |  |
+| 30 | `poll` | 1 | 0 | 1 | complete | `syscalls.conformance`, `exec.pipes` |
+| 31 | `pipe` | 17 | 0 | 17 | complete | `exec.pipes` |
 | 32 | `fork` | 25 | 0 | 25 | complete | `exec.fork_wait`, `compartment.fork_bomb` |
 | 33 | `setsid` | 10 | 0 | 10 | missing |  |
 | 34 | `unlink` | 9 | 1 | 9 | complete | `exec.filesystem` |
@@ -83,7 +83,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 73 | `readv` | 36 | 0 | 36 | complete | `exec.descriptors` |
 | 74 | `getrusage` | 138 | 0 | 90 | missing |  |
 | 75 | `sched_yield` | 69 | 0 | 45 | missing |  |
-| 76 | `select` | 69 | 0 | 43 | missing |  |
+| 76 | `select` | 69 | 0 | 43 | complete | `exec.pipes` |
 | 77 | `openat` | 666 | 0 | 666 | partial | `syscalls.conformance` |
 | 78 | `getrandom` | 13 | 0 | 13 | partial | `syscalls.conformance` |
 | 79 | `futex` | 528 | 29 | 585 | partial (wait, wake, requeue) | `exec.threads`, `exec.thread_calls` |

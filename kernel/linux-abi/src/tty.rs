@@ -52,6 +52,8 @@ fn on_keyboard_byte(byte: u8) {
     }
     INPUT.wake_all();
     ECHO.wake_all();
+    // poll, select and epoll on the console (ADR 0025).
+    crate::ready::changed();
 }
 
 fn echo_thread() {

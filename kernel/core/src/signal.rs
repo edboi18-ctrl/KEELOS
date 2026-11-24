@@ -230,6 +230,12 @@ impl SignalState {
 #[derive(Clone, Debug)]
 pub struct ThreadSignals {
     blocked: u64,
+    /// The mask ppoll, pselect6 (and later epoll_pwait) replaced for their
+    /// wait (`saved_sigmask` with TIF_RESTORE_SIGMASK, `set_user_sigmask`):
+    /// put back when the call returns, unless a signal interrupted it, in
+    /// which case a handler's frame saves it (and sigreturn restores it)
+    /// or, with no handler run, the way back to user mode restores it.
+    saved: Option<u64>,
     altstack: AltStack,
     pub pending: Pending,
 }
@@ -246,6 +252,7 @@ impl ThreadSignals {
     pub const fn new() -> Self {
         Self {
             blocked: 0,
+            saved: None,
             altstack: AltStack {
                 sp: 0,
                 flags: SS_DISABLE,
@@ -297,6 +304,33 @@ impl ThreadSignals {
 
     pub fn blocked(&self) -> u64 {
         self.blocked
+    }
+
+    /// `set_user_sigmask`: blocks `mask` for the length of a call, keeping
+    /// the mask it replaces (once: a nested call keeps the first).
+    pub fn set_temporary(&mut self, mask: u64) {
+        if self.saved.is_none() {
+            self.saved = Some(self.blocked);
+        }
+        self.set_blocked(mask);
+    }
+
+    /// `restore_saved_sigmask`: the mask from before `set_temporary`.
+    pub fn restore_saved(&mut self) {
+        if let Some(mask) = self.saved.take() {
+            self.blocked = mask;
+        }
+    }
+
+    /// `sigmask_to_save`: what a signal frame records as the mask to go
+    /// back to, the saved one if a call replaced it.
+    pub fn mask_to_save(&self) -> u64 {
+        self.saved.unwrap_or(self.blocked)
+    }
+
+    /// `clear_restore_sigmask`: a frame now holds the saved mask.
+    pub fn forget_saved(&mut self) {
+        self.saved = None;
     }
 
     /// `set_current_blocked`: SIGKILL and SIGSTOP are never blocked.

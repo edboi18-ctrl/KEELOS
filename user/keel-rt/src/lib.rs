@@ -319,6 +319,7 @@ pub unsafe fn syscall6(number: u64, a: [u64; 6]) -> i64 {
 }
 
 pub mod fuzz;
+pub mod signal;
 pub mod sys;
 
 #[panic_handler]

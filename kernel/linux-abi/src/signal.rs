@@ -321,8 +321,11 @@ struct Dequeued {
     signal: i32,
     info: SigInfo,
     action: SigAction,
-    /// The mask before delivery (saved in the frame).
+    /// The mask at delivery, which the handler's mask is added to.
     blocked: u64,
+    /// The mask the frame saves, for sigreturn to restore: `blocked`, or
+    /// the mask ppoll or pselect6 replaced (`sigmask_to_save`).
+    to_save: u64,
     signals: sig::ThreadSignals,
     trap: Trap,
 }
@@ -360,6 +363,7 @@ fn dequeue(p: &Arc<IrqMutex<Process>>) -> Option<Dequeued> {
         info,
         action,
         blocked,
+        to_save: t.signals.mask_to_save(),
         signals: t.signals.clone(),
         trap: t.trap,
     })
@@ -377,6 +381,12 @@ fn on_return(frame: &mut TrapFrame) {
     // SIGSEGV, and a second failure kills, so this ends.
     for _ in 0..2 * NSIG {
         let Some(d) = dequeue(&p) else {
+            // No handler ran (or the last one's frame holds it): put back
+            // a mask ppoll or pselect6 replaced (`restore_saved_sigmask`).
+            let me = sched::current().0;
+            if let Some(t) = p.lock().threads.get_mut(&me) {
+                t.signals.restore_saved();
+            }
             return;
         };
         match d.action.handler {
@@ -484,7 +494,7 @@ fn setup_frame(
         ss: regs.ss as u16,
         err: d.trap.err,
         trapno: d.trap.trapno,
-        oldmask: d.blocked,
+        oldmask: d.to_save,
         cr2: d.trap.cr2,
         fpstate: placement.fpstate,
     };
@@ -501,7 +511,7 @@ fn setup_frame(
         uc_flags,
         alt,
         &context,
-        d.blocked,
+        d.to_save,
         siginfo.then_some(d.info),
     );
     // Without SA_SIGINFO Linux leaves the info part as it was.
@@ -525,6 +535,7 @@ fn setup_frame(
             mask |= sig::sigmask(d.signal);
         }
         t.signals.set_blocked(mask);
+        t.signals.forget_saved();
         if t.signals.altstack().flags & SS_AUTODISARM != 0 {
             t.signals.disarm_altstack();
         }
@@ -617,4 +628,34 @@ fn restore(p: &Arc<IrqMutex<Process>>, regs: &TrapFrame) -> Result<u64, ()> {
     };
     sched::set_pending_frame(new);
     Ok(context.rax)
+}
+
+/// Whether the calling thread has a signal pending that it does not
+/// block (`signal_pending` after `recalc_sigpending`): a wait that has
+/// just unblocked one with a temporary mask ends at once.
+pub fn pending_unblocked(p: &Arc<IrqMutex<Process>>) -> bool {
+    let me = sched::current().0;
+    let process = p.lock();
+    process.threads.get(&me).is_some_and(|t| {
+        let blocked = t.signals.blocked();
+        (t.signals.pending.set() | process.pending.set()) & !blocked != 0
+    })
+}
+
+/// `set_user_sigmask`: with a mask (8 bytes at `mask`; `size` must be
+/// 8, else EINVAL; unreadable EFAULT), blocks it until the call returns
+/// to user mode: a handler's frame then saves the replaced mask (and
+/// sigreturn restores it), and otherwise `on_return` restores it. Without
+/// one (address 0), nothing changes.
+pub fn temporary_mask(p: &Arc<IrqMutex<Process>>, mask: u64, size: u64) -> Result<(), Errno> {
+    if mask == 0 {
+        return Ok(());
+    }
+    if size != sig::SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let mut b = [0u8; 8];
+    copy_from_user(&mut b, mask).map_err(|_| Errno::EFAULT)?;
+    let mask = u64::from_le_bytes(b);
+    process::with_current_thread(p, |t| t.signals.set_temporary(mask)).ok_or(Errno::ESRCH)
 }

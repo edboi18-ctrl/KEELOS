@@ -1040,6 +1040,53 @@ impl WaitQueue {
             if interrupts_were_enabled {
                 crate::interrupts::enable_after_switch();
             }
+            // Woken by `wake_all` (which took us off the queue) or by a
+            // signal or exit request (which did not): leave the queue
+            // either way, so no later wake reaches this thread elsewhere.
+            self.waiters.lock().retain(|&id| id != me);
+        }
+    }
+
+    /// As `wait_until`, but gives up at `deadline` (monotonic nanoseconds;
+    /// None waits without one): the timed waits of poll, select, epoll and
+    /// pipes (P3-T10, ADR 0025). The thread sleeps until woken or the
+    /// deadline, whichever comes first, and is taken off the queue if the
+    /// deadline wakes it, so a later `wake_all` cannot wake it from some
+    /// other sleep.
+    pub fn wait_until_deadline(
+        &self,
+        mut condition: impl FnMut() -> bool,
+        deadline: Option<u64>,
+    ) -> Waited {
+        let Some(deadline) = deadline else {
+            return if self.wait_until(condition) {
+                Waited::Ready
+            } else {
+                Waited::Interrupted
+            };
+        };
+        loop {
+            let mut waiters = self.waiters.lock();
+            if condition() {
+                return Waited::Ready;
+            }
+            if exit_requested().is_some() || interrupted() {
+                return Waited::Interrupted;
+            }
+            if time::monotonic_nanos() >= deadline {
+                return Waited::TimedOut;
+            }
+            let me = SCHED.lock().as_ref().map_or(0, |s| s.current);
+            waiters.push_back(me);
+            NEXT_WAKE_NS.fetch_min(deadline, Ordering::Relaxed);
+            let interrupts_were_enabled = waiters.release_keep_interrupts_disabled();
+            schedule(State::Sleeping { until_ns: deadline });
+            if interrupts_were_enabled {
+                crate::interrupts::enable_after_switch();
+            }
+            // Woken by the deadline (or a signal), not by `wake_all`: leave
+            // the queue.
+            self.waiters.lock().retain(|&id| id != me);
         }
     }
 
@@ -1053,7 +1100,7 @@ impl WaitQueue {
         if let Some(sched) = guard.as_mut() {
             for id in woken {
                 if let Some(t) = sched.threads.get_mut(&id)
-                    && t.state == State::Blocked
+                    && matches!(t.state, State::Blocked | State::Sleeping { .. })
                 {
                     t.state = State::Ready;
                     sched.ready.push_back(id);
@@ -1061,6 +1108,17 @@ impl WaitQueue {
             }
         }
     }
+}
+
+/// How a timed wait ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waited {
+    /// The condition held.
+    Ready,
+    /// The deadline passed first.
+    TimedOut,
+    /// A signal or an exit request cut it short.
+    Interrupted,
 }
 
 impl Default for WaitQueue {

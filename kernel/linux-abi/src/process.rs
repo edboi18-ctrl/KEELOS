@@ -69,6 +69,10 @@ impl Drop for OpenFile {
 #[derive(Clone)]
 pub enum Object {
     File(Arc<IrqMutex<OpenFile>>),
+    /// One end of a pipe (P3-T10, ADR 0025).
+    Pipe(Arc<crate::ready::PipeEnd>),
+    /// An eventfd (P3-T10, ADR 0025).
+    EventFd(Arc<crate::ready::EventFile>),
 }
 
 /// Rights given to an open regular file or device, by access mode. Reading
