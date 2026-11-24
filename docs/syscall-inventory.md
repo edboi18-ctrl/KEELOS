@@ -35,25 +35,25 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 25 | `lstat` | 162 | 17 | 163 | complete | `exec.filesystem` |
 | 26 | `pipe2` | 166 | 0 | 157 | partial (no O_DIRECT) | `exec.pipes` |
 | 27 | `clone` | 48 | 0 | 45 | partial (threads, fork-like) | `exec.threads`, `exec.thread_calls` |
-| 28 | `socketpair` | 11 | 0 | 11 | missing |  |
-| 29 | `shutdown` | 1 | 0 | 1 | missing |  |
+| 28 | `socketpair` | 11 | 0 | 11 | partial (AF_UNIX stream) | `exec.sockets` |
+| 29 | `shutdown` | 1 | 0 | 1 | complete | `exec.sockets` |
 | 30 | `poll` | 1 | 0 | 1 | complete | `syscalls.conformance`, `exec.pipes` |
 | 31 | `pipe` | 17 | 0 | 17 | complete | `exec.pipes` |
 | 32 | `fork` | 25 | 0 | 25 | complete | `exec.fork_wait`, `compartment.fork_bomb` |
 | 33 | `setsid` | 10 | 0 | 10 | missing |  |
 | 34 | `unlink` | 9 | 1 | 9 | complete | `exec.filesystem` |
-| 35 | `socket` | 8 | 0 | 8 | missing |  |
-| 36 | `bind` | 2 | 0 | 2 | missing |  |
+| 35 | `socket` | 8 | 0 | 8 | partial (AF_UNIX stream) | `exec.sockets` |
+| 36 | `bind` | 2 | 0 | 2 | complete | `exec.sockets` |
 | 37 | `chmod` | 1 | 0 | 1 | complete | `exec.filesystem` |
-| 38 | `listen` | 1 | 0 | 1 | missing |  |
+| 38 | `listen` | 1 | 0 | 1 | complete | `exec.sockets` |
 | 39 | `epoll_create1` | 1 | 0 | 1 | complete | `exec.epoll` |
 | 40 | `epoll_ctl` | 155 | 0 | 149 | partial (no nesting) | `exec.epoll` |
 | 41 | `dup2` | 22 | 0 | 22 | complete | `exec.descriptors` |
 | 42 | `write` | 28591 | 0 | 28754 | partial | `syscalls.conformance` |
 | 43 | `exit_group` | 27 | 0 |  | partial | `syscalls.conformance` |
 | 44 | `wait4` | 13 | 0 | 13 | partial (no process groups) | `exec.fork_wait` |
-| 45 | `setsockopt` | 22 | 0 | 22 | missing |  |
-| 46 | `connect` | 1 | 0 | 1 | missing |  |
+| 45 | `setsockopt` | 22 | 0 | 22 | partial | `exec.sockets` |
+| 46 | `connect` | 1 | 0 | 1 | complete | `exec.sockets` |
 | 47 | `fchdir` | 75 | 0 | 75 | complete | `exec.filesystem` |
 | 48 | `fstatfs` | 242 | 0 | 232 | complete | `exec.descriptors` |
 | 49 | `pread64` | 2845 | 23 | 2835 | complete | `exec.file_mappings` |
@@ -62,9 +62,9 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 52 | `getpid` | 47 | 0 | 44 | complete | `compartment.pid_space` |
 | 53 | `setpriority` | 2 | 1 | 2 | missing |  |
 | 54 | `epoll_pwait` | 21615 | 0 | 21623 | complete | `exec.epoll` |
-| 55 | `accept` | 1 | 0 | 1 | missing |  |
-| 56 | `sendmsg` | 829 | 0 | 820 | missing |  |
-| 57 | `recvmsg` | 833 | 4 | 822 | missing |  |
+| 55 | `accept` | 1 | 0 | 1 | complete | `exec.sockets` |
+| 56 | `sendmsg` | 829 | 0 | 820 | partial (no ancillary data) | `exec.sockets` |
+| 57 | `recvmsg` | 833 | 4 | 822 | partial (no ancillary data) | `exec.sockets` |
 | 58 | `sigaltstack` | 58 | 0 | 55 | complete | `syscalls.conformance`, `exec.signals` |
 | 59 | `gettid` | 58 | 0 | 55 | complete | `exec.thread_calls` |
 | 60 | `sched_getaffinity` | 12 | 0 | 12 | missing |  |
@@ -89,8 +89,8 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 79 | `futex` | 528 | 29 | 585 | partial (wait, wake, requeue) | `exec.threads`, `exec.thread_calls` |
 | 80 | `access` | 4 | 4 | 4 | complete | `exec.filesystem` |
 | 81 | `exit` | 43 | 0 |  | partial | `syscalls.conformance` |
-| 82 | `sendto` | 2 | 0 | 2 | missing |  |
-| 83 | `recvfrom` | 5 | 0 | 5 | missing |  |
+| 82 | `sendto` | 2 | 0 | 2 | partial (Unix stream; the traced calls are netlink) | `exec.sockets` |
+| 83 | `recvfrom` | 5 | 0 | 5 | partial (Unix stream; the traced calls are netlink) | `exec.sockets` |
 | 84 | `kill` | 11 | 11 | 11 | partial (no process groups) | `exec.thread_calls`, `exec.signals` |
 | 85 | `tgkill` | 10 | 0 | 13 | complete | `exec.signals` |
 | 86 | `rt_sigreturn` | 1 | 0 | 2 | complete | `exec.signals` |

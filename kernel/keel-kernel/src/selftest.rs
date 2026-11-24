@@ -1925,6 +1925,7 @@ fn phase3(t: &mut Runner) {
     phase3_procfs(t);
     phase3_pipes(t);
     phase3_epoll(t);
+    phase3_sockets(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2186,6 +2187,46 @@ fn phase3_epoll(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  epollprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T11 part 1 (ADR 0027): user/tests/sockprobe, which passes under
+/// Linux too (`host.sockprobe`), run twice. After the second run every
+/// node, frame and process is back (socket nodes are unlinked by the
+/// probe).
+fn phase3_sockets(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/sockprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    // A first run warms up: it takes the heap to the high-water mark the
+    // probe needs (the probe queues about 200 KiB in one socket), whose
+    // page-table frames the heap keeps. The second run is measured, so a
+    // leak would show and one-time growth does not.
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    // A failed first run is the status reported (its check number).
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.sockets",
+        ok,
+        "Unix stream sockets as on Linux: creation and options, socketpair data, shutdown and EPIPE, resets, path and abstract names, autobind, listen, connect before accept, the backlog, accept4, peer names and credentials; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  sockprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

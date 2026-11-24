@@ -99,7 +99,7 @@ fn start(p: &ProcessRef, dirfd: i32, path: &[u8], modify: bool) -> Result<(Ino, 
 /// The node `path` names relative to `dirfd`; an empty path with
 /// AT_EMPTY_PATH is the handle itself (which then needs STAT), without it
 /// ENOENT.
-fn node_at(
+pub(crate) fn node_at(
     p: &ProcessRef,
     dirfd: i32,
     path: &[u8],
@@ -194,6 +194,8 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
         Object::Pipe(_) => return Err(Errno::ESPIPE),
         // eventfd's and eventpoll's `noop_llseek`: the position, always 0.
         Object::EventFd(_) | Object::Epoll(_) => return Ok(0),
+        // `socket_file_ops` has no llseek: ESPIPE.
+        Object::Socket(_) => return Err(Errno::ESPIPE),
         Object::File(_) => {}
     }
     let open = file(p, fd, Rights::SEEK)?;
@@ -217,7 +219,7 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
             f.offset = at as u64;
             return Ok(at as u64);
         }
-        Kind::File | Kind::Symlink => {
+        Kind::File | Kind::Symlink | Kind::Socket => {
             let node = f.node;
             fs::with(|fs| fs.stat(node))?.size
         }
@@ -245,13 +247,14 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
 }
 
 /// `d_type` values (`include/linux/fs_types.h`: DT_CHR 2, DT_DIR 4,
-/// DT_REG 8, DT_LNK 10).
+/// DT_REG 8, DT_LNK 10, DT_SOCK 12).
 fn d_type(kind: Kind) -> u8 {
     match kind {
         Kind::Device(_) => 2,
         Kind::Directory => 4,
         Kind::File => 8,
         Kind::Symlink => 10,
+        Kind::Socket => 12,
     }
 }
 
@@ -356,7 +359,11 @@ fn set_cwd(p: &ProcessRef, node: Ino) -> SysResult {
 
 /// The parent and last component of `path`, for a call that changes the
 /// names in a directory.
-fn parent_of<'p>(p: &ProcessRef, dirfd: i32, path: &'p [u8]) -> Result<Parent<'p>, Errno> {
+pub(crate) fn parent_of<'p>(
+    p: &ProcessRef,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Result<Parent<'p>, Errno> {
     let (root, base) = start(p, dirfd, path, true)?;
     fs::with(|fs| fs.parent(root, base, path))
 }
@@ -932,7 +939,7 @@ fn record_lock(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
 
 /// An `iovec` array (`import_iovec`): more than UIO_MAXIOV (1024) entries
 /// EINVAL; a total length past `ssize_t` EINVAL.
-fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+pub(crate) fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
     const UIO_MAXIOV: u64 = 1024;
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);

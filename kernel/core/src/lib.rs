@@ -27,5 +27,6 @@ pub mod procfs;
 pub mod rng;
 pub mod signal;
 pub mod tty;
+pub mod unix;
 pub mod vfs;
 pub mod vm;

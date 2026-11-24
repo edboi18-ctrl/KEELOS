@@ -53,6 +53,7 @@ enum Target {
     File(Weak<IrqMutex<OpenFile>>),
     Pipe(Weak<PipeEnd>),
     EventFd(Weak<EventFile>),
+    Socket(Weak<crate::socket::Socket>),
 }
 
 impl Target {
@@ -61,6 +62,7 @@ impl Target {
             Target::File(w) => w.upgrade().map(Object::File),
             Target::Pipe(w) => w.upgrade().map(Object::Pipe),
             Target::EventFd(w) => w.upgrade().map(Object::EventFd),
+            Target::Socket(w) => w.upgrade().map(Object::Socket),
         }
     }
 }
@@ -92,7 +94,7 @@ pub struct EpollFile {
 /// (EINVAL; ADR 0026).
 fn can_poll(object: &Object) -> Result<(), Errno> {
     match object {
-        Object::Pipe(_) | Object::EventFd(_) | Object::Epoll(_) => Ok(()),
+        Object::Pipe(_) | Object::EventFd(_) | Object::Epoll(_) | Object::Socket(_) => Ok(()),
         Object::File(file) if file.lock().kind == Kind::Device(Device::Console) => Ok(()),
         Object::File(_) => Err(Errno::EPERM),
     }
@@ -104,6 +106,7 @@ fn identity(object: &Object) -> usize {
         Object::Pipe(a) => Arc::as_ptr(a) as *const () as usize,
         Object::EventFd(a) => Arc::as_ptr(a) as *const () as usize,
         Object::Epoll(a) => Arc::as_ptr(a) as *const () as usize,
+        Object::Socket(a) => Arc::as_ptr(a) as *const () as usize,
     }
 }
 
@@ -112,6 +115,7 @@ fn downgrade(object: &Object) -> Option<Target> {
         Object::File(a) => Target::File(Arc::downgrade(a)),
         Object::Pipe(a) => Target::Pipe(Arc::downgrade(a)),
         Object::EventFd(a) => Target::EventFd(Arc::downgrade(a)),
+        Object::Socket(a) => Target::Socket(Arc::downgrade(a)),
         Object::Epoll(_) => return None,
     })
 }
@@ -133,6 +137,7 @@ fn wakes_of(object: &Object) -> Wakes {
         Object::EventFd(file) => file.counter.lock().wakes,
         Object::File(_) => *CONSOLE_WAKES.lock(),
         Object::Epoll(_) => Wakes::new(),
+        Object::Socket(s) => s.wakes(),
     }
 }
 

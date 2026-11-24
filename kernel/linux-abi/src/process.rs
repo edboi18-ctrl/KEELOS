@@ -75,6 +75,8 @@ pub enum Object {
     EventFd(Arc<crate::ready::EventFile>),
     /// An epoll instance (P3-T10, ADR 0026).
     Epoll(Arc<crate::epoll::EpollFile>),
+    /// A Unix domain socket (P3-T11, ADR 0027).
+    Socket(Arc<crate::socket::Socket>),
 }
 
 /// Rights given to an open regular file or device, by access mode. Reading

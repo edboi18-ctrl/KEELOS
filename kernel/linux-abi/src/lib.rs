@@ -34,6 +34,8 @@ pub mod ready;
 #[cfg(target_os = "none")]
 pub mod signal;
 #[cfg(target_os = "none")]
+pub mod socket;
+#[cfg(target_os = "none")]
 pub mod syscall;
 #[cfg(target_os = "none")]
 pub mod tty;

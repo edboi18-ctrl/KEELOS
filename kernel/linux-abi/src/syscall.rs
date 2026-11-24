@@ -147,6 +147,43 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
             let (epfd, max, ms) = (a[0] as u32 as i32, a[2] as u32 as i32, a[3] as u32 as i32);
             e::epoll_pwait(p, epfd, a[1], max, ms, a[4], a[5])
         });
+        // P3-T11: Unix domain sockets (ADR 0027).
+        use crate::socket as k;
+        t[41] = Some(|p, a| k::socket(p, a[0] as u32 as i32, a[1] as u32, a[2] as u32 as i32));
+        t[53] = Some(|p, a| {
+            k::socketpair(p, a[0] as u32 as i32, a[1] as u32, a[2] as u32 as i32, a[3])
+        });
+        t[49] = Some(|p, a| k::bind(p, a[0] as u32 as i32, a[1], a[2] as u32 as i32));
+        t[50] = Some(|p, a| k::listen(p, a[0] as u32 as i32, a[1] as u32 as i32));
+        t[42] = Some(|p, a| k::connect(p, a[0] as u32 as i32, a[1], a[2] as u32 as i32));
+        t[43] = Some(|p, a| k::accept4(p, a[0] as u32 as i32, a[1], a[2], 0));
+        t[288] = Some(|p, a| k::accept4(p, a[0] as u32 as i32, a[1], a[2], a[3] as u32));
+        t[51] = Some(|p, a| k::getname(p, a[0] as u32 as i32, a[1], a[2], false));
+        t[52] = Some(|p, a| k::getname(p, a[0] as u32 as i32, a[1], a[2], true));
+        t[48] = Some(|p, a| k::shutdown(p, a[0] as u32 as i32, a[1] as u32 as i32));
+        t[44] = Some(|p, a| {
+            k::sendto(
+                p,
+                a[0] as u32 as i32,
+                a[1],
+                a[2],
+                a[3] as u32,
+                a[4],
+                a[5] as u32 as i32,
+            )
+        });
+        t[45] =
+            Some(|p, a| k::recvfrom(p, a[0] as u32 as i32, a[1], a[2], a[3] as u32, a[4], a[5]));
+        t[46] = Some(|p, a| k::sendmsg(p, a[0] as u32 as i32, a[1], a[2] as u32));
+        t[47] = Some(|p, a| k::recvmsg(p, a[0] as u32 as i32, a[1], a[2] as u32));
+        t[54] = Some(|p, a| {
+            let (fd, level, name) = (a[0] as u32 as i32, a[1] as u32 as i32, a[2] as u32 as i32);
+            k::setsockopt(p, fd, level, name, a[3], a[4] as u32 as i32)
+        });
+        t[55] = Some(|p, a| {
+            let (fd, level, name) = (a[0] as u32 as i32, a[1] as u32 as i32, a[2] as u32 as i32);
+            k::getsockopt(p, fd, level, name, a[3], a[4])
+        });
         t[441] = Some(|p, a| {
             let (epfd, max) = (a[0] as u32 as i32, a[2] as u32 as i32);
             e::epoll_pwait2(p, epfd, a[1], max, a[3], a[4], a[5])
@@ -894,7 +931,7 @@ fn read_at(
             Kind::Directory => return Err(Errno::EISDIR),
             // A descriptor never names a symbolic link itself (open
             // follows it, O_NOFOLLOW refuses it).
-            Kind::Symlink => return Err(Errno::EINVAL),
+            Kind::Symlink | Kind::Socket => return Err(Errno::EINVAL),
             // No lock held: a console read can wait for the keyboard.
             Kind::Device(device) => fs::device_read(device, &mut chunk[..want])?,
         };
@@ -1012,7 +1049,7 @@ pub(crate) fn write_at(
                         Err(_) => break,
                     }
                 }
-                Kind::Symlink => return Err(Errno::EINVAL),
+                Kind::Symlink | Kind::Socket => return Err(Errno::EINVAL),
                 Kind::Directory => return Err(Errno::EISDIR),
                 Kind::Device(device) => fs::device_write(device, &chunk[..want]),
             }
@@ -1180,6 +1217,10 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         }
         if kind != Kind::Directory && flags & O_DIRECTORY != 0 {
             return Err(Errno::ENOTDIR);
+        }
+        // A socket's name cannot be opened (`bad_sock_fops`: ENXIO).
+        if kind == Kind::Socket {
+            return Err(Errno::ENXIO);
         }
         if kind == Kind::File && write && flags & O_TRUNC != 0 {
             fs.set_len_as(node, 0, quota.as_ref())?;
@@ -1482,8 +1523,21 @@ fn ioctl(p: &Arc<IrqMutex<Process>>, fd: i32, request: u32, argument: u64) -> Sy
     /// FIONREAD (`include/uapi/asm-generic/ioctls.h`): an int, the bytes
     /// waiting in a pipe (`pipe_ioctl`).
     const FIONREAD: u32 = 0x541B;
+    /// SIOCOUTQ (TIOCOUTQ): a socket's bytes sent and not yet read.
+    const SIOCOUTQ: u32 = 0x5411;
     let file = match object(p, fd, Rights::STAT)? {
         Object::File(file) => file,
+        // `unix_ioctl`: SIOCINQ (FIONREAD) and SIOCOUTQ; others ENOTTY.
+        Object::Socket(sock) => {
+            let n = match request {
+                FIONREAD => sock.inq()?,
+                SIOCOUTQ => sock.outq(),
+                _ => return Err(Errno::ENOTTY),
+            };
+            let n = i32::try_from(n).unwrap_or(i32::MAX);
+            copy_to_user(argument, &n.to_le_bytes()).map_err(fault)?;
+            return Ok(0);
+        }
         other => {
             let waiting = crate::ready::bytes_waiting(&other);
             return match (request, waiting) {

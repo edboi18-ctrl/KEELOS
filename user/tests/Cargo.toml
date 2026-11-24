@@ -132,6 +132,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "sockprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "execprobe"
 test = false
 bench = false

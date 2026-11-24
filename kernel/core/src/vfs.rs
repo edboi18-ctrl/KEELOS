@@ -51,6 +51,7 @@ pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFLNK: u32 = 0o120000;
+pub const S_IFSOCK: u32 = 0o140000;
 
 /// tmpfs's size for each directory entry, and for an empty directory two
 /// of them (`BOGO_DIRENT_SIZE` 20, `mm/shmem.c`), which `stat` reports as a
@@ -102,6 +103,9 @@ enum Contents {
     Device(Device),
     /// A symbolic link's target, as given (never empty).
     Symlink(Vec<u8>),
+    /// A Unix domain socket's name (bind(2), ADR 0027): which socket, if
+    /// any, it names is the socket layer's record, not the node's.
+    Socket,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +142,8 @@ pub enum Kind {
     Directory,
     Device(Device),
     Symlink,
+    /// A Unix socket's name in the filesystem (ADR 0027).
+    Socket,
 }
 
 /// File status, the parts `stat(2)` reports.
@@ -394,6 +400,7 @@ impl Fs {
             Contents::Directory(_) => Kind::Directory,
             Contents::Device(device) => Kind::Device(device),
             Contents::Symlink(_) => Kind::Symlink,
+            Contents::Socket => Kind::Socket,
         })
     }
 
@@ -708,6 +715,19 @@ impl Fs {
             quota.cloned(),
             self.now(),
         );
+        self.add(dir, name, node)
+    }
+
+    /// Creates a socket node (`unix_bind_bsd`'s `vfs_mknod` with
+    /// S_IFSOCK), owned by `quota`: EEXIST if the name is taken.
+    pub fn create_socket_as(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        permissions: u32,
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<Ino, Errno> {
+        let node = Node::new(Contents::Socket, permissions, quota.cloned(), self.now());
         self.add(dir, name, node)
     }
 
@@ -1261,6 +1281,7 @@ impl Fs {
             }
             Contents::Device(device) => (S_IFCHR, 0, node.links, device.number()),
             Contents::Symlink(target) => (S_IFLNK, target.len() as u64, node.links, (0, 0)),
+            Contents::Socket => (S_IFSOCK, 0, node.links, (0, 0)),
         };
         Ok(Stat {
             ino,

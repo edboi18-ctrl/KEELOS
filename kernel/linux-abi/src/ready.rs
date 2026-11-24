@@ -207,7 +207,7 @@ pub fn deadline_ms(ms: i64) -> Option<u64> {
 
 /// Copies user memory from the segments `segs` (base, length), starting
 /// `skip` bytes in, into `out`; false on a fault.
-fn copy_in(segs: &[(u64, u64)], mut skip: u64, out: &mut [u8]) -> bool {
+pub(crate) fn copy_in(segs: &[(u64, u64)], mut skip: u64, out: &mut [u8]) -> bool {
     let mut at = 0usize;
     for &(base, len) in segs {
         if at == out.len() {
@@ -228,7 +228,7 @@ fn copy_in(segs: &[(u64, u64)], mut skip: u64, out: &mut [u8]) -> bool {
 }
 
 /// Copies `data` out to the segments; the bytes copied before a fault.
-fn copy_out(segs: &[(u64, u64)], data: &[u8]) -> usize {
+pub(crate) fn copy_out(segs: &[(u64, u64)], data: &[u8]) -> usize {
     let mut at = 0usize;
     for &(base, len) in segs {
         if at == data.len() {
@@ -248,7 +248,7 @@ fn copy_out(segs: &[(u64, u64)], data: &[u8]) -> usize {
     at
 }
 
-fn total(segs: &[(u64, u64)]) -> u64 {
+pub(crate) fn total(segs: &[(u64, u64)]) -> u64 {
     segs.iter()
         .fold(0u64, |t, &(_, len)| t.saturating_add(len))
         .min(crate::abi::MAX_RW_COUNT)
@@ -266,6 +266,7 @@ pub fn read(object: &Object, segs: &[(u64, u64)]) -> Option<SysResult> {
     Some(match object {
         Object::Pipe(end) => read_pipe(end, segs),
         Object::EventFd(file) => read_eventfd(file, segs),
+        Object::Socket(s) => crate::socket::read(s, segs),
         _ => return None,
     })
 }
@@ -350,6 +351,7 @@ pub fn write(p: &ProcessRef, object: &Object, segs: &[(u64, u64)]) -> Option<Sys
     Some(match object {
         Object::Pipe(end) => write_pipe(p, end, segs),
         Object::EventFd(file) => write_eventfd(file, segs),
+        Object::Socket(s) => crate::socket::write(p, s, segs),
         _ => return None,
     })
 }
@@ -443,6 +445,7 @@ pub fn poll_mask(object: &Object) -> Option<u16> {
         Object::Pipe(end) => end.pipe.lock().poll(!end.write),
         Object::EventFd(file) => file.counter.lock().poll(),
         Object::Epoll(ep) => crate::epoll::poll_mask(ep),
+        Object::Socket(s) => s.poll(),
         Object::File(_) => return None,
     })
 }
@@ -450,6 +453,8 @@ pub fn poll_mask(object: &Object) -> Option<u16> {
 /// The device pipes report: pipefs is its own superblock on Linux, an
 /// anonymous device (major 0); 0:3 is arbitrary, as procfs's 0:2.
 pub const PIPEFS_DEV: (u32, u32) = (0, 3);
+/// The device sockets report: sockfs's, 0:5.
+pub const SOCKFS_DEV: (u32, u32) = (0, 5);
 /// The device eventfds report: the anon-inode filesystem's, 0:4.
 pub const ANON_INODE_DEV: (u32, u32) = (0, 4);
 /// The inode every eventfd shares: Linux gives all of them the one
@@ -472,6 +477,8 @@ pub fn stat_bytes(object: &Object) -> Option<[u8; 144]> {
         Object::Pipe(end) => (end.ino, S_IFIFO | 0o600, PIPEFS_DEV),
         // An epoll instance is the same anonymous inode.
         Object::EventFd(_) | Object::Epoll(_) => (ANON_INODE_INO, 0o600, ANON_INODE_DEV),
+        // A socket's own inode on sockfs, S_IFSOCK | 0777 (`sock_alloc`).
+        Object::Socket(s) => (s.ino, keel_core::vfs::S_IFSOCK | 0o777, SOCKFS_DEV),
         Object::File(_) => return None,
     };
     let now = crate::fs::with(|fs| Ok(fs.time_now())).unwrap_or(Timespec::default());
@@ -494,6 +501,8 @@ pub fn statfs_magic(object: &Object) -> Option<u64> {
     match object {
         Object::Pipe(_) => Some(0x5049_5045),
         Object::EventFd(_) | Object::Epoll(_) => Some(0x0904_1934),
+        // SOCKFS_MAGIC.
+        Object::Socket(_) => Some(0x534F_434B),
         Object::File(_) => None,
     }
 }
@@ -504,6 +513,7 @@ pub fn status(object: &Object) -> Option<&IrqMutex<u64>> {
         Object::Pipe(end) => Some(&end.status),
         Object::EventFd(file) => Some(&file.status),
         Object::Epoll(ep) => Some(&ep.status),
+        Object::Socket(s) => Some(&s.status),
         Object::File(_) => None,
     }
 }
@@ -559,12 +569,16 @@ pub fn object_ready(object: &Object, rights: Rights) -> u16 {
         }
         other => poll_mask(other).unwrap_or(0),
     };
+    // POLLRDBAND and POLLRDHUP are about reading, POLLWRBAND writing.
+    const POLLRDBAND: u16 = 0x80;
+    const POLLWRBAND: u16 = 0x200;
+    const POLLRDHUP: u16 = 0x2000;
     let mut allowed = POLLERR | POLLHUP;
     if rights.contains(Rights::READ) {
-        allowed |= POLLIN | POLLRDNORM | POLLPRI;
+        allowed |= POLLIN | POLLRDNORM | POLLPRI | POLLRDBAND | POLLRDHUP;
     }
     if rights.contains(Rights::WRITE) {
-        allowed |= POLLOUT | POLLWRNORM;
+        allowed |= POLLOUT | POLLWRNORM | POLLWRBAND;
     }
     ready & allowed
 }

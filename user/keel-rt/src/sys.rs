@@ -1298,3 +1298,171 @@ pub fn epoll_pwait2(
         ],
     )
 }
+
+/// socket(2).
+pub fn socket(family: i32, ty: u32, protocol: i32) -> i64 {
+    call3(
+        41,
+        family as u32 as u64,
+        u64::from(ty),
+        protocol as u32 as u64,
+    )
+}
+
+/// socketpair(2) into `sv`.
+pub fn socketpair(family: i32, ty: u32, protocol: i32, sv: &mut [i32; 2]) -> i64 {
+    call6(
+        53,
+        [
+            family as u32 as u64,
+            u64::from(ty),
+            protocol as u32 as u64,
+            sv.as_mut_ptr() as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// socketpair(2) writing to an address the kernel may refuse.
+pub fn socketpair_into(family: i32, ty: u32, target: Hostile) -> i64 {
+    call6(53, [family as u32 as u64, u64::from(ty), 0, target.0, 0, 0])
+}
+
+/// bind(2) with the address bytes `addr` (its length is theirs).
+pub fn bind(fd: i32, addr: &[u8]) -> i64 {
+    call3(49, fd as u64, addr.as_ptr() as u64, addr.len() as u64)
+}
+
+/// connect(2) with the address bytes `addr`.
+pub fn connect(fd: i32, addr: &[u8]) -> i64 {
+    call3(42, fd as u64, addr.as_ptr() as u64, addr.len() as u64)
+}
+
+pub fn listen(fd: i32, backlog: i32) -> i64 {
+    call3(50, fd as u64, backlog as u32 as u64, 0)
+}
+
+/// accept4(2); `peer` the address buffer and its length (in and out).
+pub fn accept4(fd: i32, peer: Option<(&mut [u8], &mut i32)>, flags: u32) -> i64 {
+    let (a, l) = peer.map_or((0, 0), |(b, l)| {
+        (b.as_mut_ptr() as u64, l as *mut i32 as u64)
+    });
+    call6(288, [fd as u64, a, l, u64::from(flags), 0, 0])
+}
+
+/// getsockname(2) (`peer` false) or getpeername(2).
+pub fn getname(fd: i32, addr: &mut [u8], len: &mut i32, peer: bool) -> i64 {
+    call3(
+        if peer { 52 } else { 51 },
+        fd as u64,
+        addr.as_mut_ptr() as u64,
+        len as *mut i32 as u64,
+    )
+}
+
+pub fn shutdown(fd: i32, how: i32) -> i64 {
+    call3(48, fd as u64, how as u32 as u64, 0)
+}
+
+/// sendto(2); `to` an address, or none.
+pub fn sendto(fd: i32, data: &[u8], flags: u32, to: Option<&[u8]>) -> i64 {
+    let (a, l) = to.map_or((0, 0), |t| (t.as_ptr() as u64, t.len() as u64));
+    call6(
+        44,
+        [
+            fd as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            u64::from(flags),
+            a,
+            l,
+        ],
+    )
+}
+
+/// recvfrom(2); `from` the address buffer and its length (in and out).
+pub fn recvfrom(fd: i32, buf: &mut [u8], flags: u32, from: Option<(&mut [u8], &mut i32)>) -> i64 {
+    let (a, l) = from.map_or((0, 0), |(b, l)| {
+        (b.as_mut_ptr() as u64, l as *mut i32 as u64)
+    });
+    call6(
+        45,
+        [
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            u64::from(flags),
+            a,
+            l,
+        ],
+    )
+}
+
+/// sendmsg(2) of `parts` as its iovec, with no name and no control data.
+pub fn sendmsg(fd: i32, parts: &[&[u8]], flags: u32) -> i64 {
+    let mut iov = [0u64; 16];
+    let n = parts.len().min(8);
+    for (i, p) in parts[..n].iter().enumerate() {
+        iov[2 * i] = p.as_ptr() as u64;
+        iov[2 * i + 1] = p.len() as u64;
+    }
+    let mut hdr = [0u64; 7];
+    hdr[2] = iov.as_ptr() as u64;
+    hdr[3] = n as u64;
+    call3(46, fd as u64, hdr.as_ptr() as u64, u64::from(flags))
+}
+
+/// recvmsg(2) into two buffers; `name` an address buffer. Returns the
+/// result and the msghdr's name length and flags as written back.
+pub fn recvmsg2(
+    fd: i32,
+    a: &mut [u8],
+    b: &mut [u8],
+    name: Option<&mut [u8]>,
+    flags: u32,
+) -> (i64, i32, i32) {
+    let iov = [
+        a.as_mut_ptr() as u64,
+        a.len() as u64,
+        b.as_mut_ptr() as u64,
+        b.len() as u64,
+    ];
+    let mut hdr = [0u64; 7];
+    if let Some(n) = name {
+        hdr[0] = n.as_mut_ptr() as u64;
+        hdr[1] = n.len() as u64;
+    }
+    hdr[2] = iov.as_ptr() as u64;
+    hdr[3] = 2;
+    let r = call3(47, fd as u64, hdr.as_mut_ptr() as u64, u64::from(flags));
+    (r, hdr[1] as u32 as i32, hdr[6] as u32 as i32)
+}
+
+pub fn setsockopt(fd: i32, level: i32, name: i32, val: &[u8]) -> i64 {
+    call6(
+        54,
+        [
+            fd as u64,
+            level as u32 as u64,
+            name as u32 as u64,
+            val.as_ptr() as u64,
+            val.len() as u64,
+            0,
+        ],
+    )
+}
+
+pub fn getsockopt(fd: i32, level: i32, name: i32, val: &mut [u8], len: &mut i32) -> i64 {
+    call6(
+        55,
+        [
+            fd as u64,
+            level as u32 as u64,
+            name as u32 as u64,
+            val.as_mut_ptr() as u64,
+            len as *mut i32 as u64,
+            0,
+        ],
+    )
+}
