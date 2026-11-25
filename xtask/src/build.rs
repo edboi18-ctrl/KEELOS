@@ -288,6 +288,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: true,
     },
+    TestProgram {
+        path: "test/stopprobe",
+        binary: "stopprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
     // Needs the console as its terminal: Keel only.
     TestProgram {
         path: "test/ctrlc",

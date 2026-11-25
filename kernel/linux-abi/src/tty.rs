@@ -450,8 +450,8 @@ impl TtyOpen {
 /// SIGTTOU to write with TOSTOP or change the settings). With the signal
 /// blocked or ignored: EIO for SIGTTIN, allowed for SIGTTOU. In an
 /// orphaned group: EIO. Otherwise the signal goes to its whole group and
-/// the call is EINTR (Linux's ERESTARTSYS, restarted after the stop;
-/// Keel neither stops nor restarts yet, ADR 0030).
+/// call is ERESTARTSYS: restarted once the process is continued, or EINTR
+/// after a handler without SA_RESTART (ADR 0031).
 fn check_change(tty: &Ctty, signal: i32) -> Result<(), Errno> {
     let Some(me) = caller() else {
         return Ok(());
@@ -489,7 +489,7 @@ fn check_change(tty: &Ctty, signal: i32) -> Result<(), Errno> {
                 return Err(Errno::EIO);
             }
             crate::jobs::signal_group(&compartment, pgid, signal);
-            Err(Errno::EINTR)
+            Err(Errno::ERESTARTSYS)
         }
         _ => Ok(()),
     }
@@ -1012,7 +1012,8 @@ pub fn read(open: &TtyOpen, nonblock: bool, segs: &[(u64, u64)]) -> SysResult {
                 let ready =
                     || open.look(|tty, _, other| tty.input_available(false) || other.closed);
                 if wait(ready, deadline) == Waited::Interrupted {
-                    error = Some(Errno::EINTR);
+                    // n_tty_read: ERESTARTSYS.
+                    error = Some(Errno::ERESTARTSYS);
                     break;
                 }
             }
@@ -1085,7 +1086,7 @@ fn write_chunk(open: &TtyOpen, nonblock: bool, data: &[u8]) -> Result<usize, Err
             return if done > 0 {
                 Ok(done)
             } else {
-                Err(Errno::EINTR)
+                Err(Errno::ERESTARTSYS)
             };
         }
         if open.hung_up() {
@@ -1127,7 +1128,7 @@ fn write_chunk(open: &TtyOpen, nonblock: bool, data: &[u8]) -> Result<usize, Err
             return if done > 0 {
                 Ok(done)
             } else {
-                Err(Errno::EINTR)
+                Err(Errno::ERESTARTSYS)
             };
         }
     }
@@ -1329,7 +1330,7 @@ pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
             if let Some(tty) = open.as_ctty() {
                 check_change(&tty, ttou)?;
             }
-            wait_until_sent(open)?;
+            wait_until_sent(open, Errno::EINTR)?;
         }
         TIOCEXCL | TIOCNXCL => open.run(false, |t, _, _| t.exclusive = request == TIOCEXCL),
         TIOCGEXCL => return put_int(arg, i32::from(open.run(false, |t, _, _| t.exclusive))),
@@ -1340,7 +1341,7 @@ pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
             if let Some(tty) = open.as_ctty() {
                 check_change(&tty, ttou)?;
             }
-            wait_until_sent(open)?;
+            wait_until_sent(open, Errno::EINTR)?;
             let disc = get_int(arg)?;
             if !(0..NR_LDISCS).contains(&disc) || disc != 0 {
                 return Err(Errno::EINVAL);
@@ -1420,10 +1421,11 @@ fn master_ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
 }
 
 /// `tty_wait_until_sent`: until the terminal's own output has gone (a
-/// pty has none); a signal ends it (EINTR).
-fn wait_until_sent(open: &TtyOpen) -> Result<(), Errno> {
+/// pty has none). A signal ends it with `interrupted`: EINTR for
+/// tty_ioctl's TCSBRK, TCSBRKP and TIOCSETD, ERESTARTSYS for set_termios.
+fn wait_until_sent(open: &TtyOpen, interrupted: Errno) -> Result<(), Errno> {
     if wait(|| open.look(|_, _, other| other.chars == 0), None) == Waited::Interrupted {
-        return Err(Errno::EINTR);
+        return Err(interrupted);
     }
     Ok(())
 }
@@ -1434,7 +1436,7 @@ fn wait_until_sent(open: &TtyOpen) -> Result<(), Errno> {
 /// read buffer emptied), then `tty_set_termios`.
 fn set_termios(open: &TtyOpen, user: &[u8], termio: bool, how: SetHow) -> Result<(), Errno> {
     if how != SetHow::Now {
-        wait_until_sent(open)?;
+        wait_until_sent(open, Errno::ERESTARTSYS)?;
     }
     open.run(true, |t, out, _| {
         let mut new = if termio {

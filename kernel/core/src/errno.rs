@@ -61,11 +61,24 @@ pub enum Errno {
     ETOOMANYREFS = 109,
     ETIMEDOUT = 110,
     ECONNREFUSED = 111,
+    /// `ERESTARTSYS` (`include/linux/errno.h`, kernel-internal): the call
+    /// was interrupted and is restarted if no handler runs, or if the
+    /// handler has SA_RESTART; else it is EINTR. Never reaches user space
+    /// (ADR 0031).
+    ERESTARTSYS = 512,
+    /// `ERESTARTNOHAND`: restarted if no handler runs, else EINTR.
+    ERESTARTNOHAND = 514,
 }
 
 impl Errno {
     /// The value a system call puts in RAX: `-errno`.
     pub fn to_return(self) -> i64 {
         -(self as i64)
+    }
+
+    /// Whether this is a restart request, which the return to user mode
+    /// turns into a restart or EINTR.
+    pub fn is_restart(self) -> bool {
+        matches!(self, Errno::ERESTARTSYS | Errno::ERESTARTNOHAND)
     }
 }

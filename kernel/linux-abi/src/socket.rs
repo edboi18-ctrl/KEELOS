@@ -732,7 +732,12 @@ fn wait_for(ready: impl FnMut() -> bool, timeout: Option<u64>) -> Result<(), Err
     match wait(ready, deadline) {
         Waited::Ready => Ok(()),
         Waited::TimedOut => Err(Errno::EAGAIN),
-        Waited::Interrupted => Err(Errno::EINTR),
+        // sock_intr_errno: ERESTARTSYS without a timeout, else EINTR.
+        Waited::Interrupted => Err(if timeout.is_none() {
+            Errno::ERESTARTSYS
+        } else {
+            Errno::EINTR
+        }),
     }
 }
 

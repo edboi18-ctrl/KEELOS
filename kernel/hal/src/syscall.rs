@@ -114,6 +114,10 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
     };
     crate::arch::x86_64::cpu::disable_interrupts();
     frame.rax = result as u64;
+    // Linux's `orig_ax`: the call's number, which a restart puts back in
+    // RAX. The stub's error-code slot is unused on this path (the vector
+    // marks a system call); u64::MAX means "no call to restart".
+    frame.error_code = call.number;
     // execve replaced the program, or rt_sigreturn restores the registers
     // a signal interrupted: return with those registers. For execve every
     // general register is 0, as Linux's elf_common_init clears them for a
@@ -131,6 +135,9 @@ pub(crate) fn dispatch(frame: &mut TrapFrame) {
             ss: frame.ss,
             vector: frame.vector,
             saved_cr3: frame.saved_cr3,
+            // rt_sigreturn and execve are never restarted (sigreturn sets
+            // `orig_ax = -1`).
+            error_code: u64::MAX,
             ..new
         };
     }

@@ -1930,6 +1930,7 @@ fn phase3(t: &mut Runner) {
     phase3_terminals(t);
     phase3_job_control(t);
     phase3_console_interrupt(t);
+    phase3_stop_continue(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2378,6 +2379,40 @@ fn phase3_console_interrupt(t: &mut Runner) {
     );
     if outcome != Some((true, (0, None))) {
         kprintln!("  ctrlc: {outcome:?}");
+    }
+}
+
+/// Job control's stop and continue (ADR 0031): user/tests/stopprobe,
+/// which passes under Linux too (`host.stopprobe`), run twice; after the
+/// second run every node, frame and process is back.
+fn phase3_stop_continue(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/stopprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.stop_continue",
+        ok,
+        "stop and continue as on Linux: SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU stop, SIGCONT continues (WUNTRACED and WCONTINUED once each, SIGCHLD, SA_NOCLDSTOP), the interrupted read restarted, pending stops and SIGCONT discarding each other, orphaned groups, SA_RESTART, SIGCHLD ignored and SA_NOCLDWAIT reaping, an orphaned stopped job's SIGHUP and SIGCONT; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  stopprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
     }
 }
 

@@ -133,13 +133,9 @@ The rules are Linux v6.12's:
 
 ## Not yet covered
 
-- **Stopping and continuing.** A stop signal's default action does
-  nothing yet. A background reader whose SIGTTIN is at its default gets
-  EINTR where Linux would stop it and restart the read. ^Z without a
-  handler does nothing. WUNTRACED and WCONTINUED report nothing, and
-  orphaned groups with stopped members get no SIGHUP and SIGCONT
-  (`kill_orphaned_pgrp`). SIGCHLD to the parent, and its SIG_IGN
-  auto-reaping, belong with these. They are the next task.
+- **Stopping and continuing**, WUNTRACED and WCONTINUED,
+  `kill_orphaned_pgrp`, SIGCHLD and its auto-reaping, and restarting the
+  call a background check interrupts: done in ADR 0031.
 - **Zombies** are not in their group: Linux keeps a zombie findable
   (getpgid, kill, setpgid's group check) until it is reaped, Keel only
   through its parent's wait records.

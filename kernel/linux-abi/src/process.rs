@@ -166,6 +166,15 @@ pub struct Process {
     /// its foreground group, which gets SIGHUP and SIGCONT when the leader
     /// exits.
     pub old_pgrp: Option<u32>,
+    /// Stopped by a stop signal (`SIGNAL_STOP_STOPPED`; ADR 0031): its
+    /// threads wait until SIGCONT or SIGKILL.
+    pub stopped: bool,
+    /// The stop signal, until wait4's WUNTRACED reports it
+    /// (`group_exit_code`).
+    pub stop_report: Option<i32>,
+    /// Continued, until wait4's WCONTINUED reports it
+    /// (`SIGNAL_STOP_CONTINUED`).
+    pub continue_report: bool,
 }
 
 /// One thread of a process.
@@ -234,8 +243,13 @@ pub struct Child {
     pub status: Option<i32>,
 }
 
-/// Woken whenever a process exits, for wait4.
+/// Woken whenever a process exits, stops or continues, for wait4.
 static CHILD_EXITS: sched::WaitQueue = sched::WaitQueue::new();
+
+/// Wakes wait4's waiters (`__wake_up_parent`).
+pub fn wake_waiters() {
+    CHILD_EXITS.wake_all();
+}
 
 /// Lock owners, one per process, never reused.
 fn new_lock_owner() -> u64 {
@@ -358,6 +372,9 @@ pub fn spawn_in(
         execed: true,
         ctty: None,
         old_pgrp: None,
+        stopped: false,
+        stop_report: None,
+        continue_report: false,
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.
@@ -459,6 +476,9 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         execed: false,
         ctty,
         old_pgrp: None,
+        stopped: false,
+        stop_report: None,
+        continue_report: false,
     }));
     let mut registers = *frame;
     registers.rax = 0;
@@ -720,23 +740,60 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
             p.lock_owner,
         )
     };
+    let live_children: Vec<Arc<IrqMutex<Process>>> = children
+        .iter()
+        .filter(|c| c.status.is_none())
+        .map(|c| c.process.clone())
+        .collect();
     drop((handles, space, children));
     // disassociate_ctty(1): a session leader's terminal is hung up.
     crate::tty::on_exit(&process);
     // Its record locks go with it.
     crate::fscalls::release_locks(owner, None);
+    let parent = parent.as_ref().and_then(Weak::upgrade);
+    // kill_orphaned_pgrp: groups this exit orphans get SIGHUP and SIGCONT
+    // if they have stopped members.
+    crate::jobs::orphan_at_exit(&process, parent.as_ref(), &live_children);
+    drop(live_children);
     let wait_status = match signal {
         Some(signal) => signal & 0x7f,
         None => ((code & 0xff) << 8) as i32,
     };
-    if let Some(parent) = parent.as_ref().and_then(Weak::upgrade) {
-        let mut parent = parent.lock();
-        if let Some(child) = parent
-            .children
-            .iter_mut()
-            .find(|c| Arc::ptr_eq(&c.process, &process))
-        {
-            child.status = Some(wait_status);
+    if let Some(parent) = parent {
+        // do_notify_parent: SIGCHLD (CLD_KILLED with the signal, or
+        // CLD_EXITED with the code) unless the parent ignores it; a parent
+        // that ignores SIGCHLD or set SA_NOCLDWAIT does not keep the
+        // zombie (autoreap).
+        let (code, status) = match signal {
+            Some(s) => (keel_core::signal::CLD_KILLED, s),
+            None => (keel_core::signal::CLD_EXITED, (code & 0xff) as i32),
+        };
+        let pid = process.lock().pid();
+        let (send, reaped) = {
+            let mut q = parent.lock();
+            let action = q.signals.action(keel_core::signal::SIGCHLD);
+            let ignore = action.is_some_and(|a| a.handler == keel_core::signal::SIG_IGN);
+            let nowait = action.is_some_and(|a| a.flags & keel_core::signal::SA_NOCLDWAIT != 0);
+            let index = q
+                .children
+                .iter()
+                .position(|c| Arc::ptr_eq(&c.process, &process));
+            let reaped = match index {
+                Some(i) if ignore || nowait => Some(q.children.remove(i)),
+                Some(i) => {
+                    q.children[i].status = Some(wait_status);
+                    None
+                }
+                None => None,
+            };
+            (!ignore, reaped)
+        };
+        drop(reaped);
+        if send {
+            crate::signal::send_to_process(
+                &parent,
+                keel_core::signal::SigInfo::child(code, pid, status),
+            );
         }
     }
     CHILD_EXITS.wake_all();
@@ -775,14 +832,26 @@ pub enum WaitFor {
     Group(u32),
 }
 
-/// wait4's core: reaps an exited child matching `which` and returns its
-/// PID and wait status. ECHILD if no child matches; `Ok(None)` if one
-/// matches but none has exited and `block` is false (WNOHANG); otherwise
-/// blocks until one exits. Reaping drops the zombie, giving its
+/// What wait4 reports besides exits: WUNTRACED (a child's stop, once)
+/// and WCONTINUED (its continuing, once).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaitAlso {
+    pub stopped: bool,
+    pub continued: bool,
+}
+
+/// wait4's core (`wait_consider_task`): the first child matching `which`
+/// with something to report, in the order they were made: an exit reaps
+/// it; with `also`, a stop it has not reported (status `sig << 8 | 0x7f`)
+/// or its continuing (0xffff). Returns its PID and wait status. ECHILD if
+/// no child matches; `Ok(None)` if one matches but has nothing to report
+/// and `block` is false (WNOHANG); otherwise blocks (a signal:
+/// ERESTARTSYS, as `do_wait`). Reaping drops the zombie, giving its
 /// compartment slot back.
 pub fn wait(
     p: &Arc<IrqMutex<Process>>,
     which: WaitFor,
+    also: WaitAlso,
     block: bool,
 ) -> Result<Option<(u32, i32)>, Errno> {
     // The parent is locked while this runs; a child is another process.
@@ -798,24 +867,40 @@ pub fn wait(
             result = Err(Errno::ECHILD);
             return true;
         }
-        let Some(index) = process
-            .children
-            .iter()
-            .position(|c| matches(c) && c.status.is_some())
-        else {
-            return false;
-        };
-        let child = process.children.remove(index);
-        result = Ok(child.status.map(|status| (child.pid, status)));
-        drop(process);
-        drop(child);
-        true
+        for index in 0..process.children.len() {
+            let c = &process.children[index];
+            if !matches(c) {
+                continue;
+            }
+            if c.status.is_some() {
+                let child = process.children.remove(index);
+                result = Ok(child.status.map(|status| (child.pid, status)));
+                drop(process);
+                drop(child);
+                return true;
+            }
+            let mut q = c.process.lock();
+            if also.stopped
+                && q.stopped
+                && let Some(signal) = q.stop_report.take()
+            {
+                result = Ok(Some((c.pid, (signal << 8) | 0x7f)));
+                return true;
+            }
+            if also.continued && q.continue_report {
+                q.continue_report = false;
+                result = Ok(Some((c.pid, 0xffff)));
+                return true;
+            }
+        }
+        false
     };
     if block {
         if !CHILD_EXITS.wait_until(&mut try_reap) {
             // wait(2): "EINTR: WNOHANG was not set and an unblocked
-            // signal or a SIGCHLD was caught".
-            return Err(Errno::EINTR);
+            // signal or a SIGCHLD was caught"; restarted if no handler
+            // runs or it has SA_RESTART.
+            return Err(Errno::ERESTARTSYS);
         }
     } else {
         try_reap();

@@ -210,8 +210,13 @@ pub fn futex(
         Ok(0)
     } else if sched::exit_requested().is_some() || sched::interrupted() {
         // futex(2): "EINTR: A FUTEX_WAIT ... operation was interrupted by
-        // a signal". SA_RESTART is not honoured yet (ADR 0020).
-        Err(Errno::EINTR)
+        // a signal". Untimed, Linux restarts it (ERESTARTSYS); timed it
+        // uses a restart block, which Keel does not have: EINTR (ADR 0031).
+        Err(if deadline.is_none() {
+            Errno::ERESTARTSYS
+        } else {
+            Errno::EINTR
+        })
     } else {
         Err(Errno::ETIMEDOUT)
     }

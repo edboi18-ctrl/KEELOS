@@ -148,8 +148,7 @@ the signals ISIG raises are part 2 (ADR 0030).
   otherwise), TIOCSTI, TIOCCONS, TIOCVHANGUP, the modem lines (TIOCMGET
   and its setters) and TIOCGSERIAL.
 - **`/dev/pts/ptmx`**; devpts mount options.
-- **Restarting** a read or write a handled signal interrupted: EINTR
-  only (ADR 0020).
+- **Restarting** an interrupted read or write: done in ADR 0031.
 - **Parity and framing errors, breaks** (PARMRK only doubles 0xff): no
   driver reports them.
 - **Line disciplines** other than N_TTY.

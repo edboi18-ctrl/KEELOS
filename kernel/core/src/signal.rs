@@ -463,6 +463,11 @@ pub const SIGSYS: i32 = 31;
 pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TKILL: i32 = -6;
+/// SIGCHLD's codes (`include/uapi/asm-generic/siginfo.h`).
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
 pub const ILL_ILLOPN: i32 = 2;
 pub const FPE_INTDIV: i32 = 1;
 pub const SEGV_MAPERR: i32 = 1;
@@ -561,6 +566,20 @@ impl SigInfo {
     }
 
     /// `force_sig`: `SI_KERNEL` with every field 0.
+    /// SIGCHLD about a child (`_sigchld`): its PID, UID 0 and the status
+    /// (`si_status`: the exit code, or the signal); the times are 0.
+    pub fn child(code: i32, pid: u32, status: i32) -> Self {
+        let mut fields = [0; 16];
+        fields[0..4].copy_from_slice(&pid.to_le_bytes());
+        fields[8..12].copy_from_slice(&status.to_le_bytes());
+        Self {
+            signo: SIGCHLD,
+            errno: 0,
+            code,
+            fields,
+        }
+    }
+
     pub fn kernel(signo: i32) -> Self {
         Self {
             signo,

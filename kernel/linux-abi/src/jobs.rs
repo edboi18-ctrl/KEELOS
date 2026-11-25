@@ -185,8 +185,17 @@ pub fn session_members(compartment: &Arc<Compartment>, sid: u32) -> Vec<ProcessR
 /// does not count (Linux reparents an orphan to init and skips init's
 /// children).
 pub fn orphaned(compartment: &Arc<Compartment>, pgid: u32) -> bool {
+    orphaned_without(compartment, pgid, None)
+}
+
+/// As [`orphaned`], with `gone` (an exiting process) counted as no
+/// parent.
+fn orphaned_without(compartment: &Arc<Compartment>, pgid: u32, gone: Option<&ProcessRef>) -> bool {
     let members = process::members(compartment, |q| q.pgid == pgid);
     for m in members {
+        if gone.is_some_and(|g| Arc::ptr_eq(g, &m)) {
+            continue;
+        }
         let (parent, sid) = {
             let q = m.lock();
             (
@@ -197,6 +206,9 @@ pub fn orphaned(compartment: &Arc<Compartment>, pgid: u32) -> bool {
         let Some(parent) = parent else {
             continue;
         };
+        if gone.is_some_and(|g| Arc::ptr_eq(g, &parent)) {
+            continue;
+        }
         let parent = parent.lock();
         if parent.pid() == 1 {
             continue;
@@ -206,4 +218,51 @@ pub fn orphaned(compartment: &Arc<Compartment>, pgid: u32) -> bool {
         }
     }
     true
+}
+
+/// `has_stopped_jobs`: a member of group `pgid` is stopped.
+fn has_stopped(compartment: &Arc<Compartment>, pgid: u32) -> bool {
+    !process::members(compartment, |q| q.pgid == pgid && q.stopped).is_empty()
+}
+
+/// `kill_orphaned_pgrp` at an exit (`exit_notify`, `reparent_leader`): a
+/// group the exit leaves orphaned that has a stopped member gets SIGHUP
+/// and SIGCONT (as the kernel), so its jobs do not stay stopped with no
+/// one to continue them. That is the exiting process's own group, if its
+/// parent was in another group of its session, and each live child's
+/// group in another group of its session.
+pub fn orphan_at_exit(exiting: &ProcessRef, parent: Option<&ProcessRef>, children: &[ProcessRef]) {
+    let (compartment, pgid, sid) = {
+        let q = exiting.lock();
+        (q.member.compartment().clone(), q.pgid, q.sid)
+    };
+    let hang_up = |group: u32| {
+        signal_group(&compartment, group, keel_core::signal::SIGHUP);
+        signal_group(&compartment, group, keel_core::signal::SIGCONT);
+    };
+    let mut groups: Vec<u32> = Vec::new();
+    if let Some(parent) = parent {
+        let (ppgid, psid) = {
+            let q = parent.lock();
+            (q.pgid, q.sid)
+        };
+        if ppgid != pgid && psid == sid {
+            groups.push(pgid);
+        }
+    }
+    for child in children {
+        let (cpgid, csid) = {
+            let q = child.lock();
+            (q.pgid, q.sid)
+        };
+        if cpgid != pgid && csid == sid && !groups.contains(&cpgid) {
+            groups.push(cpgid);
+        }
+    }
+    for group in groups {
+        if orphaned_without(&compartment, group, Some(exiting)) && has_stopped(&compartment, group)
+        {
+            hang_up(group);
+        }
+    }
 }

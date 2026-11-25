@@ -925,7 +925,8 @@ fn record_lock(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
             outcome != Err(Errno::EAGAIN)
         });
         if !done {
-            return Err(Errno::EINTR);
+            // locks_lock_inode_wait: ERESTARTSYS.
+            return Err(Errno::ERESTARTSYS);
         }
         outcome
     } else {

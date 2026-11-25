@@ -306,7 +306,7 @@ fn read_pipe(end: &PipeEnd, segs: &[(u64, u64)]) -> SysResult {
                     None,
                 ) != Waited::Ready
                 {
-                    return Err(Errno::EINTR);
+                    return Err(Errno::ERESTARTSYS);
                 }
             }
         }
@@ -334,7 +334,7 @@ fn read_eventfd(file: &EventFile, segs: &[(u64, u64)]) -> SysResult {
             return Err(Errno::EAGAIN);
         }
         if wait(|| file.counter.lock().count > 0, None) != Waited::Ready {
-            return Err(Errno::EINTR);
+            return Err(Errno::ERESTARTSYS);
         }
     }
 }
@@ -405,7 +405,7 @@ fn write_pipe(p: &ProcessRef, end: &PipeEnd, segs: &[(u64, u64)]) -> SysResult {
                     None,
                 );
                 if waited != Waited::Ready {
-                    return partial(done, Errno::EINTR);
+                    return partial(done, Errno::ERESTARTSYS);
                 }
             }
         }
@@ -434,7 +434,7 @@ fn write_eventfd(file: &EventFile, segs: &[(u64, u64)]) -> SysResult {
             return Err(Errno::EAGAIN);
         }
         if wait(|| u64::MAX - file.counter.lock().count > n, None) != Waited::Ready {
-            return Err(Errno::EINTR);
+            return Err(Errno::ERESTARTSYS);
         }
     }
 }
@@ -578,8 +578,8 @@ pub fn object_ready(object: &Object, rights: Rights) -> u16 {
 /// The wait poll, select and their variants share (`do_poll`,
 /// `do_select`): `scan` looks at every descriptor and returns how many
 /// are ready (or an error); if none is, and a signal is pending that the
-/// thread does not block, the call is interrupted (EINTR, even with a
-/// zero timeout, as Linux's ERESTARTNOHAND); at the deadline it returns
+/// thread does not block, the call is interrupted (ERESTARTNOHAND, even
+/// with a zero timeout); at the deadline it returns
 /// 0; otherwise it waits for a readiness change and scans again.
 fn wait_scan(
     p: &ProcessRef,
@@ -592,7 +592,7 @@ fn wait_scan(
             return Ok(count);
         }
         if crate::signal::pending_unblocked(p) || sched::interrupted() {
-            return Err(Errno::EINTR);
+            return Err(Errno::ERESTARTNOHAND);
         }
         if deadline.is_some_and(|d| keel_hal::time::monotonic_nanos() >= d) {
             return Ok(0);
@@ -646,9 +646,16 @@ fn do_poll(p: &ProcessRef, fds: u64, nfds: u32, deadline: Option<u64>) -> SysRes
     Ok(count)
 }
 
-/// poll(2): a negative timeout waits without limit.
+/// poll(2): a negative timeout waits without limit. Interrupted, it is
+/// restarted without a timeout (ERESTARTNOHAND); with one, Linux restarts
+/// it for the time left (a restart block), which Keel does not have:
+/// EINTR (ADR 0031).
 pub fn poll(p: &ProcessRef, fds: u64, nfds: u32, timeout_ms: i32) -> SysResult {
-    do_poll(p, fds, nfds, deadline_ms(i64::from(timeout_ms)))
+    let result = do_poll(p, fds, nfds, deadline_ms(i64::from(timeout_ms)));
+    match result {
+        Err(Errno::ERESTARTNOHAND) if timeout_ms >= 0 => Err(Errno::EINTR),
+        other => other,
+    }
 }
 
 /// A `struct timespec` timeout (`poll_select_set_timeout`): EFAULT if
@@ -697,7 +704,10 @@ fn finish(
     form: TimeForm,
     result: SysResult,
 ) -> SysResult {
-    crate::signal::end_temporary_mask(p, result == Err(Errno::EINTR));
+    crate::signal::end_temporary_mask(
+        p,
+        matches!(result, Err(Errno::EINTR | Errno::ERESTARTNOHAND)),
+    );
     if let Some((deadline, false)) = timeout {
         let left = deadline.saturating_sub(keel_hal::time::monotonic_nanos());
         let sec = left / 1_000_000_000;

@@ -164,16 +164,14 @@ Everything below follows Linux v6.12 (sources in `docs/SOURCES.md`):
 
 ## Not yet covered
 
-- **SA_RESTART.** An interrupted call returns EINTR even with
-  `SA_RESTART`; Linux would restart `futex`, `wait4` and `read`. `poll`
-  is not interrupted at all yet.
+- **SA_RESTART** and restarting interrupted calls: done in ADR 0031.
 - **Real-time signal queueing.** Each real-time signal should be queued
   (up to RLIMIT_SIGPENDING). The calls that need it (`rt_sigqueueinfo`,
   `rt_tgsigqueueinfo`) are also missing.
 - **Waiting for signals and asking what is pending:** `rt_sigsuspend`,
   `rt_sigtimedwait`, `rt_sigpending`, `signalfd`, `pause`.
 - **Job control and SIGCHLD:** stop and continue, and SIGCHLD to the
-  parent at exit (with process groups, P3-T7).
+  parent at exit: done in ADR 0030 and ADR 0031.
 - **Dynamically enabled FPU state (AMX).** It is not granted, so the
   alternate stack needs no size check beyond MINSIGSTKSZ.
 

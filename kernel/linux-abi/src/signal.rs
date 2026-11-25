@@ -20,9 +20,10 @@ use alloc::vec::Vec;
 use keel_core::errno::Errno;
 use keel_core::signal::frame::{self, SigContext};
 use keel_core::signal::{
-    self as sig, BUS_ADRALN, DefaultAction, FPE_INTDIV, ILL_ILLOPN, NSIG, SA_NODEFER, SA_ONSTACK,
-    SA_RESETHAND, SA_RESTORER, SA_SIGINFO, SEGV_ACCERR, SEGV_MAPERR, SIG_DFL, SIG_IGN, SIGBUS,
-    SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP, SS_AUTODISARM, SigAction, SigInfo,
+    self as sig, BUS_ADRALN, CLD_CONTINUED, CLD_STOPPED, DefaultAction, FPE_INTDIV, ILL_ILLOPN,
+    NSIG, SA_NOCLDSTOP, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_RESTORER, SA_SIGINFO,
+    SEGV_ACCERR, SEGV_MAPERR, SIG_DFL, SIG_IGN, SIGBUS, SIGCHLD, SIGCONT, SIGFPE, SIGILL, SIGKILL,
+    SIGSEGV, SIGSTOP, SIGTRAP, SIGTSTP, SIGTTIN, SIGTTOU, SS_AUTODISARM, SigAction, SigInfo,
 };
 use keel_hal::arch::x86_64::fpu;
 use keel_hal::arch::x86_64::idt::TrapFrame;
@@ -72,14 +73,152 @@ fn is_handler(action: &SigAction) -> bool {
 }
 
 /// `sig_handler_ignored`: SIG_IGN, or SIG_DFL for a signal whose default
-/// is to be ignored.
+/// is to be ignored (`sig_kernel_ignore`: SIGCONT, SIGCHLD, SIGWINCH,
+/// SIGURG). A stop signal at its default is not ignored: it stops.
 fn ignored(signal: i32, action: &SigAction) -> bool {
     action.handler == SIG_IGN
         || (action.handler == SIG_DFL
             && matches!(
                 sig::default_action(signal),
-                DefaultAction::Ignore | DefaultAction::Continue | DefaultAction::Stop
+                DefaultAction::Ignore | DefaultAction::Continue
             ))
+}
+
+/// The stop signals (`SIG_KERNEL_STOP_MASK`).
+const STOP_MASK: u64 =
+    (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
+
+fn is_stop(signal: i32) -> bool {
+    (1..=64).contains(&signal) && STOP_MASK & sig::sigmask(signal) != 0
+}
+
+/// Woken when a stopped process is continued, or killed.
+static CONTINUED: sched::WaitQueue = sched::WaitQueue::new();
+
+/// `prepare_signal`'s job control, with `target` locked: a stop signal
+/// takes back a pending SIGCONT; SIGCONT takes back pending stop signals
+/// and continues a stopped process (it is then reported to wait4's
+/// WCONTINUED, and its stop no longer to WUNTRACED). Returns whether it
+/// was continued.
+fn prepare(p: &mut Process, signal: i32) -> bool {
+    let flush = |p: &mut Process, mask: u64| {
+        for s in 1..=NSIG as i32 {
+            if mask & sig::sigmask(s) != 0 {
+                p.pending.take(s);
+                for t in p.threads.values_mut() {
+                    t.signals.pending.take(s);
+                }
+            }
+        }
+    };
+    if is_stop(signal) {
+        flush(p, sig::sigmask(SIGCONT));
+        false
+    } else if signal == SIGCONT {
+        flush(p, STOP_MASK);
+        let was = p.stopped;
+        if was {
+            p.stopped = false;
+            p.stop_report = None;
+            p.continue_report = true;
+        }
+        was
+    } else {
+        false
+    }
+}
+
+/// `do_notify_parent_cldstop`: the parent hears that `child` stopped
+/// (`code` CLD_STOPPED, `status` the signal) or continued (CLD_CONTINUED,
+/// SIGCONT): SIGCHLD unless it ignores SIGCHLD or set SA_NOCLDSTOP, and
+/// its wait4 wakes.
+fn notify_parent(child: &Arc<IrqMutex<Process>>, code: i32, status: i32) {
+    let (parent, pid) = {
+        let c = child.lock();
+        (
+            c.parent.as_ref().and_then(alloc::sync::Weak::upgrade),
+            c.pid(),
+        )
+    };
+    let Some(parent) = parent else {
+        return;
+    };
+    let wanted = parent
+        .lock()
+        .signals
+        .action(SIGCHLD)
+        .is_some_and(|a| a.handler != SIG_IGN && a.flags & SA_NOCLDSTOP == 0);
+    if wanted {
+        send_to_process(&parent, SigInfo::child(code, pid, status));
+    }
+    process::wake_waiters();
+}
+
+/// After `prepare` continued a process: its threads go on, and its parent
+/// is told.
+fn continued(target: &Arc<IrqMutex<Process>>) {
+    CONTINUED.wake_all();
+    notify_parent(target, CLD_CONTINUED, SIGCONT);
+}
+
+/// `do_signal_stop`: the whole process stops with `signal`. Its parent is
+/// told, its other threads are interrupted so they stop on their way back
+/// to user mode, and the caller parks.
+fn group_stop(p: &Arc<IrqMutex<Process>>, signal: i32) {
+    let me = sched::current().0;
+    let others: Vec<u64> = {
+        let mut q = p.lock();
+        q.stopped = true;
+        q.stop_report = Some(signal);
+        q.continue_report = false;
+        q.threads.keys().copied().filter(|&t| t != me).collect()
+    };
+    for t in others {
+        sched::interrupt(ThreadId(t));
+    }
+    notify_parent(p, CLD_STOPPED, signal);
+    park(p);
+}
+
+/// A thread of a stopped process waits here until it is continued or
+/// asked to end (SIGKILL). Signals that arrive meanwhile stay pending.
+fn park(p: &Arc<IrqMutex<Process>>) {
+    loop {
+        if sched::exit_requested().is_some() || !p.lock().stopped {
+            return;
+        }
+        CONTINUED.wait_until(|| sched::exit_requested().is_some() || !p.lock().stopped);
+        sched::clear_interrupt();
+    }
+}
+
+/// `handle_signal`'s and `arch_do_signal_or_restart`'s restart: a system
+/// call that returned ERESTARTSYS or ERESTARTNOHAND is restarted (RAX back
+/// to its number, RIP back over the 2-byte SYSCALL) when no handler runs,
+/// or for ERESTARTSYS when the handler has SA_RESTART; otherwise it is
+/// EINTR. `handler` is the first handler's flags, if one runs. Done once
+/// per return.
+fn restart(frame: &mut TrapFrame, handler: Option<u64>) {
+    if frame.vector != keel_hal::arch::x86_64::entry::SYSCALL_VECTOR || frame.error_code == u64::MAX
+    {
+        return;
+    }
+    let result = frame.rax as i64;
+    let sys = Errno::ERESTARTSYS.to_return();
+    let nohand = Errno::ERESTARTNOHAND.to_return();
+    if result == sys || result == nohand {
+        let again = match handler {
+            None => true,
+            Some(flags) => result == sys && flags & SA_RESTART != 0,
+        };
+        if again {
+            frame.rax = frame.error_code;
+            frame.rip = frame.rip.wrapping_sub(2);
+        } else {
+            frame.rax = Errno::EINTR.to_return() as u64;
+        }
+    }
+    frame.error_code = u64::MAX;
 }
 
 /// Sends `info` to the process `target` as a whole (kill(2)). SIGKILL
@@ -95,11 +234,12 @@ pub fn send_to_process(target: &Arc<IrqMutex<Process>>, info: SigInfo) {
         process::kill_all_threads(target, SIGKILL);
         return;
     }
-    let wake = {
+    let (wake, resumed) = {
         let mut p = target.lock();
         let Some(action) = p.signals.action(signal) else {
             return;
         };
+        let resumed = prepare(&mut p, signal);
         let bit = sig::sigmask(signal);
         let taker = p
             .threads
@@ -107,11 +247,15 @@ pub fn send_to_process(target: &Arc<IrqMutex<Process>>, info: SigInfo) {
             .find(|(_, t)| t.signals.blocked() & bit == 0)
             .map(|(&id, _)| id);
         if ignored(signal, &action) && taker.is_some() {
-            return;
+            (None, resumed)
+        } else {
+            p.pending.post(info);
+            (taker, resumed)
         }
-        p.pending.post(info);
-        taker
     };
+    if resumed {
+        continued(target);
+    }
     if let Some(thread) = wake {
         sched::interrupt(ThreadId(thread));
     }
@@ -125,21 +269,29 @@ pub fn send_to_thread(target: &Arc<IrqMutex<Process>>, thread: ThreadId, info: S
         process::kill_all_threads(target, SIGKILL);
         return;
     }
-    let wake = {
+    let (wake, resumed) = {
         let mut p = target.lock();
         let Some(action) = p.signals.action(signal) else {
             return;
         };
+        if !p.threads.contains_key(&thread.0) {
+            return;
+        }
+        let resumed = prepare(&mut p, signal);
         let Some(t) = p.threads.get_mut(&thread.0) else {
             return;
         };
         let blocked = t.signals.blocked() & sig::sigmask(signal) != 0;
         if ignored(signal, &action) && !blocked {
-            return;
+            (false, resumed)
+        } else {
+            t.signals.pending.post(info);
+            (!blocked, resumed)
         }
-        t.signals.pending.post(info);
-        !blocked
     };
+    if resumed {
+        continued(target);
+    }
     if wake {
         sched::interrupt(thread);
     }
@@ -377,16 +529,21 @@ fn on_return(frame: &mut TrapFrame) {
     let Some(p) = process::current() else {
         return;
     };
+    // A thread of a process another thread stopped stops here.
+    park(&p);
     // Each pass takes one pending signal; a failed frame adds at most one
-    // SIGSEGV, and a second failure kills, so this ends.
+    // SIGSEGV, and a second failure kills, so this ends. A stop counts as
+    // a pass.
     for _ in 0..2 * NSIG {
         let Some(d) = dequeue(&p) else {
             // No handler ran (or the last one's frame holds it): put back
-            // a mask ppoll or pselect6 replaced (`restore_saved_sigmask`).
+            // a mask ppoll or pselect6 replaced (`restore_saved_sigmask`),
+            // and restart an interrupted call.
             let me = sched::current().0;
             if let Some(t) = p.lock().threads.get_mut(&me) {
                 t.signals.restore_saved();
             }
+            restart(frame, None);
             return;
         };
         match d.action.handler {
@@ -396,11 +553,28 @@ fn on_return(frame: &mut TrapFrame) {
                     process::kill_all_threads(&p, d.signal);
                     return;
                 }
-                // Job control is not implemented: a stop signal is
-                // ignored (ADR 0020).
-                DefaultAction::Ignore | DefaultAction::Stop | DefaultAction::Continue => continue,
+                // get_signal: a stop signal other than SIGSTOP in an
+                // orphaned group is discarded; otherwise the process stops
+                // until SIGCONT (ADR 0031).
+                DefaultAction::Stop => {
+                    let (compartment, pgid) = {
+                        let q = p.lock();
+                        (q.member.compartment().clone(), q.pgid)
+                    };
+                    if d.signal != SIGSTOP && crate::jobs::orphaned(&compartment, pgid) {
+                        continue;
+                    }
+                    group_stop(&p, d.signal);
+                    if sched::exit_requested().is_some() {
+                        return;
+                    }
+                }
+                DefaultAction::Ignore | DefaultAction::Continue => continue,
             },
             _ => {
+                // The first handler decides an interrupted call's restart,
+                // before its frame saves the registers.
+                restart(frame, Some(d.action.flags));
                 if setup_frame(&p, frame, &d).is_err() {
                     // signal_setup_done -> force_sigsegv: a SIGSEGV that
                     // cannot be delivered either ends the process.

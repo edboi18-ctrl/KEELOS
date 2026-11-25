@@ -662,9 +662,8 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
 /// child, 0 for a child in the caller's process group, another negative
 /// value for one in that group (the child's group when wait4 looks, as
 /// `eligible_pid`; ADR 0030). No child matching:
-/// ECHILD. WNOHANG with none exited returns 0. Stopped and continued
-/// children do not exist until signals do, so WUNTRACED and WCONTINUED
-/// change nothing. The status is written if `status` is not NULL; a
+/// ECHILD. WNOHANG with none exited returns 0. WUNTRACED and WCONTINUED
+/// also report a child's stop and continuing, once each (ADR 0031). The status is written if `status` is not NULL; a
 /// `rusage` is written as all zero (no accounting yet).
 fn wait4(
     p: &Arc<IrqMutex<Process>>,
@@ -687,7 +686,12 @@ fn wait4(
         pid if pid > 0 => process::WaitFor::Pid(pid as u32),
         pid => process::WaitFor::Group(pid.unsigned_abs()),
     };
-    let Some((child, wait_status)) = process::wait(p, which, options & WNOHANG == 0)? else {
+    // WUNTRACED (WSTOPPED) 2 and WCONTINUED 8.
+    let also = process::WaitAlso {
+        stopped: options & 2 != 0,
+        continued: options & 8 != 0,
+    };
+    let Some((child, wait_status)) = process::wait(p, which, also, options & WNOHANG == 0)? else {
         return Ok(0);
     };
     // Like Linux, the child is already reaped when a copy-out fails.

@@ -59,6 +59,16 @@ pub fn catch(signal: i32) -> i64 {
     sys::rt_sigaction(signal, Arg::Buf(&act), Out::Null, 8)
 }
 
+/// As [`catch`], with `flags` added (SA_RESTART, SA_NOCLDSTOP,
+/// SA_NOCLDWAIT, ...).
+pub fn catch_with(signal: i32, flags: u64) -> i64 {
+    let mut act = [0u8; 32];
+    act[..8].copy_from_slice(&(count as extern "C" fn(i32) as usize as u64).to_le_bytes());
+    act[8..16].copy_from_slice(&(SA_RESTORER | flags).to_le_bytes());
+    act[16..24].copy_from_slice(&(restore as extern "C" fn() as usize as u64).to_le_bytes());
+    sys::rt_sigaction(signal, Arg::Buf(&act), Out::Null, 8)
+}
+
 /// How many times the handler has run for `signal`.
 pub fn caught(signal: i32) -> u32 {
     CAUGHT
