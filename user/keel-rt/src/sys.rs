@@ -675,6 +675,47 @@ pub fn clock_gettime_into(clock: u64, target: Hostile) -> i64 {
     call3(nr::CLOCK_GETTIME, clock, target.0, 0)
 }
 
+/// nanosleep(2) with raw 16-byte `struct __kernel_timespec`s; `rem`, if
+/// given, gets the time left when a signal cuts the sleep short.
+pub fn nanosleep(req: &[u8; 16], rem: Option<&mut [u8; 16]>) -> i64 {
+    let rem = rem.map_or(0, |r| r.as_mut_ptr() as u64);
+    call3(35, req.as_ptr() as u64, rem, 0)
+}
+
+/// nanosleep(2) with a request the kernel cannot read.
+pub fn nanosleep_from(req: Hostile) -> i64 {
+    call3(35, req.0, 0, 0)
+}
+
+/// clock_nanosleep(2), as [`nanosleep`] with a clock and flags
+/// (TIMER_ABSTIME 1).
+pub fn clock_nanosleep(clock: i32, flags: u32, req: &[u8; 16], rem: Option<&mut [u8; 16]>) -> i64 {
+    let rem = rem.map_or(0, |r| r.as_mut_ptr() as u64);
+    call6(
+        230,
+        [
+            clock as u32 as u64,
+            u64::from(flags),
+            req.as_ptr() as u64,
+            rem,
+            0,
+            0,
+        ],
+    )
+}
+
+/// rt_sigsuspend(2): waits with `mask` blocked until a signal it does not
+/// block is pending.
+pub fn rt_sigsuspend(mask: Arg<'_, u64>, size: u64) -> i64 {
+    call3(130, arg(&mask), size, 0)
+}
+
+/// restart_syscall(2): resumes an interrupted sleep, else EINTR. It takes
+/// no arguments and touches only what the interrupted call had.
+pub fn restart_syscall() -> i64 {
+    call3(219, 0, 0, 0)
+}
+
 pub fn getrandom(buf: &mut [u8], flags: u64) -> i64 {
     call3(
         nr::GETRANDOM,

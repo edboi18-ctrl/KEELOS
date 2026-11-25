@@ -1942,8 +1942,10 @@ fn phase3(t: &mut Runner) {
     phase3_job_control(t);
     phase3_console_interrupt(t);
     phase3_stop_continue(t);
+    phase3_sleep(t);
     phase3_shell(t);
     phase3_console_shell(t);
+    phase3_console_busybox(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2554,6 +2556,196 @@ fn phase3_console_shell(t: &mut Runner) {
             last.as_deref()
                 .map(|v| core::str::from_utf8(v).unwrap_or("?")),
         );
+    }
+}
+
+/// ADR 0033: user/tests/sleepprobe, which passes under Linux too
+/// (`host.sleepprobe`): nanosleep, clock_nanosleep and restart_syscall.
+/// Run twice; after the second run every node, frame and process is back.
+fn phase3_sleep(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/sleepprobe";
+    let outside_heap = frames_outside_heap;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.sleep",
+        ok,
+        "nanosleep and clock_nanosleep as on Linux: the request's checks, the clocks that can sleep, TIMER_ABSTIME, EINTR with the time left after a handler, and after a stop and SIGCONT the sleep going on to its first deadline through restart_syscall; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  sleepprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// Phase 3 acceptance item 3 (P3-T13 part 2): static BusyBox `sh` runs
+/// interactively on the serial console and runs `ls`, `cat`, pipelines
+/// and background jobs. `/sbin/keel-init --once --shell /bin/busybox sh`
+/// starts it as a normal boot starts keel-shell. Typed on COM1 through
+/// the UART's loopback, each line once the last has been handled; each
+/// command leaves its result in /tmp, which this test reads:
+/// - the applets linked into /tmp/bb (`mkdir`, `--install -s`), PATH
+///   set to them;
+/// - the shell is BusyBox: `readlink /proc/$$/exe` gives /bin/busybox;
+/// - `ls /etc` (keel-release) and a pipeline `echo | cat | tr`;
+/// - a background `sleep 1 &`: `jobs` shows it running, `wait` gives 0;
+/// - `cat` in the foreground, ^Z (stopped, in `jobs`), `fg`, a line,
+///   ^D: `$?` 0;
+/// - `exit 3`: keel-init exits 3.
+///
+/// Keys for a foreground job wait for the console's foreground group to
+/// change hands. If a step fails, ^C, ^D and `exit` end the shell.
+fn phase3_console_busybox(t: &mut Runner) {
+    use keel_linux_abi::{exec, fs, process, tty};
+    const INIT: &[u8] = b"/sbin/keel-init";
+    let until = |pick: &dyn Fn(u32, u32) -> bool| {
+        for _ in 0..500 {
+            if tty::console_job().is_some_and(|(s, g)| pick(s, g)) {
+                return true;
+            }
+            sched::sleep_ms(10);
+        }
+        false
+    };
+    let type_text = |text: &[u8]| {
+        text.chunks(14).all(|c| {
+            let ok = tty::type_serial(c);
+            sched::sleep_ms(30);
+            ok
+        })
+    };
+    // A command line, then time for the shell to run it.
+    let line = |text: &[u8]| {
+        let ok = type_text(text);
+        sched::sleep_ms(400);
+        ok
+    };
+    // A command line that writes `file`, then up to 5 s for it to appear.
+    let writes = |text: &[u8], file: &[u8]| {
+        type_text(text)
+            && (0..500).any(|_| {
+                let there = fs::read_file(file).is_ok_and(|f| !f.is_empty());
+                if !there {
+                    sched::sleep_ms(10);
+                }
+                there
+            })
+    };
+    let spawned = fs::read_file(INIT)
+        .ok()
+        .and_then(|file| {
+            exec::load(
+                &file,
+                INIT,
+                &[INIT, b"--once", b"--shell", b"/bin/busybox", b"sh"],
+                &[],
+            )
+            .ok()
+        })
+        .and_then(|loaded| process::spawn("keel-init", &loaded).ok());
+    let mut failed_at = 0;
+    if let Some(spawned) = &spawned {
+        let ready = until(&|s, g| s != 0 && s == g);
+        // Line editing asks the terminal where the cursor is; a moment
+        // for that before typing.
+        sched::sleep_ms(300);
+        let sid = tty::console_job().map_or(0, |(s, _)| s);
+        let steps: [&dyn Fn() -> bool; 13] = [
+            &|| ready,
+            &|| line(b"/bin/busybox mkdir /tmp/bb\n"),
+            &|| line(b"/bin/busybox --install -s /tmp/bb\n"),
+            &|| line(b"export PATH=/tmp/bb\n"),
+            // The shell is BusyBox's: its own executable.
+            &|| writes(b"readlink /proc/$$/exe >/tmp/b7\n", b"/tmp/b7"),
+            &|| {
+                writes(b"ls /etc >/tmp/b1\n", b"/tmp/b1")
+                    && writes(b"echo hi | cat | tr a-z A-Z >/tmp/b2\n", b"/tmp/b2")
+            },
+            &|| line(b"sleep 1 &\n") && writes(b"jobs >/tmp/b3\n", b"/tmp/b3"),
+            &|| writes(b"wait; echo $? >/tmp/b4\n", b"/tmp/b4"),
+            &|| type_text(b"cat\n") && until(&|_, g| g != sid),
+            &|| {
+                sched::sleep_ms(150);
+                type_text(b"\x1a") && until(&|_, g| g == sid)
+            },
+            &|| {
+                writes(b"jobs >/tmp/b5\n", b"/tmp/b5")
+                    && type_text(b"fg\n")
+                    && until(&|_, g| g != sid)
+            },
+            &|| {
+                sched::sleep_ms(150);
+                type_text(b"x\n")
+                    && {
+                        sched::sleep_ms(100);
+                        type_text(b"\x04")
+                    }
+                    && until(&|_, g| g == sid)
+            },
+            &|| writes(b"echo $? >/tmp/b6\n", b"/tmp/b6") && type_text(b"exit 3\n"),
+        ];
+        for (i, step) in steps.iter().enumerate() {
+            if !step() {
+                failed_at = i + 1;
+                type_text(b"\x03\x04\x03exit\nexit\n");
+                break;
+            }
+        }
+        join(spawned.thread);
+    }
+    let status = spawned.as_ref().and_then(|s| sched::exit_status(s.thread));
+    let file = |path: &[u8]| fs::read_file(path).ok();
+    let text = |v: &Option<alloc::sync::Arc<alloc::vec::Vec<u8>>>| -> alloc::string::String {
+        v.as_deref()
+            .map(|v| core::str::from_utf8(v).unwrap_or("?"))
+            .unwrap_or("-")
+            .into()
+    };
+    let results = [
+        b"/tmp/b1", b"/tmp/b2", b"/tmp/b3", b"/tmp/b4", b"/tmp/b5", b"/tmp/b6", b"/tmp/b7",
+    ]
+    .map(|p| file(p));
+    let has = |i: usize, parts: &[&str]| {
+        let t = text(&results[i]);
+        parts.iter().all(|p| t.contains(p))
+    };
+    let ok = failed_at == 0
+        && status == Some((3, None))
+        && text(&results[0]) == "keel-release\n"
+        && text(&results[1]) == "HI\n"
+        && has(2, &["[1]", "Running", "sleep 1"])
+        && text(&results[3]) == "0\n"
+        && has(4, &["[1]", "Stopped", "cat"])
+        && text(&results[5]) == "0\n"
+        && text(&results[6]) == "/bin/busybox\n";
+    t.check(
+        "console.busybox",
+        ok,
+        "Phase 3 acceptance item 3: static BusyBox sh, started by keel-init on the serial console, runs ls, cat, a pipeline (echo | cat | tr), a background job (sleep 1 &, jobs, wait), and stops, lists and resumes a foreground job (^Z, jobs, fg, ^D)",
+    );
+    if !ok {
+        kprintln!(
+            "  busybox: spawned {}, failed at step {failed_at}, keel-init {status:?}",
+            spawned.is_some()
+        );
+        for (i, r) in results.iter().enumerate() {
+            kprintln!("  /tmp/b{}: {:?}", i + 1, text(r));
+        }
     }
 }
 

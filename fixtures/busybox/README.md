@@ -42,7 +42,7 @@ The build writes these to `out/`:
 
 | File | What it is |
 | --- | --- |
-| `busybox` | The static executable (stripped, no build ID, no build time) |
+| `busybox` | The static executable (static PIE, stripped, no build ID, no build time) |
 | `busybox.sha256` | Its SHA-256 |
 | `busybox.config` | The final `.config` (the test suite reads it to skip tests of options that are off) |
 | `applets.txt` | `busybox --list`, sorted |
@@ -62,7 +62,22 @@ To commit, copy from `out/` into this directory: `busybox`,
 `busybox.sha256`, `busybox.config`, `applets.txt`, `testsuite.tar`,
 `testsuite.sha256`, `busybox-1.37.0.tar.bz2` and `packages.txt`.
 
-Reference build: not made yet (the owner builds it).
+Reference build (2026-11-25), by the owner with Docker Desktop on
+Windows; a second build with `-NoCache` gave the same hashes, so the
+recipe is reproducible:
+
+- `busybox`: SHA-256
+  `a7f90ab1edb39515bda299a0fa312aca27977c880850aac34784d63e28690116`
+- `testsuite.tar`: SHA-256
+  `ab4c2bed59b98a5a1f10eea7d3c7f262105b54ab6769fde8384b30915bf9dcd3`
+
+Toolchain (from `packages.txt`): gcc 15.2.0-r5, musl 1.2.6-r3, binutils
+2.45.1-r1 and linux-headers 7.0.0-r1 on Alpine 3.24.4.
+
+The executable is static PIE (`file`: "static-pie linked"), although
+the configuration turns PIE off: with this toolchain, BusyBox's `-static`
+link (without `-no-pie`) gave a static PIE. It needs no interpreter, and
+Keel loads it at a random bias.
 
 ## Licences of what the binary contains
 

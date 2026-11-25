@@ -63,6 +63,10 @@ pub mod nr {
     pub const ARCH_PRCTL: u64 = 158;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;
+    pub const NANOSLEEP: u64 = 35;
+    pub const RT_SIGSUSPEND: u64 = 130;
+    pub const RESTART_SYSCALL: u64 = 219;
+    pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const EXIT_GROUP: u64 = 231;
     pub const OPENAT: u64 = 257;
     pub const FTRUNCATE: u64 = 77;
@@ -376,6 +380,18 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::SET_TID_ADDRESS as usize] = Some(|p, a| Ok(set_tid_address(p, a[0])));
     t[nr::GETPID as usize] = Some(|p, _| Ok(u64::from(p.lock().pid())));
     t[nr::CLOCK_GETTIME as usize] = Some(|_, a| clock_gettime(a[0] as u32 as u64, a[1]));
+    t[nr::NANOSLEEP as usize] = Some(|p, a| crate::sleep::nanosleep(p, a[0], a[1]));
+    t[nr::CLOCK_NANOSLEEP as usize] = Some(|p, a| {
+        crate::sleep::clock_nanosleep(
+            p,
+            i64::from(a[0] as u32 as i32),
+            a[1] as u32 as u64,
+            a[2],
+            a[3],
+        )
+    });
+    t[nr::RESTART_SYSCALL as usize] = Some(|p, _| crate::sleep::restart_syscall(p));
+    t[nr::RT_SIGSUSPEND as usize] = Some(|p, a| crate::signal::rt_sigsuspend(p, a[0], a[1]));
     t[nr::GETRANDOM as usize] = Some(|_, a| getrandom(a[0], a[1], a[2] as u32 as u64));
     t
 };

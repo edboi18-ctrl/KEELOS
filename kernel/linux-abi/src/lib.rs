@@ -37,6 +37,9 @@ pub mod procfs;
 pub mod ready;
 #[cfg(target_os = "none")]
 pub mod signal;
+/// nanosleep, clock_nanosleep and restart_syscall (ADR 0033).
+#[cfg(target_os = "none")]
+pub mod sleep;
 #[cfg(target_os = "none")]
 pub mod socket;
 #[cfg(target_os = "none")]

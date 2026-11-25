@@ -196,7 +196,8 @@ fn park(p: &Arc<IrqMutex<Process>>) {
 /// call that returned ERESTARTSYS or ERESTARTNOHAND is restarted (RAX back
 /// to its number, RIP back over the 2-byte SYSCALL) when no handler runs,
 /// or for ERESTARTSYS when the handler has SA_RESTART; otherwise it is
-/// EINTR. `handler` is the first handler's flags, if one runs. Done once
+/// EINTR. ERESTART_RESTARTBLOCK becomes restart_syscall (219) when no
+/// handler runs, else EINTR. `handler` is the first handler's flags, if one runs. Done once
 /// per return.
 fn restart(frame: &mut TrapFrame, handler: Option<u64>) {
     if frame.vector != keel_hal::arch::x86_64::entry::SYSCALL_VECTOR || frame.error_code == u64::MAX
@@ -206,7 +207,16 @@ fn restart(frame: &mut TrapFrame, handler: Option<u64>) {
     let result = frame.rax as i64;
     let sys = Errno::ERESTARTSYS.to_return();
     let nohand = Errno::ERESTARTNOHAND.to_return();
-    if result == sys || result == nohand {
+    if result == Errno::ERESTART_RESTARTBLOCK.to_return() {
+        // `get_nr_restart_syscall`: without a handler the call is resumed
+        // by restart_syscall (ADR 0033); with one it is EINTR.
+        if handler.is_none() {
+            frame.rax = crate::syscall::nr::RESTART_SYSCALL;
+            frame.rip = frame.rip.wrapping_sub(2);
+        } else {
+            frame.rax = Errno::EINTR.to_return() as u64;
+        }
+    } else if result == sys || result == nohand {
         let again = match handler {
             None => true,
             Some(flags) => result == sys && flags & SA_RESTART != 0,
@@ -830,6 +840,27 @@ pub fn temporary_mask(p: &Arc<IrqMutex<Process>>, mask: u64, size: u64) -> Resul
     copy_from_user(&mut b, mask).map_err(|_| Errno::EFAULT)?;
     let mask = u64::from_le_bytes(b);
     process::with_current_thread(p, |t| t.signals.set_temporary(mask)).ok_or(Errno::ESRCH)
+}
+
+/// rt_sigsuspend(2) (`kernel/signal.c` `sigsuspend`, ADR 0033): a size
+/// other than 8 EINVAL, an unreadable mask EFAULT. The mask replaces the
+/// thread's blocked one (SIGKILL and SIGSTOP stay unblocked) until a
+/// signal it does not block is pending; the call is then ERESTARTNOHAND.
+/// A handler runs with the temporary mask, its frame keeping the old one
+/// to go back to, and the call is EINTR; with no handler the old mask is
+/// put back and the call restarted, so it waits again.
+pub fn rt_sigsuspend(p: &Arc<IrqMutex<Process>>, mask: u64, size: u64) -> Result<u64, Errno> {
+    if size != sig::SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let mut b = [0u8; 8];
+    copy_from_user(&mut b, mask).map_err(|_| Errno::EFAULT)?;
+    let mask = u64::from_le_bytes(b);
+    process::with_current_thread(p, |t| t.signals.set_temporary(mask)).ok_or(Errno::ESRCH)?;
+    while !pending_unblocked(p) && !sched::interrupted() {
+        crate::ready::wait(|| pending_unblocked(p), None);
+    }
+    Err(Errno::ERESTARTNOHAND)
 }
 
 /// `restore_saved_sigmask_unless(interrupted)`: a call that was not

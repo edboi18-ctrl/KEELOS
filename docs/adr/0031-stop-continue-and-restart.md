@@ -113,8 +113,8 @@ The rules are Linux v6.12's:
 
 - **Restart blocks** (`restart_syscall`, ERESTART_RESTARTBLOCK): poll
   with a timeout and timed futex waits are EINTR even with no handler,
-  where Linux continues them for the time left. There are no sleep calls
-  yet.
+  where Linux continues them for the time left. (ADR 0033 adds restart
+  blocks and uses them for nanosleep and clock_nanosleep.)
 - **Stopping a process during an uninterruptible kernel wait:** Keel's
   only such waits are short; a thread parks when it next returns to user
   mode.

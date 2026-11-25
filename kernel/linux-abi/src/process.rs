@@ -201,6 +201,8 @@ pub struct ThreadInfo {
     /// it: the program's base name at spawn and execve, the creator's for
     /// a new thread or a forked child.
     pub comm: Vec<u8>,
+    /// `restart_block`: what restart_syscall resumes (ADR 0033).
+    pub restart: Option<crate::sleep::Restart>,
 }
 
 /// A thread name from a path: its last component, cut to 15 bytes
@@ -227,6 +229,7 @@ impl ThreadInfo {
             signals,
             trap: Trap::default(),
             comm,
+            restart: None,
         }
     }
 }
@@ -589,6 +592,7 @@ pub fn clone_thread(
             signals,
             trap: Trap::default(),
             comm,
+            restart: None,
         },
     );
     processes.insert(thread.0, p.clone());

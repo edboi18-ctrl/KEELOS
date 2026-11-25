@@ -10,7 +10,9 @@
 //!
 //! `keel-init --once` runs one shell and exits with its status (the
 //! shell's exit code, or 128 plus the signal that ended it), for the
-//! kernel's self-tests.
+//! kernel's self-tests. `--shell PATH [ARG ...]`, last, runs PATH with
+//! those arguments instead (argv[0] is PATH), such as
+//! `--shell /bin/busybox sh` for BusyBox's shell.
 //!
 //! Safe Rust on keel-rt, like keel-shell.
 #![no_std]
@@ -26,7 +28,68 @@ const EINTR: i64 = -4;
 /// include/uapi/asm-generic/ioctls.h.
 const TIOCSCTTY: u64 = 0x540E;
 
-const SHELL: &CStr = c"/bin/keel-shell";
+/// The shell to run: NUL-terminated strings in a fixed buffer.
+struct Shell {
+    buf: [u8; 1024],
+    used: usize,
+    /// (start, length) of each argument; the first is also the path.
+    spans: [(usize, usize); 16],
+    count: usize,
+    /// The first argument that is argv: 1 for the default, whose argv[0]
+    /// is not its path.
+    argv_from: usize,
+}
+
+impl Shell {
+    /// `/bin/keel-shell`, argv `keel-shell`; or what follows `--shell`.
+    fn from_args(startup: &Startup) -> Option<Self> {
+        let mut shell = Shell {
+            buf: [0; 1024],
+            used: 0,
+            spans: [(0, 0); 16],
+            count: 0,
+            argv_from: 0,
+        };
+        let mut args = startup.args().skip(1).skip_while(|a| *a != b"--shell");
+        if args.next().is_some() {
+            for a in args {
+                shell.push(a)?;
+            }
+            if shell.count == 0 {
+                return None;
+            }
+        } else {
+            shell.push(b"/bin/keel-shell")?;
+            shell.push(b"keel-shell")?;
+            shell.argv_from = 1;
+        }
+        Some(shell)
+    }
+
+    fn push(&mut self, arg: &[u8]) -> Option<()> {
+        let end = self.used + arg.len();
+        if end >= self.buf.len() || self.count == self.spans.len() || arg.contains(&0) {
+            return None;
+        }
+        self.buf[self.used..end].copy_from_slice(arg);
+        self.buf[end] = 0;
+        self.spans[self.count] = (self.used, arg.len());
+        self.count += 1;
+        self.used = end + 1;
+        Some(())
+    }
+
+    fn arg(&self, i: usize) -> &CStr {
+        let (start, len) = self.spans[i];
+        CStr::from_bytes_until_nul(&self.buf[start..=start + len]).unwrap_or(c"")
+    }
+
+    fn path(&self) -> &[u8] {
+        let (start, len) = self.spans[0];
+        &self.buf[start..start + len]
+    }
+}
+
 const ENV: [&CStr; 3] = [
     c"PATH=/bin:/sbin:/usr/bin",
     c"HOME=/",
@@ -86,8 +149,8 @@ fn shell_status(raw: i32) -> i32 {
 }
 
 /// Starts the shell in a new session on the console; its PID.
-fn start_shell() -> i64 {
-    say(&[b"starting /bin/keel-shell\n"]);
+fn start_shell(shell: &Shell) -> i64 {
+    say(&[b"starting ", shell.path(), b"\n"]);
     let pid = sys::fork();
     if pid == 0 {
         // A new session (this child is not a group leader, so setsid
@@ -102,10 +165,19 @@ fn start_shell() -> i64 {
                 b"\n",
             ]);
         }
-        let e = sys::execve(SHELL, Some(&[c"keel-shell"]), &ENV);
+        // argv: the default's own argv[0], or PATH and its arguments.
+        let mut argv = [c""; 16];
+        let mut argc = 0;
+        for i in shell.argv_from..shell.count {
+            argv[argc] = shell.arg(i);
+            argc += 1;
+        }
+        let e = sys::execve(shell.arg(0), Some(&argv[..argc]), &ENV);
         let mut d = [0u8; 20];
         say(&[
-            b"cannot run /bin/keel-shell: error ",
+            b"cannot run ",
+            shell.path(),
+            b": error ",
             decimal(e, &mut d),
             b"\n",
         ]);
@@ -115,10 +187,18 @@ fn start_shell() -> i64 {
 }
 
 fn main(startup: &Startup) -> i32 {
-    let once = startup.args().skip(1).any(|a| a == b"--once");
+    let once = startup
+        .args()
+        .skip(1)
+        .take_while(|a| *a != b"--shell")
+        .any(|a| a == b"--once");
+    let Some(command) = Shell::from_args(startup) else {
+        say(&[b"usage: keel-init [--once] [--shell PATH [ARG ...]]\n"]);
+        return 2;
+    };
     loop {
         let started = now_ms();
-        let shell = start_shell();
+        let shell = start_shell(&command);
         if shell < 0 {
             let mut d = [0u8; 20];
             say(&[b"fork failed: error ", decimal(shell, &mut d), b"\n"]);

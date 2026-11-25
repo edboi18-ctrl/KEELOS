@@ -68,6 +68,11 @@ pub enum Errno {
     ERESTARTSYS = 512,
     /// `ERESTARTNOHAND`: restarted if no handler runs, else EINTR.
     ERESTARTNOHAND = 514,
+    /// `ERESTART_RESTARTBLOCK`: if no handler runs, the call becomes
+    /// restart_syscall(2), which resumes it from the thread's restart
+    /// record; else EINTR (ADR 0033).
+    #[allow(non_camel_case_types)] // Linux's name
+    ERESTART_RESTARTBLOCK = 516,
 }
 
 impl Errno {
@@ -79,6 +84,9 @@ impl Errno {
     /// Whether this is a restart request, which the return to user mode
     /// turns into a restart or EINTR.
     pub fn is_restart(self) -> bool {
-        matches!(self, Errno::ERESTARTSYS | Errno::ERESTARTNOHAND)
+        matches!(
+            self,
+            Errno::ERESTARTSYS | Errno::ERESTARTNOHAND | Errno::ERESTART_RESTARTBLOCK
+        )
     }
 }

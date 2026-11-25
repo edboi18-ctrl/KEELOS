@@ -297,6 +297,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/sleepprobe",
+        binary: "sleepprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/shellprobe",
         binary: "shellprobe",
         args: &[],
@@ -472,6 +480,17 @@ pub const TEST_FIXTURES: &[TestFixture] = &[
         path: "lib/ld-musl-x86_64.so.1",
         file: "fixtures/musl-dynamic/ld-musl-x86_64.so.1",
         hash_file: "fixtures/musl-dynamic/ld-musl.sha256",
+        stdout: None,
+        host_via: None,
+    },
+    // P3-T13 part 2: static BusyBox 1.37.0 (fixtures/busybox, built by the
+    // owner from the pinned source). At /bin/busybox, the path it was
+    // configured with (CONFIG_BUSYBOX_EXEC_PATH), which `--install`
+    // links its applets to. Not run on the host.
+    TestFixture {
+        path: "bin/busybox",
+        file: "fixtures/busybox/busybox",
+        hash_file: "fixtures/busybox/busybox.sha256",
         stdout: None,
         host_via: None,
     },

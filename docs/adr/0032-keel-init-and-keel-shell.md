@@ -1,6 +1,6 @@
 # ADR 0032: keel-init and keel-shell
 
-Status: accepted (Phase 3, P3-T13 part 1).
+Status: accepted (Phase 3, P3-T13 parts 1 and 2).
 
 ## Context
 
@@ -38,7 +38,11 @@ messages are musl's: `strsignal` (`src/string/strsignal.c`) and
    - prints `keel-init: starting /bin/keel-shell` each time, the line
      `cargo xtask boot-check` now waits for;
    - with `--once`, runs one shell and exits with its status, for the
-     self-tests.
+     self-tests;
+   - with `--shell PATH [ARG ...]`, last on its command line, runs PATH
+     with those arguments (argv[0] is PATH) instead of keel-shell: the
+     "optional second shell" P3-T13 asks for, as `--shell /bin/busybox
+     sh` (part 2).
 3. **keel-shell** (`user/keel-shell`):
    - **Input:** standard input, a script file or `-c STRING`. It is
      interactive when it reads standard input and fds 0 and 2 are both
@@ -216,11 +220,53 @@ messages are musl's: `strsignal` (`src/string/strsignal.c`) and
     the shell's status not passed on (`console.shell`: keel-init
     exits 0).
 
+## Part 2: BusyBox
+
+- **The binary:** `fixtures/busybox` builds BusyBox 1.37.0 from its
+  pinned source, with Alpine 3.24's configuration made static, in the
+  pinned Alpine image. The owner built it twice with Docker Desktop and
+  got the same bytes (`fixtures/busybox/README.md`).
+  - It is static PIE, with no interpreter: the configuration has PIE
+    off, but with this toolchain BusyBox's `-static` link (without
+    `-no-pie`) gave a static PIE. Keel loads those at a random bias, as
+    it does `heap64`.
+  - It sits at `/bin/busybox` in test builds, the path it was configured
+    with (`CONFIG_BUSYBOX_EXEC_PATH`), which `busybox --install` links
+    its applets to.
+  - It is not run on the host and not in release images.
+- **The kernel calls it needed:** nanosleep, clock_nanosleep,
+  restart_syscall and rt_sigsuspend (ADR 0033). Everything else BusyBox
+  `sh` and the applets below use was already there.
+- **Not yet done:** BusyBox's own test suite (`testsuite.tar`, committed
+  with the binary) as a conformance suite for Keel.
+
+Evidence: **`console.busybox` (phase 3), Phase 3 acceptance item 3.**
+The kernel starts `/sbin/keel-init --once --shell /bin/busybox sh`, as a
+normal boot starts keel-init, and types on COM1 through the UART's
+loopback. Each command writes its result to a file in /tmp, and the test
+waits for that file before typing the next line. Keys for a foreground
+job wait for the console's foreground group to change hands. The test
+checks:
+- `/bin/busybox mkdir /tmp/bb`, `--install -s /tmp/bb`, then PATH set to
+  the links;
+- `readlink /proc/$$/exe` gives `/bin/busybox`: the shell on the console
+  is BusyBox's;
+- `ls /etc` gives `keel-release`;
+- the pipeline `echo hi | cat | tr a-z A-Z` gives `HI`;
+- `sleep 1 &`: `jobs` shows it running, and `wait` gives 0;
+- `cat` in the foreground, ^Z: `jobs` shows it stopped; `fg`, a line and
+  ^D end it with `$?` 0;
+- `exit 3`: keel-init exits 3.
+
+Mutations: keel-init ignoring `--shell`, caught by `console.busybox`
+only once the `readlink` check was added (keel-shell, run in BusyBox's
+place, passes every other step); the kernel's, in ADR 0033.
+
 ## Consequences
 
 - A normal boot ends at a shell on the console. With a serial cable or
   a PS/2 keyboard, a user can run commands and stop, resume and
   background jobs.
-- The shell is the job-control client the next steps use: BusyBox `sh`
-  for acceptance item 3 (part 2), and later Wine's processes started
-  from it.
+- The shell is the job-control client the next steps use, and later
+  Wine's processes are started from it. BusyBox `sh` runs on the console
+  the same way (acceptance item 3).
