@@ -12,6 +12,13 @@ Needs Docker (Docker Desktop on Windows, or Docker in WSL or Linux).
     .\build.ps1        # Windows PowerShell
     ./build.sh         # Linux or WSL
 
+Behind a proxy, set it in the same window first (for example
+`$env:HTTPS_PROXY = 'http://host:port'` and `$env:HTTP_PROXY`); the
+scripts pass it to the build. Docker does not hand a shell's environment
+to `docker build`, so without that the build's `apk` and `wget` try to
+connect directly. Docker Desktop's own proxy setting (Settings,
+Resources, Proxies) also works.
+
 Everything is pinned:
 
 - **The image:** `alpine:3.24.4@sha256:f59abe65...71bf`, the same image
@@ -47,9 +54,9 @@ The build writes these to `out/`:
 ## Reproducing
 
 A second build from the same recipe must give the same `busybox.sha256`
-and `testsuite.sha256`. Build twice (the second time with
-`docker build --no-cache --output type=local,dest=out2 .`) and compare
-the hashes before committing anything.
+and `testsuite.sha256`. Build twice, the second time from scratch
+(`.\build.ps1 -NoCache -Out out2`, or `./build.sh --no-cache out2`), and
+compare the hashes before committing anything.
 
 To commit, copy from `out/` into this directory: `busybox`,
 `busybox.sha256`, `busybox.config`, `applets.txt`, `testsuite.tar`,
