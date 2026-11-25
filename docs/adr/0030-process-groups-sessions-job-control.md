@@ -136,16 +136,18 @@ The rules are Linux v6.12's:
 - **Stopping and continuing**, WUNTRACED and WCONTINUED,
   `kill_orphaned_pgrp`, SIGCHLD and its auto-reaping, and restarting the
   call a background check interrupts: done in ADR 0031.
-- **Zombies** are not in their group: Linux keeps a zombie findable
-  (getpgid, kill, setpgid's group check) until it is reaped, Keel only
-  through its parent's wait records.
+- **Zombies** are not in their group for getpgid and getsid: Linux
+  keeps a zombie findable until it is reaped, Keel only through its
+  parent's wait records. (setpgid's target and group check, TIOCSPGRP
+  and kill of a group find zombies since ADR 0032.)
 - **kill with a thread's TID** is ESRCH; Linux signals its process.
 - **TIOCVHANGUP**, `vhangup(2)`, TIOCCONS.
 
 ## Evidence
 
 - **`exec.job_control` (phase 3) and `host.jobprobe`:**
-  `user/tests/jobprobe` makes 62 checks, which pass under Linux (as root
+  `user/tests/jobprobe` makes 62 checks (67 since ADR 0032 added
+  groups of zombies), which pass under Linux (as root
   and as an unprivileged user with umask 077) and on Keel. Each part runs
   in a child that makes its own session. Keel runs it twice and measures
   the second run: every node, frame and process is back. The checks:

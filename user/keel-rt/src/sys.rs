@@ -292,13 +292,20 @@ pub fn getppid() -> i64 {
 /// execve(2) of `path` with these arguments (`None`: a NULL argv) and
 /// environment, at most 15 of each. Returns only on failure, with -errno;
 /// on success this program is replaced, so no Rust state of it survives.
+/// Limit on argv and envp entries for [`execve`] (each list keeps one slot
+/// for its NULL).
+pub const EXECVE_MAX: usize = 64;
+
 pub fn execve(path: &CStr, argv: Option<&[&CStr]>, envp: &[&CStr]) -> i64 {
-    let mut args = [0u64; 16];
-    let mut env = [0u64; 16];
-    let Some(argv_list) = argv.map_or(Some(&[][..]), Some).filter(|a| a.len() < 16) else {
+    let mut args = [0u64; EXECVE_MAX];
+    let mut env = [0u64; EXECVE_MAX];
+    let Some(argv_list) = argv
+        .map_or(Some(&[][..]), Some)
+        .filter(|a| a.len() < EXECVE_MAX)
+    else {
         return -7; // E2BIG
     };
-    if envp.len() >= 16 {
+    if envp.len() >= EXECVE_MAX {
         return -7;
     }
     for (slot, arg) in args.iter_mut().zip(argv_list) {

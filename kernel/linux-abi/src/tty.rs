@@ -398,6 +398,12 @@ struct Job {
 /// The console's session and foreground group.
 static CONSOLE_JOB: IrqMutex<Option<Job>> = IrqMutex::new(None);
 
+/// The console's session and foreground group, if it has a session, for
+/// the kernel's tests (they wait for a shell to hand the console over).
+pub fn console_job() -> Option<(u32, u32)> {
+    CONSOLE_JOB.lock().as_ref().map(|j| (j.sid, j.pgrp))
+}
+
 /// Runs `f` on `tty`'s session record; None if the pty is gone.
 fn with_job<R>(tty: &Ctty, f: impl FnOnce(&mut Option<Job>) -> R) -> Option<R> {
     match tty {
@@ -750,7 +756,11 @@ fn tiocspgrp(open: &TtyOpen, arg: u64) -> SysResult {
     }
     // find_vpid, then session_of_pgrp: a member of the group, else the
     // process (or thread) with that PID.
-    let in_group = crate::process::members(&compartment, |q| q.pgid == pgrp);
+    // A zombie counts: it stays in its group until reaped.
+    let mut in_group = crate::process::members(&compartment, |q| q.pgid == pgrp);
+    if in_group.is_empty() {
+        in_group = crate::process::zombies(&compartment, |q| q.pgid == pgrp);
+    }
     let session_of = if let Some(m) = in_group.first() {
         Some(m.lock().sid)
     } else if let Some(p) = crate::process::find_in(&compartment, pgrp) {

@@ -296,6 +296,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: true,
     },
+    TestProgram {
+        path: "test/shellprobe",
+        binary: "shellprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
     // Needs the console as its terminal: Keel only.
     TestProgram {
         path: "test/ctrlc",
@@ -520,6 +528,9 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
                 "keel-user-tests",
                 "--package",
                 "keel-peldr",
+                // Beside the tests, so the host's shellprobe finds it.
+                "--package",
+                "keel-shell",
             ])
             .args(["--target", KERNEL_TARGET])
             .arg("--target-dir")
@@ -528,6 +539,42 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
     )?;
     let out = target_dir.join(KERNEL_TARGET).join("release");
     Ok(TEST_PROGRAMS.iter().map(|p| out.join(p.binary)).collect())
+}
+
+/// Keel's own system programs (P3-T13, ADR 0032), in the initramfs of
+/// every build: (path inside it, package and binary name).
+pub const SYSTEM_PROGRAMS: &[(&str, &str)] = &[
+    ("sbin/keel-init", "keel-init"),
+    ("bin/keel-shell", "keel-shell"),
+];
+
+/// Compiles the system programs as the user tests are (static, non-PIE,
+/// the same target directory and flags) and returns the path of each, in
+/// `SYSTEM_PROGRAMS` order.
+pub fn build_system_programs(root: &Path) -> Result<Vec<PathBuf>> {
+    let target_dir = root.join("target").join("user");
+    let mut flags = target_flags(root);
+    flags.push("-Crelocation-model=static".to_string());
+    flags.push("-Cstrip=debuginfo".to_string());
+    let mut command = Command::new(util::cargo());
+    command
+        .current_dir(root)
+        .args(["build", "--release", "--locked"]);
+    for (_, package) in SYSTEM_PROGRAMS {
+        command.args(["--package", package]);
+    }
+    util::run(
+        command
+            .args(["--target", KERNEL_TARGET])
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f")),
+    )?;
+    let out = target_dir.join(KERNEL_TARGET).join("release");
+    Ok(SYSTEM_PROGRAMS
+        .iter()
+        .map(|(_, binary)| out.join(binary))
+        .collect())
 }
 
 /// Target of the programs in `user/std-tests`, which use Rust's standard
@@ -669,6 +716,9 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
 
     let mut archive = cpio::Archive::default();
     archive.add_tree(&root.join("initramfs"))?;
+    for ((path, _), binary) in SYSTEM_PROGRAMS.iter().zip(build_system_programs(&root)?) {
+        archive.add_file(path, util::read(&binary)?);
+    }
     if let BootMode::Test(..) | BootMode::Fuzz { .. } = mode {
         for (program, binary) in TEST_PROGRAMS.iter().zip(build_user_tests(&root)?) {
             archive.add_file(program.path, util::read(&binary)?);

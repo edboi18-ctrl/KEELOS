@@ -655,6 +655,34 @@ pub fn members(
     found
 }
 
+/// The zombies of `compartment` that `pick` chooses: children that have
+/// exited and that their parent has not reaped. Linux keeps a zombie in
+/// its group and session until it is reaped (`release_task` ->
+/// `__exit_signal` -> `__unhash_process` detaches its PIDTYPE_PGID and
+/// PIDTYPE_SID links), so a group whose members have all exited still
+/// exists for setpgid, TIOCSPGRP and kill until then.
+pub fn zombies(
+    compartment: &Arc<Compartment>,
+    mut pick: impl FnMut(&Process) -> bool,
+) -> Vec<Arc<IrqMutex<Process>>> {
+    let mut found = Vec::new();
+    for parent in members(compartment, |_| true) {
+        let exited: Vec<Arc<IrqMutex<Process>>> = parent
+            .lock()
+            .children
+            .iter()
+            .filter(|c| c.status.is_some())
+            .map(|c| c.process.clone())
+            .collect();
+        for z in exited {
+            if pick(&z.lock()) {
+                found.push(z);
+            }
+        }
+    }
+    found
+}
+
 /// The running process in the caller's compartment with PID `pid`, if any
 /// (kill(2) and tgkill(2) name processes this way).
 pub fn find_in(compartment: &Arc<Compartment>, pid: u32) -> Option<Arc<IrqMutex<Process>>> {

@@ -7,6 +7,8 @@ members = [
     "kernel/linux-abi",
     "kernel/keel-kernel",
     "user/keel-rt",
+    "user/keel-init",
+    "user/keel-shell",
     "user/pe",
     "user/peldr",
     "fuzz/pe-fuzz",

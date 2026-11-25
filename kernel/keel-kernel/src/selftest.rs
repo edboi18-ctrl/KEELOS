@@ -1486,6 +1486,17 @@ pub fn phase1_robustness(t: &mut Runner) {
 }
 
 /// Runs `/test/<name>` with `args` and waits for it.
+/// Frames neither free nor the heap's nor the kernel's page tables: what
+/// a leak-checking test compares before and after. The kernel's tables
+/// are counted because the heap can need a new one when it maps a page
+/// in a range no table covers yet, and tables are never freed: a run that
+/// grows the heap there is no leak.
+fn frames_outside_heap() -> i64 {
+    memory::free_frames() as i64
+        + keel_hal::heap::mapped_pages() as i64
+        + paging::kernel_table_frames() as i64
+}
+
 fn run_test_program(path: &[u8], args: &[&[u8]]) -> Option<(i64, Option<sched::UserFault>)> {
     let file = keel_linux_abi::fs::read_file(path).ok()?;
     let loaded = keel_linux_abi::exec::load(&file, path, args, &[]).ok()?;
@@ -1931,6 +1942,8 @@ fn phase3(t: &mut Runner) {
     phase3_job_control(t);
     phase3_console_interrupt(t);
     phase3_stop_continue(t);
+    phase3_shell(t);
+    phase3_console_shell(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -1950,7 +1963,7 @@ fn phase3(t: &mut Runner) {
 fn phase3_threads(t: &mut Runner) {
     use keel_linux_abi::process;
     const PROGRAM: &[u8] = b"/test/musl-threads";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let (frames, processes) = (outside_heap(), process::count());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
     // The two left-behind threads end at exit_group; give them a moment
@@ -1979,7 +1992,7 @@ fn phase3_threads(t: &mut Runner) {
 fn phase3_signals(t: &mut Runner) {
     use keel_linux_abi::process;
     const PROGRAM: &[u8] = b"/test/musl-signals";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let (frames, processes) = (outside_heap(), process::count());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
     sched::sleep_ms(50);
@@ -2009,7 +2022,7 @@ fn phase3_signals(t: &mut Runner) {
 fn phase3_shared_mappings(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/sharemap";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let (frames, processes) = (outside_heap(), process::count());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
     sched::sleep_ms(50);
@@ -2047,7 +2060,7 @@ fn phase3_shared_mappings(t: &mut Runner) {
 fn phase3_filesystem(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/fsprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
@@ -2086,7 +2099,7 @@ fn phase3_filesystem(t: &mut Runner) {
 fn phase3_descriptors(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/fdprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
@@ -2116,7 +2129,7 @@ fn phase3_descriptors(t: &mut Runner) {
 fn phase3_procfs(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/procprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
@@ -2146,7 +2159,7 @@ fn phase3_procfs(t: &mut Runner) {
 fn phase3_pipes(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/pipeprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
@@ -2174,7 +2187,7 @@ fn phase3_pipes(t: &mut Runner) {
 fn phase3_epoll(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/epollprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
@@ -2203,7 +2216,7 @@ fn phase3_epoll(t: &mut Runner) {
 fn phase3_sockets(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/sockprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     // A first run warms up: it takes the heap to the high-water mark the
     // probe needs (the probe queues about 200 KiB in one socket), whose
@@ -2242,7 +2255,7 @@ fn phase3_sockets(t: &mut Runner) {
 fn phase3_socket_messages(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/scmprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     // A first run warms up: it takes the heap to the high-water mark the
     // probe needs (the probe fills sockets), whose
@@ -2281,7 +2294,7 @@ fn phase3_socket_messages(t: &mut Runner) {
 fn phase3_terminals(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/ttyprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     // As phase3_socket_messages: the first run warms the heap up.
     let warm = run_test_program(PROGRAM, &[PROGRAM]);
@@ -2316,7 +2329,7 @@ fn phase3_terminals(t: &mut Runner) {
 fn phase3_job_control(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/jobprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let warm = run_test_program(PROGRAM, &[PROGRAM]);
     sched::sleep_ms(50);
@@ -2388,7 +2401,7 @@ fn phase3_console_interrupt(t: &mut Runner) {
 fn phase3_stop_continue(t: &mut Runner) {
     use keel_linux_abi::{fs, process};
     const PROGRAM: &[u8] = b"/test/stopprobe";
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
     let warm = run_test_program(PROGRAM, &[PROGRAM]);
     sched::sleep_ms(50);
@@ -2412,6 +2425,134 @@ fn phase3_stop_continue(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  stopprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T13 (ADR 0032): user/tests/shellprobe, which passes under Linux
+/// too (`host.shellprobe`): keel-shell runs a script on a pipe, then an
+/// interactive session on a pty with job control. Run twice; after the
+/// second run every node, frame and process is back.
+fn phase3_shell(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/shellprobe";
+    let outside_heap = frames_outside_heap;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.shell",
+        ok,
+        "keel-shell as on Linux: a script's quoting, parameters, lists, pipelines, redirections, PATH search, statuses (1, 127, 143), &, wait, export, cd; on a pty, ^Z and jobs, fg, ^C (130), a background reader stopped by SIGTTIN, bg and wait, ^C at the prompt; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  shellprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T13 (ADR 0032): what a normal boot runs, on the real console.
+/// `/sbin/keel-init --once` starts `/bin/keel-shell` in a session that
+/// has the console as its controlling terminal. Typed on COM1 through the
+/// UART's loopback: `cat`, ^Z (the job stops), `jobs` into a file, `fg`,
+/// a line, ^D, `$?` into a file, `exit 3` (keel-init exits with the
+/// shell's status). Each key waits for the console's
+/// foreground group to change hands, so it reaches the job or the shell
+/// as intended. If a step fails, ^C and `exit` end the shell so later
+/// tests have the console.
+fn phase3_console_shell(t: &mut Runner) {
+    use keel_linux_abi::{exec, fs, process, tty};
+    const INIT: &[u8] = b"/sbin/keel-init";
+    // Up to 5 s for the console's (session, foreground group) to satisfy
+    // `pick`.
+    let until = |pick: &dyn Fn(u32, u32) -> bool| {
+        for _ in 0..500 {
+            if tty::console_job().is_some_and(|(s, g)| pick(s, g)) {
+                return true;
+            }
+            sched::sleep_ms(10);
+        }
+        false
+    };
+    // At most 14 bytes go to the UART at a time (its FIFO is 16).
+    let type_text = |text: &[u8]| {
+        text.chunks(14).all(|c| {
+            let ok = tty::type_serial(c);
+            sched::sleep_ms(30);
+            ok
+        })
+    };
+    let spawned = fs::read_file(INIT)
+        .ok()
+        .and_then(|file| exec::load(&file, INIT, &[INIT, b"--once"], &[]).ok())
+        .and_then(|loaded| process::spawn("keel-init", &loaded).ok());
+    let mut failed_at = 0;
+    if let Some(spawned) = &spawned {
+        // The shell leads a session on the console, its group in front.
+        let ready = until(&|s, g| s != 0 && s == g);
+        let sid = tty::console_job().map_or(0, |(s, _)| s);
+        let steps: [&dyn Fn() -> bool; 8] = [
+            &|| ready,
+            &|| type_text(b"cat\n") && until(&|_, g| g != sid),
+            // The job has the console; a pause so it has reset SIGTSTP.
+            &|| {
+                sched::sleep_ms(150);
+                type_text(b"\x1a") && until(&|_, g| g == sid)
+            },
+            &|| type_text(b"jobs >/tmp/kj\n"),
+            &|| type_text(b"fg\n") && until(&|_, g| g != sid),
+            &|| {
+                sched::sleep_ms(150);
+                type_text(b"x\n")
+            },
+            &|| {
+                sched::sleep_ms(100);
+                type_text(b"\x04") && until(&|_, g| g == sid)
+            },
+            &|| type_text(b"echo $? >/tmp/ks\n") && type_text(b"exit 3\n"),
+        ];
+        for (i, step) in steps.iter().enumerate() {
+            if !step() {
+                failed_at = i + 1;
+                type_text(b"\x03\x04\x03exit\nexit\n");
+                break;
+            }
+        }
+        join(spawned.thread);
+    }
+    let status = spawned.as_ref().and_then(|s| sched::exit_status(s.thread));
+    let jobs = fs::read_file(b"/tmp/kj").ok();
+    let last = fs::read_file(b"/tmp/ks").ok();
+    let ok = failed_at == 0
+        && status == Some((3, None))
+        && jobs.as_deref().map(|v| v.as_slice()) == Some(b"[1]+ Stopped\tcat\n")
+        && last.as_deref().map(|v| v.as_slice()) == Some(b"0\n");
+    t.check(
+        "console.shell",
+        ok,
+        "a normal boot's /sbin/keel-init starts /bin/keel-shell with the console as its controlling terminal; typed on COM1, ^Z stops a job, jobs lists it, fg resumes it, ^D ends it with status 0, and exit 3 ends the shell and keel-init with status 3",
+    );
+    if !ok {
+        kprintln!(
+            "  console shell: spawned {}, failed at step {failed_at}, keel-init {status:?}, jobs {:?}, status {:?}",
+            spawned.is_some(),
+            jobs.as_deref()
+                .map(|v| core::str::from_utf8(v).unwrap_or("?")),
+            last.as_deref()
+                .map(|v| core::str::from_utf8(v).unwrap_or("?")),
         );
     }
 }
@@ -2502,7 +2643,7 @@ fn phase3_hostile_executables(t: &mut Runner) {
 fn phase3_shared_frame_limit(t: &mut Runner) {
     const PROGRAM: &[u8] = b"/test/forkprobe";
     const LIMIT: u16 = 12;
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let before = outside_heap();
     let previous = memory::set_reference_limit(LIMIT);
     let status = run_test_program(PROGRAM, &[PROGRAM, b"sharers"]);
@@ -2532,7 +2673,7 @@ fn phase3_fork(t: &mut Runner) {
     // after a run: the scheduler keeps the exit statuses of the last 1024
     // threads (audit 2, A7.2), and this run ends 22, so that table grows
     // until it is full. Every other frame must come back.
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let (frames, processes) = (outside_heap(), process::count());
     let status = run_test_program(PROGRAM, &[PROGRAM]);
     let (frames_after, processes_after) = (outside_heap(), process::count());
@@ -2608,7 +2749,7 @@ fn phase3_execve(t: &mut Runner) {
     const PROGRAM: &[u8] = b"/test/execprobe";
     // Frames outside the kernel heap, which may keep a page for the
     // tables a run grows (as in exec.fork_wait).
-    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let outside_heap = frames_outside_heap;
     let before = outside_heap();
     let status = run_test_program(PROGRAM, &[PROGRAM]);
     let after = outside_heap();

@@ -405,10 +405,11 @@ pub fn dist(version: Option<String>, allow_dirty: bool) -> Result<PathBuf> {
 }
 
 /// `cargo xtask boot-check <image>`: boots a raw disk image headless and
-/// passes once the kernel reports the end of a normal boot. This proves a
-/// release image is bootable by real UEFI firmware code (OVMF).
+/// passes once a normal boot has reached user space: `/sbin/keel-init`
+/// starting the shell on the console (ADR 0032). This proves a release
+/// image is bootable by real UEFI firmware code (OVMF).
 pub fn boot_check(image: &Path, options: &qemu::RunOptions) -> Result<()> {
-    qemu::boot_image_until(image, options, "Keel: nothing more to run yet")
+    qemu::boot_image_until(image, options, "keel-init: starting /bin/keel-shell")
 }
 
 #[cfg(test)]

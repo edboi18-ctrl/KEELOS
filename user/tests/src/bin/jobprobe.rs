@@ -756,6 +756,73 @@ fn leader_exit(_: &[u8]) -> i32 {
     0
 }
 
+fn zombie_group(_: &[u8]) -> i32 {
+    // 29. A group whose only member has exited and is not reaped yet still
+    //    exists: Linux detaches a task from its group only in
+    //    `release_task` (`__unhash_process`, kernel/exit.c), and setpgid
+    //    and TIOCSPGRP take any task `pid_task(.., PIDTYPE_PGID)` finds.
+    //    A shell relies on it: the first command of a pipeline can exit
+    //    before the next one joins its group.
+    let me = pid();
+    let Some((m, s, _)) = openpty() else {
+        return 63;
+    };
+    if sys::ioctl_value(s, TIOCSCTTY, 0) != 0 {
+        return 63;
+    }
+    disposition(SIGTTOU, 1);
+    let (gate, open) = pipe();
+    let (up_r, up_w) = pipe();
+    let first = spawn(move || {
+        sys::close(open);
+        sys::setpgid(0, 0);
+        sys::write(up_w, b"u");
+        let mut b = [0u8; 1];
+        sys::read(gate, &mut b);
+        0
+    });
+    if await_byte(up_r).is_none() {
+        return 63;
+    }
+    // Released: it exits and stays a zombie until reaped below.
+    sys::write(open, b"g");
+    nap(100);
+    if sys::kill(-first, 0) != 0 {
+        return 63;
+    }
+    if set_int(s, TIOCSPGRP, first) != 0 || int_ioctl(s, TIOCGPGRP) != Ok(first) {
+        return 64;
+    }
+    let (gate2, open2) = pipe();
+    let second = waiter(gate2);
+    if sys::setpgid(second, first) != 0 || sys::getpgid(second) != i64::from(first) {
+        return 65;
+    }
+    // 31. An exited child not yet reaped can still be moved to a group
+    //    (setpgid finds it with `find_task_by_vpid`): wait4 by that group
+    //    then reaps it.
+    let late = spawn(|| 9);
+    nap(100);
+    let mut st = 0;
+    if sys::setpgid(late, late) != 0
+        || sys::wait4(-late, &mut st, 0) != i64::from(late)
+        || (st >> 8) & 0xff != 9
+    {
+        return 67;
+    }
+    // 30. Reaped, and its last member gone, the number names nothing.
+    set_int(s, TIOCSPGRP, me);
+    sys::write(open2, b"x");
+    if outcome(reap(second)) != 0 || outcome(reap(first)) != 0 || sys::kill(-first, 0) != ESRCH {
+        return 66;
+    }
+    // Closing the master hangs the slave up: this leader's SIGHUP.
+    disposition(SIGHUP, 1);
+    sys::close(m);
+    sys::close(s);
+    0
+}
+
 fn main(startup: &Startup) -> i32 {
     let mut args = startup.args();
     let argv0 = args.next().unwrap_or(b"/test/jobprobe");
@@ -769,13 +836,13 @@ fn main(startup: &Startup) -> i32 {
             nap(10_000);
         }
     }
-    for part in [ids, ctty, leader_exit] {
+    for part in [ids, ctty, leader_exit, zombie_group] {
         let failed = in_session(part, argv0);
         if failed != 0 {
             return failed;
         }
     }
-    sys::write(1, b"jobprobe: 62 checks passed\n");
+    sys::write(1, b"jobprobe: 67 checks passed\n");
     0
 }
 

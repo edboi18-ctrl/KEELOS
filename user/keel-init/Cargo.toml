@@ -1,0 +1,17 @@
+[package]
+name = "keel-init"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "keel-init"
+test = false
+bench = false
+
+[dependencies]
+keel-rt = { path = "../keel-rt" }
+
+[lints]
+workspace = true

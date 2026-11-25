@@ -232,8 +232,37 @@ extern "C" fn kmain_on_boot_stack() -> ! {
         });
     }
 
-    kprintln!("Keel: nothing more to run yet; halting.");
+    // P3-T13 (ADR 0032): a normal boot runs /sbin/keel-init, which keeps
+    // a shell on the console. This thread waits for it; the scheduler runs
+    // everything else meanwhile.
+    match start_init() {
+        Ok(spawned) => {
+            kprintln!("Keel: started {} (PID {})", INIT_DISPLAY, spawned.pid);
+            sched::join(spawned.thread);
+            match sched::exit_status(spawned.thread) {
+                Some((status, None)) => {
+                    kprintln!("Keel: {INIT_DISPLAY} exited with status {status}; halting.")
+                }
+                Some((_, Some(fault))) => {
+                    kprintln!("Keel: {INIT_DISPLAY} ended by a fault ({fault:?}); halting.")
+                }
+                None => kprintln!("Keel: {INIT_DISPLAY} ended; halting."),
+            }
+        }
+        Err(why) => kprintln!("Keel: cannot start {INIT_DISPLAY} ({why}); halting."),
+    }
     halt_forever();
+}
+
+const INIT: &[u8] = b"/sbin/keel-init";
+const INIT_DISPLAY: &str = "/sbin/keel-init";
+
+/// Loads and starts the first user program, with the console on fds 0-2.
+fn start_init() -> Result<keel_linux_abi::process::Spawned, &'static str> {
+    let file = keel_linux_abi::fs::read_file(INIT).map_err(|_| "not in the initramfs")?;
+    let loaded =
+        keel_linux_abi::exec::load(&file, INIT, &[INIT], &[]).map_err(|_| "not a valid program")?;
+    keel_linux_abi::process::spawn("keel-init", &loaded).map_err(|_| "no process could be made")
 }
 
 fn on_off(enabled: bool) -> &'static str {

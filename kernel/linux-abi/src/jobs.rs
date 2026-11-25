@@ -56,17 +56,30 @@ pub fn setpgid(p: &ProcessRef, pid: i32, pgid: i32) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let pgid = pgid as u32;
-    let (target, thread) = task(&compartment, pid).ok_or(Errno::ESRCH)?;
+    // A child that has exited and is not reaped yet is still found
+    // (`find_task_by_vpid`: its PID link lasts until `release_task`), and
+    // its group can still change.
+    let zombie = || {
+        p.lock()
+            .children
+            .iter()
+            .find(|c| c.pid == pid && c.status.is_some())
+            .map(|c| c.process.clone())
+    };
+    let (target, thread, zombie) = match task(&compartment, pid) {
+        Some((t, thread)) => (t, thread, false),
+        None => (zombie().ok_or(Errno::ESRCH)?, false, true),
+    };
     if thread {
         return Err(Errno::EINVAL);
     }
     let (child, sid, execed, leader) = {
         let t = target.lock();
-        let child = t
-            .parent
-            .as_ref()
-            .and_then(alloc::sync::Weak::upgrade)
-            .is_some_and(|parent| Arc::ptr_eq(&parent, p));
+        let child = zombie
+            || t.parent
+                .as_ref()
+                .and_then(alloc::sync::Weak::upgrade)
+                .is_some_and(|parent| Arc::ptr_eq(&parent, p));
         (child, t.sid, t.execed, t.leader)
     };
     if child {
@@ -85,8 +98,10 @@ pub fn setpgid(p: &ProcessRef, pid: i32, pgid: i32) -> SysResult {
     if pgid != pid {
         // pid_task(pgrp, PIDTYPE_PGID): a member, in the caller's session
         // (a group's members share one).
-        let joinable =
-            !process::members(&compartment, |q| q.pgid == pgid && q.sid == my_sid).is_empty();
+        // A zombie counts: it stays in its group until reaped.
+        let pick = |q: &Process| q.pgid == pgid && q.sid == my_sid;
+        let joinable = !process::members(&compartment, pick).is_empty()
+            || !process::zombies(&compartment, pick).is_empty();
         if !joinable {
             return Err(Errno::EPERM);
         }
@@ -139,7 +154,9 @@ pub fn setsid(p: &ProcessRef) -> SysResult {
 /// (`__kill_pgrp_info`); signal 0 sends nothing. ESRCH for an empty group.
 pub fn kill_group(compartment: &Arc<Compartment>, pgid: u32, info: SigInfo) -> Result<(), Errno> {
     let members = process::members(compartment, |q| q.pgid == pgid);
-    if members.is_empty() {
+    // A group of zombies only still exists (`__kill_pgrp_info` finds them
+    // until they are reaped): the signal is accepted and goes nowhere.
+    if members.is_empty() && process::zombies(compartment, |q| q.pgid == pgid).is_empty() {
         return Err(Errno::ESRCH);
     }
     if info.signo != 0 {
