@@ -18,9 +18,12 @@
 # Every installed package and its version goes to packages.txt, so a
 # rebuild can be compared exactly.
 FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS build
-RUN apk add --no-cache gcc musl-dev make linux-headers tar
+# curl fetches the source: BusyBox's own wget cannot go through a proxy
+# to an https:// URL (networking/wget.c sends "GET https://..." to the
+# proxy and never CONNECT), which a proxy may answer with a redirect loop.
+RUN apk add --no-cache gcc musl-dev make linux-headers tar curl
 WORKDIR /src
-RUN wget -q https://busybox.net/downloads/busybox-1.37.0.tar.bz2 \
+RUN curl -fsSLO --proto =https https://busybox.net/downloads/busybox-1.37.0.tar.bz2 \
  && echo "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4  busybox-1.37.0.tar.bz2" \
     | sha256sum -c - \
  && tar -xjf busybox-1.37.0.tar.bz2

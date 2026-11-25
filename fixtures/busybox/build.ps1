@@ -22,7 +22,7 @@ if ($NoCache) { $dockerArgs += "--no-cache" }
 foreach ($name in "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY") {
     $value = [Environment]::GetEnvironmentVariable($name)
     if ($value) {
-        # Both spellings: apk and BusyBox's wget read the lower-case one.
+        # Both spellings: apk and curl read the lower-case ones.
         $dockerArgs += "--build-arg", "$name=$value"
         $dockerArgs += "--build-arg", "$($name.ToLower())=$value"
     }

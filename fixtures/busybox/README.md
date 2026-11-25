@@ -15,7 +15,7 @@ Needs Docker (Docker Desktop on Windows, or Docker in WSL or Linux).
 Behind a proxy, set it in the same window first (for example
 `$env:HTTPS_PROXY = 'http://host:port'` and `$env:HTTP_PROXY`); the
 scripts pass it to the build. Docker does not hand a shell's environment
-to `docker build`, so without that the build's `apk` and `wget` try to
+to `docker build`, so without that the build's `apk` and `curl` try to
 connect directly. Docker Desktop's own proxy setting (Settings,
 Resources, Proxies) also works.
 
