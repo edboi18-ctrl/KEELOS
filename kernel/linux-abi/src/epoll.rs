@@ -13,12 +13,11 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 
 use keel_core::epoll::{
-    self as ep, EPOLLEXCLUSIVE, EPOLLEXCLUSIVE_OK_BITS, EPOLLIN, EPOLLRDNORM, EVENT_SIZE, Interest,
-    MAX_EVENTS, Set, Wakes,
+    self as ep, EPOLLEXCLUSIVE, EPOLLEXCLUSIVE_OK_BITS, EVENT_SIZE, Interest, MAX_EVENTS, Set,
+    Wakes,
 };
 use keel_core::errno::Errno;
 use keel_core::handle::{Handle, Rights};
-use keel_core::vfs::{Device, Kind};
 use keel_hal::sched::{self, Waited};
 use keel_hal::sync::IrqMutex;
 use keel_hal::vm::{copy_from_user, copy_to_user};
@@ -33,17 +32,6 @@ type SysResult = Result<u64, Errno>;
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
-
-/// The console's read queue (`tty->read_wait`): woken at each finished
-/// line.
-static CONSOLE_WAKES: IrqMutex<Wakes> = IrqMutex::new(Wakes::new());
-
-/// A line (or an end of file) is ready on the console:
-/// `n_tty_receive_handle_newline` wakes its readers with EPOLLIN |
-/// EPOLLRDNORM. The caller then wakes the readiness queue.
-pub fn console_line() {
-    CONSOLE_WAKES.lock().wake(EPOLLIN | EPOLLRDNORM);
-}
 
 /// An item's key: its target's identity and the descriptor number.
 type Key = (usize, i32);
@@ -95,7 +83,7 @@ pub struct EpollFile {
 fn can_poll(object: &Object) -> Result<(), Errno> {
     match object {
         Object::Pipe(_) | Object::EventFd(_) | Object::Epoll(_) | Object::Socket(_) => Ok(()),
-        Object::File(file) if file.lock().kind == Kind::Device(Device::Console) => Ok(()),
+        Object::File(file) if file.lock().tty.is_some() => Ok(()),
         Object::File(_) => Err(Errno::EPERM),
     }
 }
@@ -135,7 +123,11 @@ fn wakes_of(object: &Object) -> Wakes {
             }
         }
         Object::EventFd(file) => file.counter.lock().wakes,
-        Object::File(_) => *CONSOLE_WAKES.lock(),
+        // A terminal's read and write queues (`n_tty_poll`).
+        Object::File(file) => {
+            let tty = file.lock().tty.clone();
+            tty.map_or(Wakes::new(), |t| t.wakes())
+        }
         Object::Epoll(_) => Wakes::new(),
         Object::Socket(s) => s.wakes(),
     }

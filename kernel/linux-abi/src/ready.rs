@@ -188,6 +188,7 @@ pub fn memfd_create(p: &ProcessRef, name: u64, flags: u64) -> SysResult {
         append: false,
         status: crate::abi::O_RDWR | crate::abi::O_LARGEFILE,
         comm: None,
+        tty: None,
     };
     let fd = p.lock().handles.insert(Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),
@@ -547,24 +548,15 @@ pub fn object_ready(object: &Object, rights: Rights) -> u16 {
     use keel_core::poll::*;
     let ready = match object {
         Object::File(file) => {
-            // Copy the kind out: the file lock is not held while the
+            // Copy the terminal out: the file lock is not held while the
             // terminal's is taken.
-            let kind = file.lock().kind;
-            match kind {
-                // n_tty_poll: writable while output has room (console
-                // output never waits); readable once a line or end of
-                // file is ready.
-                keel_core::vfs::Kind::Device(keel_core::vfs::Device::Console) => {
-                    let input = if crate::tty::readable() {
-                        POLLIN | POLLRDNORM
-                    } else {
-                        0
-                    };
-                    input | POLLOUT | POLLWRNORM
-                }
+            let tty = file.lock().tty.clone();
+            match tty {
+                // n_tty_poll (the event bits are poll's).
+                Some(tty) => crate::tty::poll(&tty) as u16,
                 // Regular files, directories, /dev/null, /dev/zero and
                 // /dev/urandom have no poll method: DEFAULT_POLLMASK.
-                _ => DEFAULT_POLLMASK,
+                None => DEFAULT_POLLMASK,
             }
         }
         other => poll_mask(other).unwrap_or(0),

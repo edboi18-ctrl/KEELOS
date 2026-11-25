@@ -7,10 +7,7 @@
 //! `include/uapi/linux/mman.h` (PROT_*, MAP_*), `arch/x86/include/uapi/asm/
 //! prctl.h` (ARCH_*), `arch/x86/include/uapi/asm/stat.h` (struct stat,
 //! x86-64 branch), `include/linux/kdev_t.h` (`new_encode_dev`),
-//! `include/uapi/asm-generic/ioctls.h` and `termbits.h` (TCGETS,
-//! TIOCGWINSZ, struct termios, NCCS 19), `drivers/tty/tty_io.c`
-//! (`tty_std_termios`) and `include/linux/termios_internal.h`
-//! (`INIT_C_CC`), `include/uapi/linux/time.h` (CLOCK_*),
+//! `include/uapi/linux/time.h` (CLOCK_*),
 //! `include/uapi/linux/random.h` (GRND_*), `include/uapi/linux/uio.h`
 //! (UIO_MAXIOV), `include/linux/fs.h` (MAX_RW_COUNT).
 
@@ -168,66 +165,6 @@ pub fn timespec_bytes(nanos: u64) -> [u8; 16] {
     out
 }
 
-/// `struct termios` (36 bytes: four u32 flag words, c_line, c_cc[19])
-/// with Linux's `tty_std_termios` values: iflag ICRNL|IXON, oflag
-/// OPOST|ONLCR, cflag B38400|CS8|CREAD|HUPCL, lflag ISIG|ICANON|ECHO|
-/// ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN, and `INIT_C_CC`.
-pub fn std_termios_bytes() -> [u8; 36] {
-    const ICRNL: u32 = 0x100;
-    const IXON: u32 = 0x400;
-    const OPOST: u32 = 0x01;
-    const ONLCR: u32 = 0x04;
-    const B38400: u32 = 0x0f;
-    const CS8: u32 = 0x30;
-    const CREAD: u32 = 0x80;
-    const HUPCL: u32 = 0x400;
-    const ISIG: u32 = 0x1;
-    const ICANON: u32 = 0x2;
-    const ECHO: u32 = 0x8;
-    const ECHOE: u32 = 0x10;
-    const ECHOK: u32 = 0x20;
-    const ECHOCTL: u32 = 0x200;
-    const ECHOKE: u32 = 0x800;
-    const IEXTEN: u32 = 0x8000;
-    let ctrl = |c: u8| c - 0x40;
-    let mut out = [0u8; 36];
-    let flags = [
-        ICRNL | IXON,
-        OPOST | ONLCR,
-        B38400 | CS8 | CREAD | HUPCL,
-        ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
-    ];
-    for (i, f) in flags.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
-    }
-    // out[16] = c_line 0 (N_TTY). c_cc starts at 17; indices are VINTR 0,
-    // VQUIT 1, VERASE 2, VKILL 3, VEOF 4, VMIN 6, VSTART 8, VSTOP 9,
-    // VSUSP 10, VREPRINT 12, VDISCARD 13, VWERASE 14, VLNEXT 15.
-    let cc = &mut out[17..36];
-    cc[0] = ctrl(b'C');
-    cc[1] = ctrl(b'\\');
-    cc[2] = 0o177;
-    cc[3] = ctrl(b'U');
-    cc[4] = ctrl(b'D');
-    cc[6] = 1;
-    cc[8] = ctrl(b'Q');
-    cc[9] = ctrl(b'S');
-    cc[10] = ctrl(b'Z');
-    cc[12] = ctrl(b'R');
-    cc[13] = ctrl(b'O');
-    cc[14] = ctrl(b'W');
-    cc[15] = ctrl(b'V');
-    out
-}
-
-/// `struct winsize`: rows, columns, then two unused pixel sizes (u16).
-pub fn winsize_bytes(rows: u16, cols: u16) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[..2].copy_from_slice(&rows.to_le_bytes());
-    out[2..4].copy_from_slice(&cols.to_le_bytes());
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,23 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn termios_matches_tty_std_termios() {
-        let t = std_termios_bytes();
-        let word = |i: usize| u32::from_le_bytes(t[i * 4..i * 4 + 4].try_into().unwrap());
-        assert_eq!(word(0), 0x500);
-        assert_eq!(word(1), 0x5);
-        assert_eq!(word(2), 0x4bf);
-        assert_eq!(word(3), 0x8a3b);
-        assert_eq!(t[16], 0);
-        assert_eq!(&t[17..22], &[3, 0x1c, 0x7f, 0x15, 4]);
-        assert_eq!(t[17 + 6], 1, "VMIN");
-    }
-
-    #[test]
-    fn timespec_and_winsize() {
+    fn timespec() {
         let t = timespec_bytes(3_000_000_007);
         assert_eq!(u64::from_le_bytes(t[..8].try_into().unwrap()), 3);
         assert_eq!(u64::from_le_bytes(t[8..].try_into().unwrap()), 7);
-        assert_eq!(winsize_bytes(25, 80), [25, 0, 80, 0, 0, 0, 0, 0]);
     }
 }

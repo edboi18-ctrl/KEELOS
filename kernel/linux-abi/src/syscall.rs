@@ -21,7 +21,7 @@ use keel_hal::sched::{self, SegmentBase};
 use keel_hal::sync::IrqMutex;
 use keel_hal::syscall::SyscallArgs;
 use keel_hal::vm::{AsError, copy_from_user, copy_to_user};
-use keel_hal::{console, kprintln, random, time};
+use keel_hal::{kprintln, random, time};
 
 use crate::abi::*;
 use crate::fs;
@@ -899,8 +899,16 @@ fn read_at(
         _ if at.is_some() => return Err(Errno::ESPIPE),
         other => return crate::ready::read(&other, &[(buf, count)]).unwrap_or(Err(Errno::EINVAL)),
     };
-    if at.is_some() && file.lock().kind == Kind::Device(Device::Console) {
-        return Err(Errno::ESPIPE);
+    let (tty, nonblock) = {
+        let f = file.lock();
+        (f.tty.clone(), f.status & O_NONBLOCK != 0)
+    };
+    if let Some(tty) = tty {
+        // A terminal has no position (`nonseekable_open`).
+        if at.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        return crate::tty::read(&tty, nonblock, &[(buf, count)]);
     }
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
@@ -935,13 +943,6 @@ fn read_at(
             // No lock held: a console read can wait for the keyboard.
             Kind::Device(device) => fs::device_read(device, &mut chunk[..want])?,
         };
-        // A terminal read returns at most one line.
-        if kind == Kind::Device(Device::Console) {
-            if n > 0 && copy_to_user(buf, &chunk[..n]).is_err() {
-                return Err(Errno::EFAULT);
-            }
-            return Ok(n as u64);
-        }
         if n == 0 {
             break;
         }
@@ -990,6 +991,16 @@ pub(crate) fn write_at(
     at: Option<u64>,
     append: Option<bool>,
 ) -> SysResult {
+    let (tty, nonblock) = {
+        let f = file.lock();
+        (f.tty.clone(), f.status & O_NONBLOCK != 0)
+    };
+    if let Some(tty) = tty {
+        if at.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        return crate::tty::write(&tty, nonblock, &[(buf, count)]);
+    }
     let count = count.min(MAX_RW_COUNT) as usize;
     let mut chunk = vec![0u8; CHUNK.min(count)];
     let mut done = 0usize;
@@ -1105,6 +1116,14 @@ fn writev(p: &Arc<IrqMutex<Process>>, fd: i32, iov: u64, count: u64) -> SysResul
         // A pipe takes the vectors as one write (atomic up to PIPE_BUF).
         other => return crate::ready::write(p, &other, &vectors).unwrap_or(Err(Errno::EINVAL)),
     };
+    let (tty, nonblock) = {
+        let f = file.lock();
+        (f.tty.clone(), f.status & O_NONBLOCK != 0)
+    };
+    if let Some(tty) = tty {
+        // A terminal takes the vectors as one write (`tty_write`).
+        return crate::tty::write(&tty, nonblock, &vectors);
+    }
     let mut done = 0u64;
     for (base, len) in vectors {
         let len = len.min(MAX_RW_COUNT - done);
@@ -1242,7 +1261,14 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         // O_NOCTTY, O_TRUNC cleared after the open (`do_dentry_open`).
         status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
         comm: None,
+        tty: None,
     };
+    let mut open = open;
+    // A terminal: its end (a new pty pair for /dev/ptmx). On failure the
+    // description is dropped, which unpins the node.
+    if let Kind::Device(device) = kind {
+        open.tty = crate::tty::open(device)?;
+    }
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),
         rights: file_rights(read, write, kind),
@@ -1283,6 +1309,7 @@ fn open_proc(p: &Arc<IrqMutex<Process>>, hit: crate::procfs::Hit, flags: u64) ->
         append: false,
         status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
         comm,
+        tty: None,
     };
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),
@@ -1551,22 +1578,49 @@ fn ioctl(p: &Arc<IrqMutex<Process>>, fd: i32, request: u32, argument: u64) -> Sy
             };
         }
     };
-    if file.lock().kind != Kind::Device(Device::Console) {
+    // Only terminals answer requests; anything else is not one (SR-10).
+    let Some(tty) = file.lock().tty.clone() else {
         return Err(Errno::ENOTTY);
+    };
+    if crate::tty::is_peer_request(request) {
+        return open_pty_peer(p, &tty, argument);
     }
-    match request {
-        TCGETS => copy_to_user(argument, &std_termios_bytes()).map_err(fault)?,
-        TIOCGWINSZ => {
-            let (cols, rows) = console::framebuffer_size_chars().unwrap_or((80, 25));
-            let rows = u16::try_from(rows).unwrap_or(u16::MAX);
-            let cols = u16::try_from(cols).unwrap_or(u16::MAX);
-            copy_to_user(argument, &winsize_bytes(rows, cols)).map_err(fault)?
-        }
-        // Terminal control (TCSETS, TIOCSPGRP, ...) arrives with the TTY
-        // layer; anything else is not a terminal request (SR-10).
-        _ => return Err(Errno::ENOTTY),
-    }
-    Ok(0)
+    crate::tty::ioctl(&tty, request, argument)
+}
+
+/// TIOCGPTPEER (`ptm_open_peer`): a new descriptor of the master's slave,
+/// opened with `flags` (the access mode, O_NONBLOCK, O_NOCTTY and
+/// O_CLOEXEC), as opening its node would; EIO for anything but a master,
+/// or a locked slave.
+fn open_pty_peer(
+    p: &Arc<IrqMutex<Process>>,
+    tty: &Arc<crate::tty::TtyOpen>,
+    flags: u64,
+) -> SysResult {
+    let (slave, node) = crate::tty::peer(tty)?;
+    let access = flags & O_ACCMODE;
+    let (read, write) = (access != O_WRONLY, access != O_RDONLY);
+    let kind = fs::with(|fs| {
+        let kind = fs.kind(node)?;
+        fs.pin(node);
+        Ok(kind)
+    })?;
+    let open = OpenFile {
+        node,
+        kind,
+        offset: 0,
+        append: false,
+        status: (flags & (O_ACCMODE | O_NONBLOCK)) | O_LARGEFILE,
+        comm: None,
+        tty: Some(slave),
+    };
+    let handle = Handle {
+        object: Object::File(Arc::new(IrqMutex::new(open))),
+        rights: file_rights(read, write, kind),
+        close_on_exec: flags & O_CLOEXEC != 0,
+    };
+    let fd = p.lock().handles.insert(handle)?;
+    Ok(fd as u64)
 }
 
 fn arch_prctl(code: u64, address: u64) -> SysResult {

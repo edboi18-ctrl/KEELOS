@@ -73,13 +73,18 @@ pub struct Timespec {
 
 /// The character devices Keel provides. Numbers from Linux
 /// `Documentation/admin-guide/devices.txt` (char major 1: 3 null, 5 zero,
-/// 9 urandom; major 5 minor 1: console).
+/// 9 urandom; major 5: 1 console, 2 ptmx; majors 136-143: the Unix98 pty
+/// slaves, `/dev/pts/N`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Device {
     Console,
     Null,
     Zero,
     Urandom,
+    /// `/dev/ptmx`: opening it makes a new pty pair (P3-T12).
+    Ptmx,
+    /// `/dev/pts/N`: a pty slave.
+    Pts(u32),
 }
 
 impl Device {
@@ -90,7 +95,16 @@ impl Device {
             Device::Null => (1, 3),
             Device::Zero => (1, 5),
             Device::Urandom => (1, 9),
+            Device::Ptmx => (5, 2),
+            // UNIX98_PTY_SLAVE_MAJOR 136, 256 minors a major.
+            Device::Pts(n) => (136 + n / 256, n % 256),
         }
+    }
+
+    /// Whether it is a terminal (opened as one, not seekable: tty_open
+    /// calls `nonseekable_open`).
+    pub fn is_tty(self) -> bool {
+        matches!(self, Device::Console | Device::Ptmx | Device::Pts(_))
     }
 }
 
@@ -733,7 +747,18 @@ impl Fs {
 
     /// Creates a device node.
     pub fn create_device(&mut self, dir: Ino, name: &[u8], device: Device) -> Result<Ino, Errno> {
-        let node = Node::new(Contents::Device(device), 0o666, None, self.now());
+        self.create_device_mode(dir, name, device, 0o666)
+    }
+
+    /// Creates a device node with `permissions`.
+    pub fn create_device_mode(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        device: Device,
+        permissions: u32,
+    ) -> Result<Ino, Errno> {
+        let node = Node::new(Contents::Device(device), permissions, None, self.now());
         self.add(dir, name, node)
     }
 

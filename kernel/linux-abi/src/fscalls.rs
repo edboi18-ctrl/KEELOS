@@ -201,7 +201,8 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
     let open = file(p, fd, Rights::SEEK)?;
     let mut f = open.lock();
     let size = match f.kind {
-        Kind::Device(vfs::Device::Console) => return Err(Errno::ESPIPE),
+        // A terminal is opened non-seekable (`tty_open`).
+        Kind::Device(d) if d.is_tty() => return Err(Errno::ESPIPE),
         Kind::Device(_) => {
             f.offset = 0;
             return Ok(0);
@@ -1027,8 +1028,14 @@ pub fn readv(
         Some(a) => Some(a as u64),
         None => None,
     };
-    if at.is_some() && open.lock().kind == Kind::Device(vfs::Device::Console) {
-        return Err(Errno::ESPIPE);
+    let tty = open.lock().tty.clone();
+    if let Some(tty) = tty {
+        // A terminal: no position, and the vectors are one read.
+        if at.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        let nonblock = open.lock().status & crate::abi::O_NONBLOCK != 0;
+        return crate::tty::read(&tty, nonblock, &iovecs(iov, count)?);
     }
     let mut done = 0u64;
     for (base, len) in iovecs(iov, count)? {
@@ -1073,8 +1080,13 @@ pub fn pwritev(
         Some(a) => Some(a as u64),
         None => None,
     };
-    if at.is_some() && open.lock().kind == Kind::Device(vfs::Device::Console) {
-        return Err(Errno::ESPIPE);
+    let tty = open.lock().tty.clone();
+    if let Some(tty) = tty {
+        if at.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        let nonblock = open.lock().status & crate::abi::O_NONBLOCK != 0;
+        return crate::tty::write(&tty, nonblock, iov);
     }
     let quota = quota_of(p);
     let mut done = 0u64;

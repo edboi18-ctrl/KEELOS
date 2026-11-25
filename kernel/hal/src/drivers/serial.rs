@@ -1,4 +1,6 @@
-//! 16550 UART driver (polling, transmit only), used for COM1 at 115200 8N1.
+//! 16550 UART driver, used for COM1 at 115200 8N1: polled transmit, and
+//! receive by interrupt once [`SerialPort::enable_rx_interrupt`] is called
+//! (P3-T12).
 //!
 //! Register layout and the initialisation order follow the PC16550D
 //! datasheet (Texas Instruments/National Semiconductor, "PC16550D Universal
@@ -28,9 +30,12 @@ const LCR_DLAB: u8 = 0x80; // divisor latch access bit
 const LCR_8N1: u8 = 0x03; // 8 data bits, no parity, 1 stop bit
 const FCR_ENABLE_CLEAR_14: u8 = 0xC7; // FIFOs on, both cleared, 14-byte trigger
 const MCR_DTR_RTS: u8 = 0x03;
+const MCR_OUT2: u8 = 0x08; // bit 3: OUT2, which gates the IRQ line on PCs
 const MCR_LOOPBACK: u8 = 0x10; // bit 4: local loopback
+const IER_RX_AVAILABLE: u8 = 0x01; // bit 0: received data available
 const LSR_DATA_READY: u8 = 0x01;
 const LSR_THR_EMPTY: u8 = 0x20; // bit 5: transmit holding register empty
+const LSR_TX_EMPTY: u8 = 0x40; // bit 6: transmitter (THR and shift register) empty
 
 /// The UART clock (1.8432 MHz) divided by 16 gives 115200 baud at divisor 1.
 const DIVISOR_115200: u16 = 1;
@@ -64,6 +69,19 @@ impl SerialPort {
         Self {
             base,
             present: false,
+        }
+    }
+
+    /// A handle for a UART that `init` already set up and found working,
+    /// without touching it again (so its interrupt settings stay).
+    ///
+    /// # Safety
+    ///
+    /// As [`SerialPort::new`]; `init` must have returned true for `base`.
+    pub const unsafe fn attached(base: u16) -> Self {
+        Self {
+            base,
+            present: true,
         }
     }
 
@@ -104,6 +122,82 @@ impl SerialPort {
     /// Whether `init` found a working UART.
     pub fn is_present(&self) -> bool {
         self.present
+    }
+
+    /// Writes bytes as they are (no newline translation): terminal output,
+    /// which the line discipline has already processed (ONLCR).
+    pub fn write_raw(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_byte(b);
+        }
+    }
+
+    /// Turns on the received-data interrupt (IER bit 0) and OUT2, which on
+    /// a PC connects the UART's interrupt output to the interrupt
+    /// controller (PC16550D datasheet, MCR bit 3 and IER bit 0; Linux
+    /// `serial8250_do_startup` sets UART_MCR_OUT2 for the same reason).
+    pub fn enable_rx_interrupt(&mut self) {
+        if !self.present {
+            return;
+        }
+        // SAFETY: as in `init`: programming our own UART's registers.
+        unsafe {
+            outb(self.base + REG_MODEM_CTRL, MCR_DTR_RTS | MCR_OUT2);
+            outb(self.base + REG_INT_ENABLE, IER_RX_AVAILABLE);
+        }
+    }
+
+    /// Takes received bytes into `buf` while the line status register
+    /// says data is ready; returns how many. Reading RBR clears the
+    /// received-data interrupt once the FIFO is below its trigger level.
+    pub fn read_received(&mut self, buf: &mut [u8]) -> usize {
+        if !self.present {
+            return 0;
+        }
+        let mut n = 0;
+        while n < buf.len() {
+            // SAFETY: reading LSR has no side effect that matters; reading
+            // RBR when DR is set takes one received byte.
+            unsafe {
+                if inb(self.base + REG_LINE_STATUS) & LSR_DATA_READY == 0 {
+                    break;
+                }
+                buf[n] = inb(self.base + REG_DATA);
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// Sends `bytes` back to the receiver in loopback mode (MCR bit 4),
+    /// where nothing reaches the wire, then leaves loopback. For
+    /// self-tests: the bytes then arrive as received data, with its
+    /// interrupt. Returns whether the transmitter emptied in time.
+    pub fn loop_back(&mut self, bytes: &[u8]) -> bool {
+        if !self.present {
+            return false;
+        }
+        // SAFETY: as in `init`.
+        unsafe {
+            outb(
+                self.base + REG_MODEM_CTRL,
+                MCR_LOOPBACK | MCR_DTR_RTS | MCR_OUT2,
+            )
+        };
+        for &b in bytes {
+            self.write_byte(b);
+        }
+        let mut empty = false;
+        for _ in 0..TX_SPIN_LIMIT {
+            // SAFETY: as in `write_byte`.
+            if unsafe { inb(self.base + REG_LINE_STATUS) } & LSR_TX_EMPTY != 0 {
+                empty = true;
+                break;
+            }
+        }
+        // SAFETY: as in `init`.
+        unsafe { outb(self.base + REG_MODEM_CTRL, MCR_DTR_RTS | MCR_OUT2) };
+        empty
     }
 
     fn write_byte(&mut self, byte: u8) {

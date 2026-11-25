@@ -142,6 +142,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "ttyprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "execprobe"
 test = false
 bench = false

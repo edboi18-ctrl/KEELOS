@@ -43,6 +43,9 @@ pub struct OpenFile {
     /// names, if the opener may name it (a thread of its own process, as
     /// Linux's `comm_write` requires; else writes are EINVAL).
     pub comm: Option<CommTarget>,
+    /// The terminal end, for a terminal (`/dev/console`, `/dev/ptmx`,
+    /// `/dev/pts/N`; ADR 0029).
+    pub tty: Option<Arc<crate::tty::TtyOpen>>,
 }
 
 /// The thread a `comm` file renames.
@@ -275,6 +278,9 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
             // or write as the descriptor is.
             status: crate::abi::O_LARGEFILE | if write { crate::abi::O_WRONLY } else { 0 },
             comm: None,
+            tty: Some(Arc::new(crate::tty::TtyOpen {
+                line: crate::tty::Line::Console,
+            })),
         };
         handles.insert(Handle {
             object: Object::File(Arc::new(IrqMutex::new(file))),

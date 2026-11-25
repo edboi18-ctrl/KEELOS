@@ -198,12 +198,18 @@ extern "C" fn kmain_on_boot_stack() -> ! {
         // running so the console shows why.
         Err(error) => kprintln!("fs: root filesystem not available: {error}"),
     }
-    match keel_linux_abi::tty::init() {
+    let tty = keel_linux_abi::tty::init();
+    match tty.keyboard {
         Ok(()) => {
             kprintln!("keyboard: i8042 ready (IRQ 1, scancode set 1, US layout) on /dev/console")
         }
         // No keyboard is not fatal: output still works.
-        Err(error) => kprintln!("keyboard: not available ({error:?}); /dev/console is output only"),
+        Err(error) => kprintln!("keyboard: not available ({error:?})"),
+    }
+    if tty.serial {
+        kprintln!("serial: COM1 input (IRQ 4) on /dev/console");
+    } else {
+        kprintln!("serial: no COM1 input");
     }
 
     if let Some((minutes, seed)) = selftest::requested_fuzz(boot::cmdline()) {

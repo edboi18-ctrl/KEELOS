@@ -629,6 +629,12 @@ pub fn ioctl(fd: i32, request: u64, buf: &mut [u8; 64]) -> i64 {
     call3(nr::IOCTL, fd as u64, request, buf.as_mut_ptr() as u64)
 }
 
+/// ioctl(2) whose argument is a value, not a pointer (TCFLSH, TCXONC,
+/// TIOCSIG, TIOCGPTPEER).
+pub fn ioctl_value(fd: i32, request: u64, arg: u64) -> i64 {
+    call3(nr::IOCTL, fd as u64, request, arg)
+}
+
 pub fn clock_gettime(clock: u64, buf: &mut [u8; 16]) -> i64 {
     call3(nr::CLOCK_GETTIME, clock, buf.as_mut_ptr() as u64, 0)
 }

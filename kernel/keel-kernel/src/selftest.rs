@@ -1927,6 +1927,7 @@ fn phase3(t: &mut Runner) {
     phase3_epoll(t);
     phase3_sockets(t);
     phase3_socket_messages(t);
+    phase3_terminals(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2267,6 +2268,41 @@ fn phase3_socket_messages(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  scmprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T12 part 1 (ADR 0029): user/tests/ttyprobe, which passes under
+/// Linux too (`host.ttyprobe`), run twice; after the second run every
+/// node, frame and process is back (each pty's /dev/pts node included).
+fn phase3_terminals(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/ttyprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    // As phase3_socket_messages: the first run warms the heap up.
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.terminals",
+        ok,
+        "ptys and the N_TTY line discipline as on Linux: /dev/ptmx and /dev/pts, locking, termios and its ioctls, canonical lines, erase, kill, ^C, ^D, VMIN and VTIME, echo, output and input processing, flow control, flushing, a closed or hung-up end; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  ttyprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }
@@ -2956,6 +2992,50 @@ pub fn phase1_exec(t: &mut Runner) {
         readline == Some((true, true, (0, None))),
         "a program blocked reading /dev/console gets the typed line, then end of file at Ctrl+D",
     );
+    // P3-T12: COM1's input reaches /dev/console too, by its interrupt:
+    // "kel", DEL (erasing the l), "el", Enter (CR), Ctrl+D, through the
+    // UART's loopback mode.
+    let serial = keel_linux_abi::fs::read_file(b"/test/readline")
+        .ok()
+        .and_then(|file| {
+            let loaded = exec::load(&file, b"/test/readline", &[b"/test/readline"], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("readline", &loaded).ok()?;
+            sched::sleep_ms(20);
+            let was_waiting = sched::exit_status(spawned.thread).is_none();
+            let typed = keel_linux_abi::tty::type_serial(b"kel\x7fel\r\x04");
+            // Up to two seconds for it to finish; if the line never came,
+            // the keyboard ends it, so a failure cannot hang the run.
+            let mut arrived = false;
+            for _ in 0..200 {
+                if sched::exit_status(spawned.thread).is_some() {
+                    arrived = true;
+                    break;
+                }
+                sched::sleep_ms(10);
+            }
+            if !arrived {
+                let keys = [
+                    0x25, 0xa5, 0x12, 0x92, 0x12, 0x92, 0x26, 0xa6, 0x1c, 0x9c, 0x1d, 0x20, 0xa0,
+                    0x9d,
+                ];
+                let _ = keel_linux_abi::tty::type_scancodes(&keys);
+            }
+            join(spawned.thread);
+            Some((
+                was_waiting,
+                typed && arrived,
+                sched::exit_status(spawned.thread)?,
+            ))
+        });
+    t.check(
+        "console.serial_line",
+        serial == Some((true, true, (0, None))),
+        "a program blocked reading /dev/console gets a line typed on COM1 (received by interrupt, edited by the line discipline), then end of file",
+    );
+    if serial != Some((true, true, (0, None))) {
+        let (interrupts, bytes) = keel_hal::console::serial_input_counts();
+        kprintln!("  serial: {serial:?}; COM1 interrupts {interrupts}, bytes {bytes}");
+    }
 
     t.check(
         "process.teardown",

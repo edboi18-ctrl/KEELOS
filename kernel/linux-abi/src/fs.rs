@@ -64,11 +64,12 @@ impl core::fmt::Display for InitError {
 
 /// The device nodes in `/dev`. Only these exist; `/dev/mem`, `/dev/kmem`
 /// and `/dev/port` cannot be created (SR-9).
-const DEVICES: [(&[u8], Device); 4] = [
+const DEVICES: [(&[u8], Device); 5] = [
     (b"console", Device::Console),
     (b"null", Device::Null),
     (b"zero", Device::Zero),
     (b"urandom", Device::Urandom),
+    (b"ptmx", Device::Ptmx),
 ];
 
 /// Builds the tree from the initramfs boot module and adds `/dev`.
@@ -94,6 +95,10 @@ pub fn init() -> Result<Report, InitError> {
         fs.create_device(dev, name, device)
             .map_err(InitError::Unpack)?;
     }
+    // /dev/pts, where the pty slaves appear (devpts, mounted there on
+    // Linux: its root is mode 0755).
+    fs.create_dir(dev, b"pts", 0o755)
+        .map_err(InitError::Unpack)?;
     // /tmp, as on Linux (the Filesystem Hierarchy Standard 3.0, section
     // 3.18: "/tmp : Temporary files"); Wine keeps its server directory
     // under it. Mode 1777 (world-writable and sticky), as Linux
@@ -153,13 +158,12 @@ pub fn read_file(path: &[u8]) -> Result<Arc<Vec<u8>>, Errno> {
     })
 }
 
-/// Reads from a device. `/dev/console` waits for a line from the
-/// keyboard (see `tty`); call it with no lock held. EINTR if a signal
-/// cuts that wait short.
+/// Reads from a device that is not a terminal (terminals are read through
+/// their open file's `tty`: EIO here).
 pub fn device_read(device: Device, buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(match device {
         Device::Null => 0,
-        Device::Console => crate::tty::read(buf).ok_or(Errno::EINTR)?,
+        Device::Console | Device::Ptmx | Device::Pts(_) => return Err(Errno::EIO),
         Device::Zero => {
             buf.fill(0);
             buf.len()
@@ -174,7 +178,9 @@ pub fn device_read(device: Device, buf: &mut [u8]) -> Result<usize, Errno> {
 
 /// Writes to a device; returns the bytes consumed.
 pub fn device_write(device: Device, data: &[u8]) -> usize {
-    if device == Device::Console {
+    if device.is_tty() {
+        // Terminals are written through their open file's `tty`; this is
+        // the kernel's own path to the screen.
         console::write_user_bytes(data);
     }
     // null, zero and urandom discard writes, as on Linux.

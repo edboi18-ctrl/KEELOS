@@ -73,7 +73,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 63 | `getcwd` | 1 | 0 | 1 | complete | `exec.filesystem` |
 | 64 | `sysinfo` | 19 | 0 | 19 | missing |  |
 | 65 | `dup` | 401 | 0 | 400 | complete | `exec.descriptors` |
-| 66 | `ioctl` | 404 | 189 | 404 | partial | `syscalls.conformance` |
+| 66 | `ioctl` | 404 | 189 | 404 | partial (terminals: ADR 0029) | `syscalls.conformance`, `exec.terminals` |
 | 67 | `sched_setaffinity` | 57 | 0 | 54 | missing |  |
 | 68 | `uname` | 12 | 0 | 12 | missing |  |
 | 69 | `getdents64` | 1926 | 0 | 1926 | complete | `exec.filesystem` |
