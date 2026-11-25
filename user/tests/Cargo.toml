@@ -147,6 +147,16 @@ test = false
 bench = false
 
 [[bin]]
+name = "jobprobe"
+test = false
+bench = false
+
+[[bin]]
+name = "ctrlc"
+test = false
+bench = false
+
+[[bin]]
 name = "execprobe"
 test = false
 bench = false

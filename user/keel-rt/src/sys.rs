@@ -260,6 +260,31 @@ pub fn futex_cmp_requeue(
 }
 
 /// getppid(2).
+/// setpgid(2).
+pub fn setpgid(pid: i32, pgid: i32) -> i64 {
+    call3(109, pid as u64, pgid as u64, 0)
+}
+
+/// getpgrp(2).
+pub fn getpgrp() -> i64 {
+    call3(111, 0, 0, 0)
+}
+
+/// setsid(2).
+pub fn setsid() -> i64 {
+    call3(112, 0, 0, 0)
+}
+
+/// getpgid(2).
+pub fn getpgid(pid: i32) -> i64 {
+    call3(121, pid as u64, 0, 0)
+}
+
+/// getsid(2).
+pub fn getsid(pid: i32) -> i64 {
+    call3(124, pid as u64, 0, 0)
+}
+
 pub fn getppid() -> i64 {
     call3(nr::GETPPID, 0, 0, 0)
 }

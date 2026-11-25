@@ -64,12 +64,13 @@ impl core::fmt::Display for InitError {
 
 /// The device nodes in `/dev`. Only these exist; `/dev/mem`, `/dev/kmem`
 /// and `/dev/port` cannot be created (SR-9).
-const DEVICES: [(&[u8], Device); 5] = [
+const DEVICES: [(&[u8], Device); 6] = [
     (b"console", Device::Console),
     (b"null", Device::Null),
     (b"zero", Device::Zero),
     (b"urandom", Device::Urandom),
     (b"ptmx", Device::Ptmx),
+    (b"tty", Device::Tty),
 ];
 
 /// Builds the tree from the initramfs boot module and adds `/dev`.
@@ -163,7 +164,9 @@ pub fn read_file(path: &[u8]) -> Result<Arc<Vec<u8>>, Errno> {
 pub fn device_read(device: Device, buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(match device {
         Device::Null => 0,
-        Device::Console | Device::Ptmx | Device::Pts(_) => return Err(Errno::EIO),
+        Device::Console | Device::Ptmx | Device::Pts(_) | Device::Tty => {
+            return Err(Errno::EIO);
+        }
         Device::Zero => {
             buf.fill(0);
             buf.len()

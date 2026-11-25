@@ -21,9 +21,11 @@ use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use keel_core::compartment::Compartment;
 use keel_core::epoll::Wakes;
 use keel_core::errno::Errno;
 use keel_core::keyboard::Decoder;
+use keel_core::signal::{SIGCONT, SIGHUP, SigInfo};
 use keel_core::tty::{
     self as core_tty, Collect, End, N_TTY_BUF_SIZE, Pty, Sink, TCIFLUSH, TCIOFLUSH, TCOFLUSH,
     Termios, Tty, Winsize,
@@ -45,6 +47,9 @@ struct Console {
     decoder: Decoder,
     /// Echo waiting for the echo thread (the UART's transmit buffer).
     out: Vec<u8>,
+    /// Signals the input raised (ISIG) for the foreground process group;
+    /// the echo thread sends them, as interrupt context cannot.
+    signals: Vec<u8>,
 }
 
 /// UART_XMIT_SIZE (a page): the console's unsent output at most.
@@ -78,6 +83,7 @@ fn console(slot: &mut Option<Console>) -> &mut Console {
             tty,
             decoder: Decoder::new(),
             out: Vec::new(),
+            signals: Vec::new(),
         }
     })
 }
@@ -113,10 +119,11 @@ fn console_input(bytes: &[u8], keyboard: bool) {
             // A full flip buffer drops the rest, as a UART overrun.
             c.tty.push_input(bytes);
         }
-        let Console { tty, out, .. } = c;
-        // ISIG's signals go to the foreground process group, which
-        // arrives with sessions (P3-T12 part 2).
-        let _ = tty.receive(&mut EchoOut(out));
+        let Console {
+            tty, out, signals, ..
+        } = c;
+        let received = tty.receive(&mut EchoOut(out));
+        signals.extend(received.signals);
     }
     ECHO.wake_all();
     changed();
@@ -130,14 +137,21 @@ fn on_serial_bytes(bytes: &[u8]) {
     console_input(bytes, false);
 }
 
+/// Prints the console's echo and sends the signals its input raised.
 fn echo_thread() {
     loop {
-        ECHO.wait_until(|| CONSOLE.lock().as_ref().is_some_and(|c| !c.out.is_empty()));
-        let echo = CONSOLE
+        ECHO.wait_until(|| {
+            CONSOLE
+                .lock()
+                .as_ref()
+                .is_some_and(|c| !c.out.is_empty() || !c.signals.is_empty())
+        });
+        let (echo, signals) = CONSOLE
             .lock()
             .as_mut()
-            .map(|c| core::mem::take(&mut c.out))
+            .map(|c| (core::mem::take(&mut c.out), core::mem::take(&mut c.signals)))
             .unwrap_or_default();
+        signal_foreground(&Ctty::Console, &signals);
         keel_hal::console::write_tty_bytes(&echo);
         if let Some(c) = CONSOLE.lock().as_mut() {
             // `uart_write_wakeup`: the writers' queue.
@@ -193,6 +207,8 @@ pub struct PtyLine {
     pub pty: IrqMutex<Pty>,
     /// The slave's node in /dev/pts while the master is open.
     node: IrqMutex<Option<Ino>>,
+    /// The slave's session and foreground group (ADR 0030).
+    job: IrqMutex<Option<Job>>,
 }
 
 /// Index -> pair; an index is free again once its pair is gone
@@ -227,8 +243,10 @@ impl Drop for TtyOpen {
         };
         match end {
             End::Master => {
-                // tty_vhangup of the slave; devpts_pty_kill removes its node.
+                // tty_vhangup of the slave (its session leader gets SIGHUP
+                // and SIGCONT); devpts_pty_kill removes its node.
                 line.pty.lock().master_closed = true;
+                hang_up(&Ctty::Pty(Arc::downgrade(line)), false);
                 let node = line.node.lock().take();
                 if node.is_some() {
                     let name = line.index.to_string();
@@ -252,17 +270,33 @@ impl Drop for TtyOpen {
     }
 }
 
-/// The terminal `device` opens, or None if it is not one. /dev/ptmx makes
-/// a new pair (ENOSPC past [`PTY_MAX`]); a slave opens only while its
-/// master is open and it is unlocked (EIO, as `pty_open`).
-pub fn open(device: Device) -> Result<Option<Arc<TtyOpen>>, Errno> {
+/// The terminal `device` opens with open(2) `flags`, or None if it is not
+/// one. /dev/ptmx makes a new pair (ENOSPC past [`PTY_MAX`]); a slave
+/// opens only while its master is open and it is unlocked (EIO, as
+/// `pty_open`); /dev/tty is the caller's controlling terminal (ENXIO
+/// without one, `tty_open_current_tty`). Opening a terminal can make it
+/// the caller's controlling terminal (`tty_open_proc_set_tty`).
+pub fn open(device: Device, flags: u64) -> Result<Option<Arc<TtyOpen>>, Errno> {
     let line = match device {
         Device::Console => Line::Console,
         Device::Ptmx => Line::Pty(new_pty()?, End::Master),
         Device::Pts(n) => Line::Pty(open_slave(n)?, End::Slave),
+        Device::Tty => {
+            let ctty = caller().and_then(|p| p.lock().ctty.clone());
+            match ctty {
+                Some(Ctty::Console) => Line::Console,
+                Some(Ctty::Pty(w)) => {
+                    let line = w.upgrade().ok_or(Errno::ENXIO)?;
+                    Line::Pty(open_slave(line.index)?, End::Slave)
+                }
+                None => return Err(Errno::ENXIO),
+            }
+        }
         _ => return Ok(None),
     };
-    Ok(Some(Arc::new(TtyOpen { line })))
+    let open = Arc::new(TtyOpen { line });
+    take_on_open(&open, device, flags);
+    Ok(Some(open))
 }
 
 fn new_pty() -> Result<Arc<PtyLine>, Errno> {
@@ -281,6 +315,7 @@ fn new_pty() -> Result<Arc<PtyLine>, Errno> {
             index: index as u32,
             pty: IrqMutex::new(Pty::new()),
             node: IrqMutex::new(None),
+            job: IrqMutex::new(None),
         });
         ptys[index] = Arc::downgrade(&line);
         line
@@ -318,6 +353,426 @@ fn open_slave(n: u32) -> Result<Arc<PtyLine>, Errno> {
     Ok(line)
 }
 
+// --- job control (P3-T12 part 2; ADR 0030) -------------------------------
+//
+// `drivers/tty/tty_jobctrl.c`, `tty_io.c` (`tty_open`, `__tty_hangup`) and
+// `n_tty.c`'s `job_control` at v6.12.
+
+/// A controlling terminal: the console or a pty's slave (a master never
+/// is one). A pty is held weakly: once both its ends are closed it is no
+/// one's, as `session_clear_tty` makes it at the final close.
+#[derive(Clone)]
+pub enum Ctty {
+    Console,
+    Pty(Weak<PtyLine>),
+}
+
+impl Ctty {
+    /// Whether it is still a terminal: a pty with both ends closed is
+    /// no one's (`tty_release` clears the sessions at the final close).
+    fn alive(&self) -> bool {
+        match self {
+            Ctty::Console => true,
+            Ctty::Pty(w) => w.strong_count() > 0,
+        }
+    }
+
+    fn same(&self, other: &Ctty) -> bool {
+        match (self, other) {
+            (Ctty::Console, Ctty::Console) => true,
+            (Ctty::Pty(a), Ctty::Pty(b)) => Weak::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// A terminal's session and foreground process group (`tty->ctrl`), by
+/// number in a compartment.
+#[derive(Clone)]
+struct Job {
+    compartment: Weak<Compartment>,
+    sid: u32,
+    pgrp: u32,
+}
+
+/// The console's session and foreground group.
+static CONSOLE_JOB: IrqMutex<Option<Job>> = IrqMutex::new(None);
+
+/// Runs `f` on `tty`'s session record; None if the pty is gone.
+fn with_job<R>(tty: &Ctty, f: impl FnOnce(&mut Option<Job>) -> R) -> Option<R> {
+    match tty {
+        Ctty::Console => Some(f(&mut CONSOLE_JOB.lock())),
+        Ctty::Pty(w) => w.upgrade().map(|line| f(&mut line.job.lock())),
+    }
+}
+
+/// `tty`'s session: its compartment, session and foreground group, if it
+/// has one (and the compartment is still there).
+fn job_of(tty: &Ctty) -> Option<(Arc<Compartment>, u32, u32)> {
+    let job = with_job(tty, |j| j.clone()).flatten()?;
+    Some((job.compartment.upgrade()?, job.sid, job.pgrp))
+}
+
+type ProcessRef = Arc<IrqMutex<crate::process::Process>>;
+
+/// The calling process.
+fn caller() -> Option<ProcessRef> {
+    crate::process::current()
+}
+
+/// Whether `p`'s controlling terminal is `tty`.
+fn controls(p: &ProcessRef, tty: &Ctty) -> bool {
+    p.lock().ctty.as_ref().is_some_and(|c| c.same(tty))
+}
+
+impl TtyOpen {
+    /// This file's terminal as a controlling terminal (none for a master).
+    fn as_ctty(&self) -> Option<Ctty> {
+        match &self.line {
+            Line::Console => Some(Ctty::Console),
+            Line::Pty(line, End::Slave) => Some(Ctty::Pty(Arc::downgrade(line))),
+            Line::Pty(_, End::Master) => None,
+        }
+    }
+
+    /// The terminal a request acts on (`tty_pair_get_tty`: a master's
+    /// slave).
+    fn real_ctty(&self) -> Ctty {
+        match &self.line {
+            Line::Console => Ctty::Console,
+            Line::Pty(line, _) => Ctty::Pty(Arc::downgrade(line)),
+        }
+    }
+}
+
+/// `__tty_check_change`: a process in the background of its controlling
+/// terminal `tty` asking for `signal`'s permission (SIGTTIN to read,
+/// SIGTTOU to write with TOSTOP or change the settings). With the signal
+/// blocked or ignored: EIO for SIGTTIN, allowed for SIGTTOU. In an
+/// orphaned group: EIO. Otherwise the signal goes to its whole group and
+/// the call is EINTR (Linux's ERESTARTSYS, restarted after the stop;
+/// Keel neither stops nor restarts yet, ADR 0030).
+fn check_change(tty: &Ctty, signal: i32) -> Result<(), Errno> {
+    let Some(me) = caller() else {
+        return Ok(());
+    };
+    let (mine, pgid, compartment, ignored) = {
+        let q = me.lock();
+        let blocked = q
+            .threads
+            .get(&sched::current().0)
+            .is_some_and(|t| t.signals.blocked() & keel_core::signal::sigmask(signal) != 0);
+        let ignored = q
+            .signals
+            .action(signal)
+            .is_some_and(|a| a.handler == keel_core::signal::SIG_IGN);
+        (
+            q.ctty.as_ref().is_some_and(|c| c.same(tty)),
+            q.pgid,
+            q.member.compartment().clone(),
+            blocked || ignored,
+        )
+    };
+    if !mine {
+        return Ok(());
+    }
+    match job_of(tty) {
+        Some((_, _, fg)) if fg != pgid => {
+            if ignored {
+                return if signal == keel_core::signal::SIGTTIN {
+                    Err(Errno::EIO)
+                } else {
+                    Ok(())
+                };
+            }
+            if crate::jobs::orphaned(&compartment, pgid) {
+                return Err(Errno::EIO);
+            }
+            crate::jobs::signal_group(&compartment, pgid, signal);
+            Err(Errno::EINTR)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Signals for `tty`'s foreground process group (ISIG's, TIOCSIG's,
+/// SIGWINCH): `kill_pgrp(tty_pgrp, sig, 1)`, so `si_code` SI_KERNEL.
+fn signal_foreground(tty: &Ctty, signals: &[u8]) {
+    if signals.is_empty() {
+        return;
+    }
+    if let Some((compartment, _, fg)) = job_of(tty) {
+        for &s in signals {
+            crate::jobs::signal_group(&compartment, fg, i32::from(s));
+        }
+    }
+}
+
+/// Clears the controlling terminal of every process of session `sid`
+/// (`session_clear_tty`).
+fn clear_session(compartment: &Arc<Compartment>, sid: u32) {
+    for m in crate::jobs::session_members(compartment, sid) {
+        m.lock().ctty = None;
+    }
+}
+
+/// `__tty_hangup`'s session part (`tty_signal_session_leader`): the
+/// session's processes lose `tty` as their controlling terminal, its
+/// leader gets SIGHUP and SIGCONT and keeps the foreground group
+/// (`tty_old_pgrp`), and with `exit_session` (the leader exiting) the
+/// foreground group gets SIGHUP. The terminal then has no session.
+fn hang_up(tty: &Ctty, exit_session: bool) {
+    let Some((compartment, sid, fg)) = job_of(tty) else {
+        with_job(tty, |j| *j = None);
+        return;
+    };
+    for m in crate::jobs::session_members(&compartment, sid) {
+        let leader = {
+            let mut q = m.lock();
+            if q.ctty.as_ref().is_some_and(|c| c.same(tty)) {
+                q.ctty = None;
+            }
+            if q.leader {
+                q.old_pgrp = Some(fg);
+            }
+            q.leader
+        };
+        if leader {
+            crate::signal::send_to_process(&m, SigInfo::kernel(SIGHUP));
+            crate::signal::send_to_process(&m, SigInfo::kernel(SIGCONT));
+        }
+    }
+    if exit_session {
+        crate::jobs::signal_group(&compartment, fg, SIGHUP);
+    }
+    with_job(tty, |j| *j = None);
+}
+
+/// A process's exit (`disassociate_ctty(1)`, when its last thread goes):
+/// a session leader's controlling terminal is hung up (the console:
+/// `tty_vhangup_session`, its foreground group SIGHUP and its input
+/// discarded; a pty: its foreground group SIGHUP), the terminal leaves
+/// the session, and the session's processes lose it. A leader whose
+/// terminal was hung up earlier sends its old foreground group SIGHUP and
+/// SIGCONT.
+pub fn on_exit(p: &ProcessRef) {
+    let (leader, ctty, compartment, sid, old) = {
+        let mut q = p.lock();
+        (
+            q.leader,
+            q.ctty.take(),
+            q.member.compartment().clone(),
+            q.sid,
+            q.old_pgrp.take(),
+        )
+    };
+    if !leader {
+        return;
+    }
+    let tty = ctty.filter(Ctty::alive);
+    let Some(tty) = tty else {
+        if let Some(old) = old {
+            crate::jobs::signal_group(&compartment, old, SIGHUP);
+            crate::jobs::signal_group(&compartment, old, SIGCONT);
+        }
+        return;
+    };
+    match tty {
+        Ctty::Console => {
+            hang_up(&tty, true);
+            if let Some(c) = CONSOLE.lock().as_mut() {
+                c.tty.flush_flip();
+                c.tty.flush_input();
+            }
+        }
+        Ctty::Pty(_) => {
+            if let Some((c, _, fg)) = job_of(&tty) {
+                crate::jobs::signal_group(&c, fg, SIGHUP);
+            }
+            with_job(&tty, |j| *j = None);
+        }
+    }
+    clear_session(&compartment, sid);
+    changed();
+}
+
+/// `tty_open_proc_set_tty`: a session leader with no controlling terminal
+/// that opens one without O_NOCTTY, for reading, gets it if the terminal
+/// has no session. /dev/console and a pty master never become one by
+/// being opened.
+fn take_on_open(open: &TtyOpen, device: Device, flags: u64) {
+    use crate::abi::{O_ACCMODE, O_NOCTTY, O_WRONLY};
+    if flags & O_NOCTTY != 0 || matches!(device, Device::Console | Device::Ptmx) {
+        return;
+    }
+    let (Some(me), Some(tty)) = (caller(), open.as_ctty()) else {
+        return;
+    };
+    let (leader, has) = {
+        let q = me.lock();
+        (q.leader, q.ctty.as_ref().is_some_and(Ctty::alive))
+    };
+    if leader && !has && flags & O_ACCMODE != O_WRONLY && job_of(&tty).is_none() {
+        set_ctty(&me, tty);
+    }
+}
+
+/// `__proc_set_tty`: `tty` becomes `p`'s controlling terminal, with `p`'s
+/// session and group as its session and foreground group.
+fn set_ctty(p: &ProcessRef, tty: Ctty) {
+    let (compartment, sid, pgid) = {
+        let q = p.lock();
+        (q.member.compartment().clone(), q.sid, q.pgid)
+    };
+    with_job(&tty, |j| {
+        *j = Some(Job {
+            compartment: Arc::downgrade(&compartment),
+            sid,
+            pgrp: pgid,
+        })
+    });
+    let mut q = p.lock();
+    q.ctty = Some(tty);
+    q.old_pgrp = None;
+}
+
+/// TIOCSCTTY (`tiocsctty`): the terminal (a master's slave) becomes the
+/// caller's controlling terminal. Nothing to do if it already is its
+/// session's; EPERM unless the caller leads its session and has none; a
+/// terminal of another session is taken from it only with `arg` 1 (root,
+/// as every Keel process is) and within the caller's compartment, else
+/// EPERM.
+fn tiocsctty(open: &TtyOpen, arg: u64) -> SysResult {
+    let me = caller().ok_or(Errno::ESRCH)?;
+    let tty = open.real_ctty();
+    let (leader, sid, has, compartment) = {
+        let q = me.lock();
+        (
+            q.leader,
+            q.sid,
+            q.ctty.as_ref().is_some_and(Ctty::alive),
+            q.member.compartment().clone(),
+        )
+    };
+    let job = job_of(&tty);
+    let same = |c: &Arc<Compartment>| Arc::ptr_eq(c, &compartment);
+    if leader && job.as_ref().is_some_and(|(c, s, _)| same(c) && *s == sid) {
+        return Ok(0);
+    }
+    if !leader || has {
+        return Err(Errno::EPERM);
+    }
+    if let Some((c, s, _)) = &job {
+        if arg == 1 && same(c) {
+            clear_session(c, *s);
+        } else {
+            return Err(Errno::EPERM);
+        }
+    }
+    set_ctty(&me, tty);
+    Ok(0)
+}
+
+/// TIOCNOTTY: the caller gives up its controlling terminal (ENOTTY if
+/// this is not it). A session leader's foreground group gets SIGHUP and
+/// SIGCONT, the terminal leaves the session and every process of the
+/// session loses it (`disassociate_ctty(0)`).
+fn tiocnotty(open: &TtyOpen) -> SysResult {
+    let me = caller().ok_or(Errno::ESRCH)?;
+    let Some(tty) = open.as_ctty().filter(|t| controls(&me, t)) else {
+        return Err(Errno::ENOTTY);
+    };
+    let (leader, compartment, sid, pid) = {
+        let q = me.lock();
+        (q.leader, q.member.compartment().clone(), q.sid, q.pid())
+    };
+    if leader {
+        if let Some((c, _, fg)) = job_of(&tty) {
+            // kill_pgrp(..., 0): SEND_SIG_NOINFO, from the caller.
+            let info = |s| SigInfo::from_process(s, keel_core::signal::SI_USER, pid, 0);
+            let _ = crate::jobs::kill_group(&c, fg, info(SIGHUP));
+            let _ = crate::jobs::kill_group(&c, fg, info(SIGCONT));
+        }
+        with_job(&tty, |j| *j = None);
+        me.lock().old_pgrp = None;
+        clear_session(&compartment, sid);
+    }
+    me.lock().ctty = None;
+    Ok(0)
+}
+
+/// TIOCGPGRP and TIOCGSID (`tiocgpgrp`, `tiocgsid`): ENOTTY unless this
+/// is the caller's controlling terminal or a master; a group or session
+/// of another compartment reads as 0 (`pid_vnr`). TIOCGSID with no
+/// session is ENOTTY.
+fn tiocgpgrp(open: &TtyOpen, arg: u64, session: bool) -> SysResult {
+    let me = caller().ok_or(Errno::ESRCH)?;
+    if !open.is_master() && !open.as_ctty().is_some_and(|t| controls(&me, &t)) {
+        return Err(Errno::ENOTTY);
+    }
+    let compartment = me.lock().member.compartment().clone();
+    let job = job_of(&open.real_ctty());
+    let visible = |c: &Arc<Compartment>, n: u32| if Arc::ptr_eq(c, &compartment) { n } else { 0 };
+    let n = match (job, session) {
+        (Some((c, sid, _)), true) => visible(&c, sid),
+        (None, true) => return Err(Errno::ENOTTY),
+        (Some((c, _, fg)), false) => visible(&c, fg),
+        (None, false) => 0,
+    };
+    put_int(arg, n as i32)
+}
+
+/// TIOCSPGRP (`tiocspgrp`): the caller, in its terminal's session, makes
+/// `*arg` the foreground group. The background check first (its EIO is
+/// ENOTTY); EFAULT; a negative group EINVAL; not the caller's terminal,
+/// or not its session, ENOTTY; a number that names nothing ESRCH; a group
+/// of another session EPERM.
+fn tiocspgrp(open: &TtyOpen, arg: u64) -> SysResult {
+    let tty = open.real_ctty();
+    match check_change(&tty, keel_core::signal::SIGTTOU) {
+        Err(Errno::EIO) => return Err(Errno::ENOTTY),
+        Err(e) => return Err(e),
+        Ok(()) => {}
+    }
+    let pgrp = get_int(arg)?;
+    if pgrp < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let pgrp = pgrp as u32;
+    let me = caller().ok_or(Errno::ESRCH)?;
+    let (sid, compartment) = {
+        let q = me.lock();
+        (q.sid, q.member.compartment().clone())
+    };
+    let ours = job_of(&tty).is_some_and(|(c, s, _)| Arc::ptr_eq(&c, &compartment) && s == sid);
+    if !controls(&me, &tty) || !ours {
+        return Err(Errno::ENOTTY);
+    }
+    // find_vpid, then session_of_pgrp: a member of the group, else the
+    // process (or thread) with that PID.
+    let in_group = crate::process::members(&compartment, |q| q.pgid == pgrp);
+    let session_of = if let Some(m) = in_group.first() {
+        Some(m.lock().sid)
+    } else if let Some(p) = crate::process::find_in(&compartment, pgrp) {
+        Some(p.lock().sid)
+    } else if let Some((p, _)) = crate::process::find_thread(&compartment, pgrp) {
+        Some(p.lock().sid)
+    } else if !crate::process::members(&compartment, |q| q.sid == pgrp).is_empty() {
+        None
+    } else {
+        return Err(Errno::ESRCH);
+    };
+    if session_of != Some(sid) {
+        return Err(Errno::EPERM);
+    }
+    with_job(&tty, |j| {
+        if let Some(j) = j {
+            j.pgrp = pgrp;
+        }
+    });
+    Ok(0)
+}
+
 // --- operations ---------------------------------------------------------
 
 const EPOLLIN: u32 = 0x001;
@@ -345,13 +800,15 @@ impl TtyOpen {
         let r = match &self.line {
             Line::Console => {
                 let mut slot = CONSOLE.lock();
-                let Console { tty, out, .. } = console(&mut slot);
+                let Console {
+                    tty, out, signals, ..
+                } = console(&mut slot);
                 let other = Other {
                     chars: out.len(),
                     ..Other::default()
                 };
                 let r = f(tty, &mut EchoOut(out), other);
-                let _ = tty.receive(&mut EchoOut(out));
+                signals.extend(tty.receive(&mut EchoOut(out)).signals);
                 r
             }
             Line::Pty(line, end) => {
@@ -365,8 +822,12 @@ impl TtyOpen {
                     hung_up: end == End::Slave && pty.master_closed,
                     chars: 0,
                 };
-                // ISIG's signals: P3-T12 part 2.
-                pty.with_output(end, |tty, out| f(tty, out, other)).0
+                let (r, signals) = pty.with_output(end, |tty, out| f(tty, out, other));
+                drop(pty);
+                // ISIG: the slave's input raised them, for its foreground
+                // process group.
+                signal_foreground(&Ctty::Pty(Arc::downgrade(line)), &signals);
+                r
             }
         };
         if matches!(self.line, Line::Console) {
@@ -472,6 +933,10 @@ pub fn read(open: &TtyOpen, nonblock: bool, segs: &[(u64, u64)]) -> SysResult {
     if open.io_error() {
         return Err(Errno::EIO);
     }
+    // job_control: a background reader of its controlling terminal.
+    if let Some(tty) = open.as_ctty() {
+        check_change(&tty, keel_core::signal::SIGTTIN)?;
+    }
     let count = total(segs) as usize;
     if count == 0 {
         return Ok(0);
@@ -575,6 +1040,13 @@ const WRITE_CHUNK: usize = 2048;
 pub fn write(open: &TtyOpen, nonblock: bool, segs: &[(u64, u64)]) -> SysResult {
     if open.hung_up() || open.io_error() {
         return Err(Errno::EIO);
+    }
+    // n_tty_write: with TOSTOP, a background writer is checked.
+    if let Some(tty) = open.as_ctty() {
+        let tostop = open.look(|t, _, _| t.termios.lflag & core_tty::TOSTOP != 0);
+        if tostop {
+            check_change(&tty, keel_core::signal::SIGTTOU)?;
+        }
     }
     let count = total(segs) as usize;
     let mut written = 0usize;
@@ -725,7 +1197,11 @@ const TIOCGEXCL: u32 = 0x8004_5440;
 const TIOCGPTPEER: u32 = 0x5441;
 const TIOCGLCKTRMIOS: u32 = 0x5456;
 const TIOCSLCKTRMIOS: u32 = 0x5457;
+const TIOCSCTTY: u32 = 0x540E;
+const TIOCGPGRP: u32 = 0x540F;
 const TIOCSPGRP: u32 = 0x5410;
+const TIOCNOTTY: u32 = 0x5422;
+const TIOCGSID: u32 = 0x5429;
 /// NR_LDISCS: line discipline numbers are 0 to 29.
 const NR_LDISCS: i32 = 30;
 
@@ -756,10 +1232,13 @@ enum SetHow {
 
 /// The ioctls of a terminal (`tty_ioctl`, `tty_mode_ioctl`,
 /// `n_tty_ioctl_helper`, `n_tty_ioctl`, `pty_unix98_ioctl` at v6.12). A
-/// master's termios and window-size requests act on its slave. ENOTTY for
-/// requests Keel does not have (job control: P3-T12 part 2; packet mode,
-/// TIOCSTI, TIOCCONS, TIOCVHANGUP and the modem lines: ADR 0029).
+/// master's termios and window-size requests act on its slave. Requests
+/// that change the terminal are first checked for a background caller
+/// (`tty_check_change`: SIGTTOU). ENOTTY for requests Keel does not have
+/// (packet mode, TIOCSTI, TIOCCONS, TIOCVHANGUP and the modem lines: ADR
+/// 0029).
 pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
+    let ttou = keel_core::signal::SIGTTOU;
     if open.hung_up() {
         // hung_up_tty_ioctl.
         return Err(if request == TIOCSPGRP {
@@ -789,6 +1268,7 @@ pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
                 TCSETA | TCSETAW | TCSETAF => core_tty::TERMIO_SIZE,
                 _ => core_tty::TERMIOS2_SIZE,
             };
+            check_change(&open.real_ctty(), ttou)?;
             let mut user = [0u8; core_tty::TERMIOS2_SIZE];
             copy_from_user(&mut user[..size], arg).map_err(fault)?;
             set_termios(open, &user[..size], size == core_tty::TERMIO_SIZE, how)?;
@@ -800,23 +1280,38 @@ pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
             let mut b = [0u8; 8];
             copy_from_user(&mut b, arg).map_err(fault)?;
             // tty_do_resize: SIGWINCH to the foreground process group if
-            // it changed (part 2).
-            open.run(true, |t, _, _| t.winsize = Winsize::from_bytes(&b));
+            // it changed.
+            let new = Winsize::from_bytes(&b);
+            let changed = open.run(true, |t, _, _| {
+                core::mem::replace(&mut t.winsize, new) != new
+            });
+            if changed {
+                signal_foreground(&open.real_ctty(), &[keel_core::signal::SIGWINCH as u8]);
+            }
         }
-        TCFLSH => match u64::from(arg as u32) {
-            TCIFLUSH => open.run(false, |t, _, _| {
-                t.flush_flip();
-                t.flush_input();
-            }),
-            TCIOFLUSH => open.run(false, |t, out, _| {
-                t.flush_flip();
-                t.flush_input();
-                out.flush();
-            }),
-            TCOFLUSH => open.run(false, |_, out, _| out.flush()),
-            _ => return Err(Errno::EINVAL),
-        },
+        TCFLSH => {
+            let which = u64::from(arg as u32);
+            // tty_ioctl empties the flip buffer before the check.
+            if which == TCIFLUSH || which == TCIOFLUSH {
+                open.run(false, |t, _, _| t.flush_flip());
+            }
+            if let Some(tty) = open.as_ctty() {
+                check_change(&tty, ttou)?;
+            }
+            match which {
+                TCIFLUSH => open.run(false, |t, _, _| t.flush_input()),
+                TCIOFLUSH => open.run(false, |t, out, _| {
+                    t.flush_input();
+                    out.flush();
+                }),
+                TCOFLUSH => open.run(false, |_, out, _| out.flush()),
+                _ => return Err(Errno::EINVAL),
+            }
+        }
         TCXONC => {
+            if let Some(tty) = open.as_ctty() {
+                check_change(&tty, ttou)?;
+            }
             open.run(false, |t, out, _| t.tcxonc(u64::from(arg as u32), out))?;
         }
         TIOCINQ => {
@@ -828,20 +1323,28 @@ pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
             return put_int(arg, n as i32);
         }
         TCSBRK | TCSBRKP => {
-            // tty_wait_until_sent, then a break the console's and a pty's
-            // drivers do not send (no break_ctl: send_break returns 0).
+            // The check, tty_wait_until_sent, then a break the console's
+            // and a pty's drivers do not send (no break_ctl: send_break
+            // returns 0).
+            if let Some(tty) = open.as_ctty() {
+                check_change(&tty, ttou)?;
+            }
             wait_until_sent(open)?;
         }
         TIOCEXCL | TIOCNXCL => open.run(false, |t, _, _| t.exclusive = request == TIOCEXCL),
         TIOCGEXCL => return put_int(arg, i32::from(open.run(false, |t, _, _| t.exclusive))),
         TIOCGETD => return put_int(arg, 0),
         TIOCSETD => {
-            // tty_set_ldisc: only N_TTY (0) is here.
+            // The check and the wait come first (tty_ioctl); then
+            // tty_set_ldisc, where only N_TTY (0) is here.
+            if let Some(tty) = open.as_ctty() {
+                check_change(&tty, ttou)?;
+            }
+            wait_until_sent(open)?;
             let disc = get_int(arg)?;
             if !(0..NR_LDISCS).contains(&disc) || disc != 0 {
                 return Err(Errno::EINVAL);
             }
-            wait_until_sent(open)?;
         }
         TIOCGDEV => {
             let (major, minor) = open.device();
@@ -868,6 +1371,11 @@ pub fn ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
         TIOCGPTPEER => {
             return Err(Errno::EIO);
         }
+        TIOCSCTTY => return tiocsctty(open, arg),
+        TIOCNOTTY => return tiocnotty(open),
+        TIOCGPGRP => return tiocgpgrp(open, arg, false),
+        TIOCGSID => return tiocgpgrp(open, arg, true),
+        TIOCSPGRP => return tiocspgrp(open, arg),
         TIOCSPTLCK | TIOCGPTLCK | TIOCGPTN | TIOCSIG | TIOCPKT | TIOCGPKT if open.is_master() => {
             return master_ioctl(open, request, arg);
         }
@@ -891,11 +1399,12 @@ fn master_ioctl(open: &TtyOpen, request: u32, arg: u64) -> SysResult {
         TIOCGPTN => put_int(arg, line.index as i32),
         TIOCSIG => {
             // pty_signal: SIGINT, SIGQUIT or SIGTSTP to the slave's
-            // foreground process group (none until part 2).
+            // foreground process group.
             let sig = arg as i32;
             if ![2, 3, 20].contains(&sig) {
                 return Err(Errno::EINVAL);
             }
+            signal_foreground(&open.real_ctty(), &[sig as u8]);
             Ok(0)
         }
         // Packet mode is not supported: turning it off is all that works.
@@ -945,18 +1454,19 @@ fn set_termios(open: &TtyOpen, user: &[u8], termio: bool, how: SetHow) -> Result
 
 /// TIOCGPTPEER on a master: a new description of its slave, opened with
 /// `flags` (`ptm_open_peer`). The caller installs it.
-pub fn peer(open: &TtyOpen) -> Result<(Arc<TtyOpen>, Ino), Errno> {
+pub fn peer(open: &TtyOpen, flags: u64) -> Result<(Arc<TtyOpen>, Ino), Errno> {
     let Line::Pty(line, End::Master) = &open.line else {
         return Err(Errno::EIO);
     };
     let ino = (*line.node.lock()).ok_or(Errno::EIO)?;
     let slave = open_slave(line.index)?;
-    Ok((
-        Arc::new(TtyOpen {
-            line: Line::Pty(slave, End::Slave),
-        }),
-        ino,
-    ))
+    let slave = Arc::new(TtyOpen {
+        line: Line::Pty(slave, End::Slave),
+    });
+    // dentry_open goes through tty_open, so it can become the caller's
+    // controlling terminal as an open of the node would.
+    take_on_open(&slave, Device::Pts(line.index), flags);
+    Ok((slave, ino))
 }
 
 /// Whether `request` is TIOCGPTPEER, which the caller handles (it makes a

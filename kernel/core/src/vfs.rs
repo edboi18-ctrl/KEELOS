@@ -73,7 +73,7 @@ pub struct Timespec {
 
 /// The character devices Keel provides. Numbers from Linux
 /// `Documentation/admin-guide/devices.txt` (char major 1: 3 null, 5 zero,
-/// 9 urandom; major 5: 1 console, 2 ptmx; majors 136-143: the Unix98 pty
+/// 9 urandom; major 5: 0 tty, 1 console, 2 ptmx; majors 136-143: the Unix98 pty
 /// slaves, `/dev/pts/N`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Device {
@@ -83,6 +83,8 @@ pub enum Device {
     Urandom,
     /// `/dev/ptmx`: opening it makes a new pty pair (P3-T12).
     Ptmx,
+    /// `/dev/tty`: the opener's controlling terminal.
+    Tty,
     /// `/dev/pts/N`: a pty slave.
     Pts(u32),
 }
@@ -96,6 +98,7 @@ impl Device {
             Device::Zero => (1, 5),
             Device::Urandom => (1, 9),
             Device::Ptmx => (5, 2),
+            Device::Tty => (5, 0),
             // UNIX98_PTY_SLAVE_MAJOR 136, 256 minors a major.
             Device::Pts(n) => (136 + n / 256, n % 256),
         }
@@ -104,7 +107,10 @@ impl Device {
     /// Whether it is a terminal (opened as one, not seekable: tty_open
     /// calls `nonseekable_open`).
     pub fn is_tty(self) -> bool {
-        matches!(self, Device::Console | Device::Ptmx | Device::Pts(_))
+        matches!(
+            self,
+            Device::Console | Device::Ptmx | Device::Pts(_) | Device::Tty
+        )
     }
 }
 

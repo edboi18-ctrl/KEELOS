@@ -333,6 +333,12 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::EXECVE as usize] = Some(|p, a| execve(p, a[0], a[1], a[2]));
     t[nr::WAIT4 as usize] = Some(|p, a| wait4(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3]));
     t[nr::GETPPID as usize] = Some(|p, _| Ok(u64::from(p.lock().parent_pid())));
+    // Process groups and sessions (ADR 0030).
+    t[109] = Some(|p, a| crate::jobs::setpgid(p, a[0] as u32 as i32, a[1] as u32 as i32));
+    t[111] = Some(|p, _| crate::jobs::getpgid(p, 0));
+    t[112] = Some(|p, _| crate::jobs::setsid(p));
+    t[121] = Some(|p, a| crate::jobs::getpgid(p, a[0] as u32 as i32));
+    t[124] = Some(|p, a| crate::jobs::getsid(p, a[0] as u32 as i32));
     t[nr::GETTID as usize] =
         Some(|p, _| process::with_current_thread(p, |t| u64::from(t.tid)).ok_or(Errno::ESRCH));
     t[nr::KILL as usize] = Some(|p, a| kill(p, a[0] as u32 as i32, a[1] as u32 as i32));
@@ -653,9 +659,9 @@ fn read(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64, count: u64) -> SysResult 
 /// wait4(2) (P3-T3). As Linux's kernel_wait4 (`kernel/exit.c` at v6.12):
 /// options other than WNOHANG, WUNTRACED, WCONTINUED, __WNOTHREAD,
 /// __WCLONE and __WALL are EINVAL; INT_MIN is ESRCH. -1 waits for any
-/// child. Keel has no process groups yet and every process of a
-/// compartment would be in one, so 0 (the caller's group) is any child,
-/// and another negative pgid finds none (ECHILD). No child matching:
+/// child, 0 for a child in the caller's process group, another negative
+/// value for one in that group (the child's group when wait4 looks, as
+/// `eligible_pid`; ADR 0030). No child matching:
 /// ECHILD. WNOHANG with none exited returns 0. Stopped and continued
 /// children do not exist until signals do, so WUNTRACED and WCONTINUED
 /// change nothing. The status is written if `status` is not NULL; a
@@ -676,9 +682,10 @@ fn wait4(
     }
     let which = match pid {
         i32::MIN => return Err(Errno::ESRCH),
-        -1 | 0 => process::WaitFor::Any,
+        -1 => process::WaitFor::Any,
+        0 => process::WaitFor::Group(p.lock().pgid),
         pid if pid > 0 => process::WaitFor::Pid(pid as u32),
-        _ => return Err(Errno::ECHILD),
+        pid => process::WaitFor::Group(pid.unsigned_abs()),
     };
     let Some((child, wait_status)) = process::wait(p, which, options & WNOHANG == 0)? else {
         return Ok(0);
@@ -802,6 +809,8 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
             t.comm = process::comm_of(&path);
         }
         process.exe = exe_path.clone();
+        // begin_new_exec clears PF_FORKNOEXEC (setpgid's EACCES).
+        process.execed = true;
         process.signals.reset_for_exec();
         if let Some(t) = process.threads.get_mut(&sched::current().0) {
             t.signals.reset_for_exec();
@@ -1267,7 +1276,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
     // A terminal: its end (a new pty pair for /dev/ptmx). On failure the
     // description is dropped, which unpins the node.
     if let Kind::Device(device) = kind {
-        open.tty = crate::tty::open(device)?;
+        open.tty = crate::tty::open(device, flags)?;
     }
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),
@@ -1597,7 +1606,7 @@ fn open_pty_peer(
     tty: &Arc<crate::tty::TtyOpen>,
     flags: u64,
 ) -> SysResult {
-    let (slave, node) = crate::tty::peer(tty)?;
+    let (slave, node) = crate::tty::peer(tty, flags)?;
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);
     let kind = fs::with(|fs| {
@@ -1834,23 +1843,35 @@ fn sigaltstack(p: &Arc<IrqMutex<Process>>, ss: u64, old_ss: u64, user_rsp: u64) 
 /// compartment (ESRCH if there is none: a PID names a process only in its
 /// own compartment, ADR 0014), with `si_code` SI_USER and the caller's PID
 /// as `si_pid`. Signal 0 only checks that the process exists. EINVAL
-/// outside 0 to 64. Process groups (PID 0 or negative) are ESRCH for now:
-/// they arrive with P3-T7.
+/// outside 0 to 64. As `kill_something_info`: PID 0 is the caller's
+/// process group, -1 every process of the compartment but its PID 1 and
+/// the caller, a lower one the group -PID (ESRCH if empty; INT_MIN ESRCH).
 fn kill(p: &Arc<IrqMutex<Process>>, pid: i32, signal: i32) -> SysResult {
     use keel_core::signal::{NSIG, SI_USER, SigInfo};
     if !(0..=NSIG as i32).contains(&signal) {
         return Err(Errno::EINVAL);
     }
-    if pid <= 0 {
-        return Err(Errno::ESRCH);
-    }
-    let (compartment, me) = {
+    let (compartment, me, pgid) = {
         let process = p.lock();
-        (process.member.compartment().clone(), process.pid())
+        (
+            process.member.compartment().clone(),
+            process.pid(),
+            process.pgid,
+        )
     };
+    let info = SigInfo::from_process(signal, SI_USER, me, 0);
+    match pid {
+        i32::MIN => return Err(Errno::ESRCH),
+        0 => return crate::jobs::kill_group(&compartment, pgid, info).map(|()| 0),
+        -1 => return crate::jobs::kill_all(p, info).map(|()| 0),
+        pid if pid < 0 => {
+            return crate::jobs::kill_group(&compartment, pid.unsigned_abs(), info).map(|()| 0);
+        }
+        _ => {}
+    }
     let target = process::find_in(&compartment, pid as u32).ok_or(Errno::ESRCH)?;
     if signal != 0 {
-        crate::signal::send_to_process(&target, SigInfo::from_process(signal, SI_USER, me, 0));
+        crate::signal::send_to_process(&target, info);
     }
     Ok(0)
 }

@@ -23,8 +23,12 @@ pub mod exec;
 pub mod fs;
 #[cfg(target_os = "none")]
 pub mod fscalls;
+
 #[cfg(target_os = "none")]
 pub mod futex;
+/// Process groups and sessions (ADR 0030).
+#[cfg(target_os = "none")]
+pub mod jobs;
 #[cfg(target_os = "none")]
 pub mod process;
 #[cfg(target_os = "none")]

@@ -142,11 +142,12 @@ the signals ISIG raises are part 2 (ADR 0030).
 
 - **Job control:** sessions, process groups, the controlling terminal
   (TIOCSCTTY, TIOCNOTTY, TIOCGPGRP, TIOCSPGRP, TIOCGSID), the signals
-  ISIG and TIOCSIG raise, SIGWINCH, SIGTTIN and SIGTTOU: part 2.
+  ISIG and TIOCSIG raise, SIGWINCH, SIGTTIN and SIGTTOU: part 2, ADR
+  0030 (with `/dev/tty`).
 - **Packet mode** (TIOCPKT: only turning it off works; ENOTTY
   otherwise), TIOCSTI, TIOCCONS, TIOCVHANGUP, the modem lines (TIOCMGET
   and its setters) and TIOCGSERIAL.
-- **`/dev/tty`** and `/dev/pts/ptmx`; devpts mount options.
+- **`/dev/pts/ptmx`**; devpts mount options.
 - **Restarting** a read or write a handled signal interrupted: EINTR
   only (ADR 0020).
 - **Parity and framing errors, breaks** (PARMRK only doubles 0xff): no

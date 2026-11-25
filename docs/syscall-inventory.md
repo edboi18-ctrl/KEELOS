@@ -40,7 +40,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 30 | `poll` | 1 | 0 | 1 | complete | `syscalls.conformance`, `exec.pipes` |
 | 31 | `pipe` | 17 | 0 | 17 | complete | `exec.pipes` |
 | 32 | `fork` | 25 | 0 | 25 | complete | `exec.fork_wait`, `compartment.fork_bomb` |
-| 33 | `setsid` | 10 | 0 | 10 | missing |  |
+| 33 | `setsid` | 10 | 0 | 10 | complete | `exec.job_control` |
 | 34 | `unlink` | 9 | 1 | 9 | complete | `exec.filesystem` |
 | 35 | `socket` | 8 | 0 | 8 | partial (AF_UNIX stream and datagram; the traced AF_INET and AF_NETLINK are not) | `exec.sockets`, `exec.socket_messages` |
 | 36 | `bind` | 2 | 0 | 2 | complete | `exec.sockets` |
@@ -51,7 +51,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 41 | `dup2` | 22 | 0 | 22 | complete | `exec.descriptors` |
 | 42 | `write` | 28591 | 0 | 28754 | partial | `syscalls.conformance` |
 | 43 | `exit_group` | 27 | 0 |  | partial | `syscalls.conformance` |
-| 44 | `wait4` | 13 | 0 | 13 | partial (no process groups) | `exec.fork_wait` |
+| 44 | `wait4` | 13 | 0 | 13 | partial (no stopped children) | `exec.fork_wait`, `exec.job_control` |
 | 45 | `setsockopt` | 22 | 0 | 22 | partial | `exec.sockets` |
 | 46 | `connect` | 1 | 0 | 1 | complete | `exec.sockets` |
 | 47 | `fchdir` | 75 | 0 | 75 | complete | `exec.filesystem` |
@@ -91,7 +91,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 81 | `exit` | 43 | 0 |  | partial | `syscalls.conformance` |
 | 82 | `sendto` | 2 | 0 | 2 | partial (Unix stream; the traced calls are netlink) | `exec.sockets` |
 | 83 | `recvfrom` | 5 | 0 | 5 | partial (Unix stream; the traced calls are netlink) | `exec.sockets` |
-| 84 | `kill` | 11 | 11 | 11 | partial (no process groups) | `exec.thread_calls`, `exec.signals` |
+| 84 | `kill` | 11 | 11 | 11 | complete (groups: ADR 0030) | `exec.thread_calls`, `exec.signals`, `exec.job_control` |
 | 85 | `tgkill` | 10 | 0 | 13 | complete | `exec.signals` |
 | 86 | `rt_sigreturn` | 1 | 0 | 2 | complete | `exec.signals` |
 | 87 | `rename` | 3 | 0 | 3 | complete | `exec.filesystem` |

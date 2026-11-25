@@ -1928,6 +1928,8 @@ fn phase3(t: &mut Runner) {
     phase3_sockets(t);
     phase3_socket_messages(t);
     phase3_terminals(t);
+    phase3_job_control(t);
+    phase3_console_interrupt(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2304,6 +2306,78 @@ fn phase3_terminals(t: &mut Runner) {
         kprintln!(
             "  ttyprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
+    }
+}
+
+/// P3-T12 part 2 (ADR 0030): user/tests/jobprobe, which passes under
+/// Linux too (`host.jobprobe`), run twice; after the second run every
+/// node, frame and process is back.
+fn phase3_job_control(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/jobprobe";
+    let outside_heap = || memory::free_frames() as i64 + keel_hal::heap::mapped_pages() as i64;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.job_control",
+        ok,
+        "process groups, sessions and the controlling terminal as on Linux: setsid, setpgid (ESRCH, EPERM, EACCES after execve), kill and wait4 by group, TIOCSCTTY, /dev/tty, TIOCSPGRP, ^C, ^\\, ^Z and SIGWINCH to the foreground group, SIGTTIN and SIGTTOU in the background, orphaned groups, TIOCNOTTY, hangup and a leader's exit; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  jobprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-T12: ^C typed on COM1 sends SIGINT to the console's foreground
+/// process group: user/tests/ctrlc, a session leader with the console as
+/// its terminal, blocked reading it, sees EINTR and its handler run. If
+/// the signal never comes, Enter on the keyboard ends the read, so the
+/// check fails rather than hangs.
+fn phase3_console_interrupt(t: &mut Runner) {
+    let outcome = keel_linux_abi::fs::read_file(b"/test/ctrlc")
+        .ok()
+        .and_then(|file| {
+            let loaded =
+                keel_linux_abi::exec::load(&file, b"/test/ctrlc", &[b"/test/ctrlc"], &[]).ok()?;
+            let spawned = keel_linux_abi::process::spawn("ctrlc", &loaded).ok()?;
+            sched::sleep_ms(50);
+            let typed = keel_linux_abi::tty::type_serial(b"\x03");
+            let mut ended = false;
+            for _ in 0..200 {
+                if sched::exit_status(spawned.thread).is_some() {
+                    ended = true;
+                    break;
+                }
+                sched::sleep_ms(10);
+            }
+            if !ended {
+                let _ = keel_linux_abi::tty::type_scancodes(&[0x1c, 0x9c]);
+            }
+            join(spawned.thread);
+            Some((typed && ended, sched::exit_status(spawned.thread)?))
+        });
+    t.check(
+        "console.interrupt",
+        outcome == Some((true, (0, None))),
+        "^C typed on COM1 sends SIGINT to the console's foreground process group: a session leader that took the console with TIOCSCTTY, blocked reading it, gets EINTR and its handler runs",
+    );
+    if outcome != Some((true, (0, None))) {
+        kprintln!("  ctrlc: {outcome:?}");
     }
 }
 

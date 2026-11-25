@@ -150,6 +150,22 @@ pub struct Process {
     pub parent: Option<Weak<IrqMutex<Process>>>,
     /// Children not yet reaped by wait4, alive or exited (zombies).
     pub children: Vec<Child>,
+    /// Its process group and session (P3-T12, ADR 0030), PIDs of its
+    /// compartment. A process the kernel starts is in session 0 and group
+    /// 0, as Linux's init begins, so it can call setsid.
+    pub pgid: u32,
+    pub sid: u32,
+    /// `signal->leader`: it made its session with setsid.
+    pub leader: bool,
+    /// It has called execve (Linux's PF_FORKNOEXEC cleared): its parent
+    /// can no longer change its group (setpgid EACCES).
+    pub execed: bool,
+    /// Its controlling terminal (`signal->tty`), shared by its threads.
+    pub ctty: Option<crate::tty::Ctty>,
+    /// `signal->tty_old_pgrp`: a leader whose terminal was hung up keeps
+    /// its foreground group, which gets SIGHUP and SIGCONT when the leader
+    /// exits.
+    pub old_pgrp: Option<u32>,
 }
 
 /// One thread of a process.
@@ -336,6 +352,12 @@ pub fn spawn_in(
         threads: BTreeMap::new(),
         group_exit: None,
         killed_by: None,
+        pgid: 0,
+        sid: 0,
+        leader: false,
+        execed: true,
+        ctty: None,
+        old_pgrp: None,
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.
@@ -380,6 +402,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         umask,
         exe,
         comm,
+        (pgid, sid, ctty),
     ) = {
         let process = p.lock();
         (
@@ -401,6 +424,9 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
                 .threads
                 .get(&sched::current().0)
                 .map_or_else(Vec::new, |t| t.comm.clone()),
+            // copy_process: the group, session and controlling terminal
+            // are inherited; a child is never a session leader.
+            (process.pgid, process.sid, process.ctty.clone()),
         )
     };
     let member = compartment.admit()?;
@@ -427,6 +453,12 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         threads: BTreeMap::new(),
         group_exit: None,
         killed_by: None,
+        pgid,
+        sid,
+        leader: false,
+        execed: false,
+        ctty,
+        old_pgrp: None,
     }));
     let mut registers = *frame;
     registers.rax = 0;
@@ -580,6 +612,29 @@ fn find(compartment: &Arc<Compartment>, pid: u32) -> Option<Arc<IrqMutex<Process
         .cloned()
 }
 
+/// The running processes of `compartment` for which `pick` holds, each
+/// once (the table has an entry per thread). `pick` runs with the process
+/// locked, so it must not lock it again.
+pub fn members(
+    compartment: &Arc<Compartment>,
+    mut pick: impl FnMut(&Process) -> bool,
+) -> Vec<Arc<IrqMutex<Process>>> {
+    let mut found: Vec<Arc<IrqMutex<Process>>> = Vec::new();
+    for p in PROCESSES.lock().values() {
+        if found.iter().any(|f| Arc::ptr_eq(f, p)) {
+            continue;
+        }
+        let chosen = {
+            let q = p.lock();
+            Arc::ptr_eq(q.member.compartment(), compartment) && pick(&q)
+        };
+        if chosen {
+            found.push(p.clone());
+        }
+    }
+    found
+}
+
 /// The running process in the caller's compartment with PID `pid`, if any
 /// (kill(2) and tgkill(2) name processes this way).
 pub fn find_in(compartment: &Arc<Compartment>, pid: u32) -> Option<Arc<IrqMutex<Process>>> {
@@ -666,6 +721,8 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
         )
     };
     drop((handles, space, children));
+    // disassociate_ctty(1): a session leader's terminal is hung up.
+    crate::tty::on_exit(&process);
     // Its record locks go with it.
     crate::fscalls::release_locks(owner, None);
     let wait_status = match signal {
@@ -709,11 +766,13 @@ pub fn end_other_threads(p: &Arc<IrqMutex<Process>>) {
     }
 }
 
-/// What wait4 is waiting for: a child with this PID, or any child.
+/// What wait4 is waiting for: a child with this PID, any child, or a
+/// child in this process group (its group when wait4 looks).
 #[derive(Clone, Copy, Debug)]
 pub enum WaitFor {
     Any,
     Pid(u32),
+    Group(u32),
 }
 
 /// wait4's core: reaps an exited child matching `which` and returns its
@@ -726,9 +785,11 @@ pub fn wait(
     which: WaitFor,
     block: bool,
 ) -> Result<Option<(u32, i32)>, Errno> {
+    // The parent is locked while this runs; a child is another process.
     let matches = move |c: &Child| match which {
         WaitFor::Any => true,
         WaitFor::Pid(pid) => c.pid == pid,
+        WaitFor::Group(pgid) => c.process.lock().pgid == pgid,
     };
     let mut result = Ok(None);
     let mut try_reap = || {

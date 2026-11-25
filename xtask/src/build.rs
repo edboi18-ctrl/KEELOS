@@ -281,6 +281,23 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/jobprobe",
+        binary: "jobprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    // Needs the console as its terminal: Keel only.
+    TestProgram {
+        path: "test/ctrlc",
+        binary: "ctrlc",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
         path: "test/execprobe",
         binary: "execprobe",
         args: &[],
