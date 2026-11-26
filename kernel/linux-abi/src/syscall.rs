@@ -85,7 +85,7 @@ pub mod nr {
 /// Size of the kernel buffer user data passes through.
 const CHUNK: usize = 4096;
 
-type SysResult = Result<u64, Errno>;
+pub(crate) type SysResult = Result<u64, Errno>;
 
 /// Registers the handler and the exit hook. Call once at boot.
 pub fn init() {
@@ -530,6 +530,12 @@ fn dispatch(call: &SyscallArgs) -> i64 {
             Some(p) => sigaltstack(&p, a[0], a[1], call.user_rsp),
             None => unimplemented(number, &a),
         },
+        n if (crate::native::BASE..crate::native::BASE + crate::native::COUNT).contains(&n) => {
+            match process::current() {
+                Some(p) => crate::native::dispatch(&p, n - crate::native::BASE, &a),
+                None => unimplemented(number, &a),
+            }
+        }
         _ if number < TABLE_SIZE => {
             // Spectre v1: the number is user-controlled; clamp it without
             // a branch before indexing (Linux does the same with
@@ -755,7 +761,7 @@ const MAX_ARG_STRLEN: usize = 32 * PAGE as usize;
 /// The pointers (8 bytes each) and the strings together must fit the
 /// initial-stack limit (`exec::ARG_LIMIT`), else E2BIG, checked as they
 /// are read, so a huge array is refused without being read in full.
-fn user_strings(array: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
+pub(crate) fn user_strings(array: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
     let mut strings = Vec::new();
     if array == 0 {
         return Ok(strings);

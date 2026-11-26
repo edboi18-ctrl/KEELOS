@@ -29,6 +29,9 @@ pub mod futex;
 /// Process groups and sessions (ADR 0030).
 #[cfg(target_os = "none")]
 pub mod jobs;
+/// The native launch interface (P3-S2, ADR 0040).
+#[cfg(target_os = "none")]
+pub mod native;
 #[cfg(target_os = "none")]
 pub mod process;
 #[cfg(target_os = "none")]

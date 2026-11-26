@@ -28,7 +28,12 @@ pub fn system() -> Arc<Compartment> {
 /// from the filesystem root) as `/`. ENOTDIR if it is not a directory;
 /// EAGAIN once compartment IDs are used up.
 pub fn create(root: &[u8], limits: Limits) -> Result<Arc<Compartment>, Errno> {
-    let root = crate::fs::lookup(root)?;
+    create_at(crate::fs::lookup(root)?, limits)
+}
+
+/// As [`create`], with the root a directory node (the native interface
+/// passes a directory handle's, ADR 0040).
+pub fn create_at(root: keel_core::vfs::Ino, limits: Limits) -> Result<Arc<Compartment>, Errno> {
     if crate::fs::with(|fs| fs.kind(root))? != Kind::Directory {
         return Err(Errno::ENOTDIR);
     }

@@ -1971,6 +1971,7 @@ fn phase3(t: &mut Runner) {
     phase3_fifos(t);
     phase3_scripts(t);
     phase3_procdirs(t);
+    phase3_launch(t);
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
@@ -3131,6 +3132,50 @@ fn phase3_procdirs(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  pidprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-S2 (ADR 0040): user/tests/launchprobe, given a factory on fd 3 as
+/// keel-init is, exercises the native launch interface: restrict,
+/// factory_derive, compartment_create, grant_device, spawn, kill and wait,
+/// their refusals, and what a process in the compartment sees. Run twice;
+/// after the second run every node, frame and process is back.
+fn phase3_launch(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/launchprobe";
+    let run = || {
+        let file = fs::read_file(PROGRAM).ok()?;
+        let loaded = keel_linux_abi::exec::load(&file, PROGRAM, &[PROGRAM], &[]).ok()?;
+        let spawned = process::spawn_with_fd3(
+            "launchprobe",
+            &loaded,
+            keel_linux_abi::native::root_factory(),
+        )
+        .ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    };
+    let outside_heap = frames_outside_heap;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run();
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) { run() } else { warm };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.launch",
+        ok,
+        "the native launch interface (ADR 0040): rights only removed by restrict, factory ceilings, compartments rooted in a directory handle with their limits, device grants, spawn with given stdio only, kill and wait with PID 1's status, each refusal; a confined PID 1 sees no factory and nothing outside its tree; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  launchprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

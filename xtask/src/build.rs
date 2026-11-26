@@ -315,6 +315,15 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: true,
     },
+    // P3-S2 (ADR 0040): the native launch interface, Keel's own.
+    TestProgram {
+        path: "test/launchprobe",
+        binary: "launchprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     TestProgram {
         path: "test/fifoprobe",
         binary: "fifoprobe",

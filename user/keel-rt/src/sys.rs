@@ -1834,3 +1834,148 @@ pub fn recvmsg_full(
         flags: hdr[6] as u32 as i32,
     }
 }
+
+// --- the native launch interface (P3-S2, ADR 0040) ----------------------
+
+/// The first native call's number.
+pub const NATIVE_BASE: u64 = 0x1000_0000;
+
+/// A compartment's or factory's limits (ADR 0040): `u32::MAX` and
+/// `u64::MAX` are no limit.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub processes: u32,
+    pub memory_bytes: u64,
+    pub tmpfs_bytes: u64,
+    pub tmpfs_nodes: u64,
+}
+
+impl Limits {
+    pub const UNLIMITED: Limits = Limits {
+        processes: u32::MAX,
+        memory_bytes: u64::MAX,
+        tmpfs_bytes: u64::MAX,
+        tmpfs_nodes: u64::MAX,
+    };
+
+    /// The 40-byte structure the calls read.
+    pub fn bytes(&self) -> [u8; 40] {
+        let mut b = [0u8; 40];
+        b[0..4].copy_from_slice(&self.processes.to_le_bytes());
+        b[8..16].copy_from_slice(&self.memory_bytes.to_le_bytes());
+        b[16..24].copy_from_slice(&self.tmpfs_bytes.to_le_bytes());
+        b[24..32].copy_from_slice(&self.tmpfs_nodes.to_le_bytes());
+        b
+    }
+}
+
+/// What `compartment_wait` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub processes: u32,
+    /// PID 1's wait status, or -1 while it runs.
+    pub status: i32,
+    pub memory_bytes: u64,
+    pub tmpfs_bytes: u64,
+    pub tmpfs_nodes: u64,
+}
+
+/// `restrict(fd, rights)`: a new descriptor with only those of the rights.
+pub fn native_restrict(fd: i32, rights: u64) -> i64 {
+    call3(NATIVE_BASE, fd as u32 as u64, rights, 0)
+}
+
+/// `factory_derive(factory, limits*)`.
+pub fn factory_derive(factory: i32, limits: &[u8; 40]) -> i64 {
+    call3(
+        NATIVE_BASE + 1,
+        factory as u32 as u64,
+        limits.as_ptr() as u64,
+        0,
+    )
+}
+
+/// `compartment_create(factory, rootfd, limits*)`.
+pub fn compartment_create(factory: i32, root: i32, limits: &[u8; 40]) -> i64 {
+    call3(
+        NATIVE_BASE + 2,
+        factory as u32 as u64,
+        root as u32 as u64,
+        limits.as_ptr() as u64,
+    )
+}
+
+/// `compartment_grant_device(c, device)`: 1 null, 2 zero, 3 urandom, 4 tty,
+/// 5 ptmx.
+pub fn compartment_grant_device(c: i32, device: u64) -> i64 {
+    call3(NATIVE_BASE + 3, c as u32 as u64, device, 0)
+}
+
+/// `compartment_spawn(c, path, argv, envp, stdio)`: at most
+/// `EXECVE_MAX - 1` arguments and environment strings (E2BIG otherwise).
+pub fn compartment_spawn(
+    c: i32,
+    path: &CStr,
+    argv: &[&CStr],
+    envp: &[&CStr],
+    stdio: [i32; 3],
+) -> i64 {
+    let mut args = [0u64; EXECVE_MAX];
+    let mut env = [0u64; EXECVE_MAX];
+    if argv.len() >= EXECVE_MAX || envp.len() >= EXECVE_MAX {
+        return -7;
+    }
+    for (slot, arg) in args.iter_mut().zip(argv) {
+        *slot = arg.as_ptr() as u64;
+    }
+    for (slot, var) in env.iter_mut().zip(envp) {
+        *slot = var.as_ptr() as u64;
+    }
+    let mut fds = [0u8; 12];
+    for (i, fd) in stdio.iter().enumerate() {
+        fds[i * 4..i * 4 + 4].copy_from_slice(&fd.to_le_bytes());
+    }
+    call6(
+        NATIVE_BASE + 4,
+        [
+            c as u32 as u64,
+            path.as_ptr() as u64,
+            args.as_ptr() as u64,
+            env.as_ptr() as u64,
+            fds.as_ptr() as u64,
+            0,
+        ],
+    )
+}
+
+/// `compartment_kill(c, signal)`.
+pub fn compartment_kill(c: i32, signal: i32) -> i64 {
+    call3(NATIVE_BASE + 5, c as u32 as u64, signal as u32 as u64, 0)
+}
+
+/// `compartment_wait(c, usage*, flags)`: flags 1 is WNOHANG.
+pub fn compartment_wait(c: i32, flags: u64) -> Result<Usage, i64> {
+    let mut b = [0u8; 40];
+    let r = call3(
+        NATIVE_BASE + 6,
+        c as u32 as u64,
+        b.as_mut_ptr() as u64,
+        flags,
+    );
+    if r < 0 {
+        return Err(r);
+    }
+    let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
+    Ok(Usage {
+        processes: u32::from_le_bytes(b[0..4].try_into().unwrap_or([0; 4])),
+        status: i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4])),
+        memory_bytes: u64_at(8),
+        tmpfs_bytes: u64_at(16),
+        tmpfs_nodes: u64_at(24),
+    })
+}
+
+/// A raw native call, for testing refusals.
+pub fn native_raw(n: u64, a: u64, b: u64, c: u64) -> i64 {
+    call3(NATIVE_BASE + n, a, b, c)
+}

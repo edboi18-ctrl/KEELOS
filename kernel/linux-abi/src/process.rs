@@ -83,6 +83,10 @@ pub enum Object {
     Epoll(Arc<crate::epoll::EpollFile>),
     /// A Unix domain socket (P3-T11, ADR 0027).
     Socket(Arc<crate::socket::Socket>),
+    /// A compartment factory (P3-S2, ADR 0040).
+    Factory(Arc<crate::native::Factory>),
+    /// A compartment its creator holds (P3-S2, ADR 0040).
+    Compartment(Arc<crate::native::CompartmentHandle>),
 }
 
 /// Rights given to an open regular file or device, by access mode. Reading
@@ -423,16 +427,39 @@ pub fn spawn_in_with(
     loaded: &Loaded,
     stdio: Option<(Ino, Ino)>,
 ) -> Result<Spawned, Errno> {
-    let member = compartment.admit()?;
-    loaded
-        .space
-        .attach_budget(compartment.memory().clone())
-        .map_err(|_| Errno::ENOMEM)?;
     let mut handles = HandleTable::new(HANDLE_LIMIT);
     match stdio {
         Some((stdin, stdout)) => file_handles(&mut handles, stdin, stdout)?,
         None => console_handles(&mut handles)?,
     }
+    spawn_in_handles(compartment, name, loaded, handles)
+}
+
+/// The console on fds 0 to 2 and `extra` at fd 3: keel-init's start, with
+/// the factory (ADR 0040).
+pub fn spawn_with_fd3(
+    name: &'static str,
+    loaded: &Loaded,
+    extra: Handle<Object>,
+) -> Result<Spawned, Errno> {
+    let mut handles = HandleTable::new(HANDLE_LIMIT);
+    console_handles(&mut handles)?;
+    handles.place(3, extra)?;
+    spawn_in_handles(&crate::compartment::system(), name, loaded, handles)
+}
+
+/// As [`spawn_in`], with `handles` as the new process's descriptors.
+pub fn spawn_in_handles(
+    compartment: &Arc<Compartment>,
+    name: &'static str,
+    loaded: &Loaded,
+    handles: HandleTable<Object>,
+) -> Result<Spawned, Errno> {
+    let member = compartment.admit()?;
+    loaded
+        .space
+        .attach_budget(compartment.memory().clone())
+        .map_err(|_| Errno::ENOMEM)?;
     let mut processes = PROCESSES.lock();
     let pid = member.pid();
     let root = compartment.root();
@@ -958,7 +985,15 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
         Some(signal) => signal & 0x7f,
         None => ((code & 0xff) << 8) as i32,
     };
-    process.lock().exit_status = Some(wait_status);
+    {
+        let mut q = process.lock();
+        q.exit_status = Some(wait_status);
+        // A compartment's PID 1 started by the native interface has no
+        // parent: its status is kept for `compartment_wait` (ADR 0040).
+        if q.parent.is_none() && q.pid() == 1 {
+            q.member.compartment().set_lead_status(wait_status);
+        }
+    }
     if let Some(parent) = parent {
         // do_notify_parent: SIGCHLD (CLD_KILLED with the signal, or
         // CLD_EXITED with the code) unless the parent ignores it; a parent
@@ -1106,6 +1141,25 @@ pub fn wait(
         try_reap();
     }
     result
+}
+
+/// Waits until `compartment` has no process left (ADR 0040). A
+/// process's slot is given back when its last reference goes, which can
+/// be after the exit that wakes this queue, or when a parent reaps a
+/// zombie, which wakes nothing: so the condition is looked at again every
+/// 50 ms as well. False if a signal or an exit request ended the wait.
+pub fn wait_until_empty(compartment: &Arc<Compartment>) -> bool {
+    loop {
+        let deadline = keel_hal::time::monotonic_nanos() + 50_000_000;
+        let waited =
+            CHILD_EXITS.wait_until_deadline(|| compartment.processes() == 0, Some(deadline));
+        if compartment.processes() == 0 {
+            return true;
+        }
+        if waited == sched::Waited::Interrupted {
+            return false;
+        }
+    }
 }
 
 /// Number of live processes (tests).

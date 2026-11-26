@@ -272,7 +272,14 @@ fn start_init() -> Result<keel_linux_abi::process::Spawned, &'static str> {
     let file = keel_linux_abi::fs::read_file(INIT).map_err(|_| "not in the initramfs")?;
     let loaded =
         keel_linux_abi::exec::load(&file, INIT, &[INIT], &[]).map_err(|_| "not a valid program")?;
-    keel_linux_abi::process::spawn("keel-init", &loaded).map_err(|_| "no process could be made")
+    // The only factory the kernel hands out, at fd 3, close-on-exec (ADR
+    // 0040).
+    keel_linux_abi::process::spawn_with_fd3(
+        "keel-init",
+        &loaded,
+        keel_linux_abi::native::root_factory(),
+    )
+    .map_err(|_| "no process could be made")
 }
 
 fn on_off(enabled: bool) -> &'static str {

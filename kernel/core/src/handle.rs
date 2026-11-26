@@ -51,6 +51,25 @@ impl Rights {
     pub const TRANSFER: Rights = Rights(1 << 11);
     pub const SIGNAL: Rights = Rights(1 << 12);
     pub const WAIT: Rights = Rights(1 << 13);
+    /// Add grants to a compartment (P3-S2, ADR 0040).
+    pub const GRANT: Rights = Rights(1 << 14);
+
+    /// Every right there is.
+    pub const ALL: Rights = Rights((1 << 15) - 1);
+
+    /// The rights whose bits are set in `bits`; None if any bit names no
+    /// right (fail closed, SR-10).
+    pub const fn from_bits(bits: u32) -> Option<Rights> {
+        if bits & !Self::ALL.0 != 0 {
+            None
+        } else {
+            Some(Rights(bits))
+        }
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
 
     pub const fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
@@ -268,6 +287,24 @@ impl<T: Clone> HandleTable<T> {
         }
         let index = index_nospec(target, self.slots.len());
         Ok(self.slots[index].replace(copy))
+    }
+
+    /// Puts `handle` at exactly `fd`, which must be free (EBUSY) and below
+    /// the limit (EBADF): a new process's stdio (ADR 0040).
+    pub fn place(&mut self, fd: i32, handle: Handle<T>) -> Result<(), Errno> {
+        let target = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        if target >= self.limit {
+            return Err(Errno::EBADF);
+        }
+        if target >= self.slots.len() {
+            self.slots.resize_with(target + 1, || None);
+        }
+        let index = index_nospec(target, self.slots.len());
+        if self.slots[index].is_some() {
+            return Err(Errno::EBUSY);
+        }
+        self.slots[index] = Some(handle);
+        Ok(())
     }
 
     /// Removes `fd` and returns its handle.

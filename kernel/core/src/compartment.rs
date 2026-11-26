@@ -15,7 +15,7 @@
 //! soft resource limit ... was reached").
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 use crate::errno::Errno;
 use crate::vfs::Ino;
@@ -49,6 +49,15 @@ impl Limits {
         tmpfs_bytes: usize::MAX,
         tmpfs_nodes: usize::MAX,
     };
+
+    /// Whether every limit is at or below `ceiling`'s (a factory's, ADR
+    /// 0040).
+    pub fn fits_within(&self, ceiling: &Limits) -> bool {
+        self.processes <= ceiling.processes
+            && self.memory_frames <= ceiling.memory_frames
+            && self.tmpfs_bytes <= ceiling.tmpfs_bytes
+            && self.tmpfs_nodes <= ceiling.tmpfs_nodes
+    }
 }
 
 /// A count with a ceiling, shared by everything charged to it. Charging
@@ -126,6 +135,9 @@ pub struct Compartment {
     /// None when both tmpfs limits are unlimited (the system compartment):
     /// its files are bounded only by the filesystem's own caps.
     tmpfs: Option<Arc<Quota>>,
+    /// The wait status of its PID 1 once that has ended, else -1 (ADR
+    /// 0040: what `compartment_wait` reports to the launcher).
+    lead_status: AtomicI64,
 }
 
 impl Compartment {
@@ -146,7 +158,19 @@ impl Compartment {
                     })
                 },
             ),
+            lead_status: AtomicI64::new(-1),
         }
+    }
+
+    /// Records the wait status of its PID 1, which has ended.
+    pub fn set_lead_status(&self, status: i32) {
+        self.lead_status.store(i64::from(status), Ordering::Release);
+    }
+
+    /// The wait status of its PID 1, if that has ended.
+    pub fn lead_status(&self) -> Option<i32> {
+        let s = self.lead_status.load(Ordering::Acquire);
+        (s >= 0).then_some(s as i32)
     }
 
     pub fn id(&self) -> u32 {
@@ -245,6 +269,43 @@ mod tests {
                 ..Limits::UNLIMITED
             },
         ))
+    }
+
+    #[test]
+    fn limits_fit_beneath_a_ceiling_field_by_field() {
+        let ceiling = Limits {
+            processes: 64,
+            memory_frames: 1000,
+            tmpfs_bytes: 4096,
+            tmpfs_nodes: 10,
+        };
+        assert!(ceiling.fits_within(&ceiling));
+        assert!(ceiling.fits_within(&Limits::UNLIMITED));
+        assert!(!Limits::UNLIMITED.fits_within(&ceiling));
+        for over in [
+            Limits {
+                processes: 65,
+                ..ceiling
+            },
+            Limits {
+                memory_frames: 1001,
+                ..ceiling
+            },
+            Limits {
+                tmpfs_bytes: 4097,
+                ..ceiling
+            },
+            Limits {
+                tmpfs_nodes: 11,
+                ..ceiling
+            },
+        ] {
+            assert!(!over.fits_within(&ceiling), "{over:?}");
+        }
+        let c = compartment(2);
+        assert_eq!(c.lead_status(), None);
+        c.set_lead_status(3 << 8);
+        assert_eq!(c.lead_status(), Some(3 << 8));
     }
 
     #[test]

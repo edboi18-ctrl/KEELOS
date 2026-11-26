@@ -186,6 +186,22 @@ Numbers checked against Linux v6.12 `arch/x86/entry/syscalls/syscall_64.tbl`,
 flags and structures against the uapi headers listed in
 `kernel/linux-abi/src/abi.rs`.
 
+## Native calls (P3-S2, ADR 0040)
+
+Keel's own, numbered from `0x1000_0000` (above Linux's x86-64 numbers,
+below the x32 bit). Only a process holding a factory handle can create a
+compartment; the kernel gives the first one to `/sbin/keel-init` alone.
+
+| Nr | Call | Needs | Notes |
+| --- | --- | --- | --- |
+| +0 | `restrict(fd, rights)` | DUPLICATE | A new descriptor with the rights it had and `rights` both; bits naming no right EINVAL. |
+| +1 | `factory_derive(factory, limits*)` | CREATE | A factory whose ceiling fits beneath this one's (EPERM). |
+| +2 | `compartment_create(factory, rootfd, limits*)` | CREATE; ENUMERATE on `rootfd` | An empty compartment rooted at the directory (ENOTDIR first), with limits beneath the ceiling (EPERM); reserved bytes or no processes EINVAL. |
+| +3 | `compartment_grant_device(c, device)` | GRANT | `/dev/<name>` in its tree: null 1, zero 2, urandom 3, tty 4, ptmx 5 (and `/dev/pts`); no `/dev` ENOENT, EEXIST, unknown EINVAL. |
+| +4 | `compartment_spawn(c, path, argv, envp, stdio)` | CREATE; DUPLICATE on each stdio fd | The program beneath its root as a new process (the first PID 1), with fds 0 to 2 from `stdio` (-1: closed) and nothing else; a factory or compartment handle EPERM. Returns the PID. |
+| +5 | `compartment_kill(c, signal)` | SIGNAL | To every process in it. |
+| +6 | `compartment_wait(c, usage*, flags)` | WAIT (STAT with WNOHANG) | Processes, PID 1's wait status (-1 while it runs), memory, tmpfs bytes and nodes; without WNOHANG, after the last process is gone (ERESTARTSYS on a signal). |
+
 ## Standard handles
 
 Every process starts with `/dev/console` on fd 0 (READ, STAT, SEEK,
