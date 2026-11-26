@@ -185,6 +185,20 @@ Started 2026-11-22, after the Phase 2 audit cleared it
 | P3-S1 (first part) | Compartment kernel object; per-compartment root and PID space | Done for files and PIDs (ADR 0014). `keel_core::compartment`: every process belongs to one compartment, which fixes its root (so absolute paths and `AT_FDCWD` cannot reach outside it: Phase 2 audit item 2) and numbers its processes from 1 (`getpid`, now implemented). Boot and test programs run in the system compartment (root `/`). `compartment.files_confined`: two compartments cannot name each other's files, or the system's, in either direction. With the system root given to every process again, all three probe runs fail. Socket names, IPC names, the procfs view and signals become per compartment as each arrives (ADR 0014, "Not yet covered"). |
 | P3-S4 (in part) | Per-compartment limits and accounting | Processes and memory done (ADR 0014). Processes: `EAGAIN` at the limit, as fork(2) at `RLIMIT_NPROC`. Memory: every user page and user page table an address space holds is charged to its compartment's budget. A fault past the limit ends the program, and all frames come back. `compartment.memory_limit`: 64 MiB of touches against 17 MiB stop within the limit, the budget and the free frame count return to where they were, and another compartment runs normally (security acceptance P3 item 3, for memory). Each rule fails its test when removed. tmpfs: each compartment's file bytes and created nodes are capped by its own quota. Bytes are charged to a file's owner; a file the kernel placed is charged to the first compartment that grows it. `ENOSPC` at the limit. `compartment.tmpfs_quota`: two compartments each reach exactly their own 64 KiB and 8 nodes, and truncation gives bytes back. This closes Phase 2 audit item 1. Each rule fails its test when removed. Left for P3-S4: none of the audit's items. Handles are bounded per process (1024) and processes per compartment. |
 
+Phase 3 acceptance progress (the task rows above stop at P3-S4; ADRs
+0020 to 0037 record the later tasks):
+- Item 2 (a dynamically linked musl program using pthreads, a signal
+  handler on an alternate stack, and a Unix socket to a forked child):
+  `acceptance.musl_threads_signals_socket`, from
+  `fixtures/musl-dynamic/acceptance2`, which also passes under Linux
+  (`host.musl-acceptance2`). Its line is required on serial. Two
+  mutations of the kernel, SA_ONSTACK ignored and tgkill sent to the
+  process instead of the thread, each make it fail.
+- Item 3 (static BusyBox `sh` on the serial console): `console.busybox`
+  (ADR 0034). BusyBox's own suite passes the 896 tests
+  `fixtures/busybox/keel-expected.txt` lists (`busybox.testsuite`).
+- Items 1 and 4: not yet.
+
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and

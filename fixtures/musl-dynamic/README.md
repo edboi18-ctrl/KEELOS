@@ -27,7 +27,8 @@ the same as `fixtures/musl-hello`. The build writes these files to `out/`:
   `musl-1.2.6-r3`;
 - `greet` and `libkeelgreet.so`, with `greet.sha256` and
   `libkeelgreet.sha256`;
-- `threads` and `signals`, with `threads.sha256` and `signals.sha256`.
+- `threads`, `signals` and `acceptance2`, with `threads.sha256`,
+  `signals.sha256` and `acceptance2.sha256`.
 
 ## Reference build
 
@@ -60,6 +61,15 @@ Two more builds with `--no-cache` gave the same hashes and the same
 linker. The toolchain was gcc 15.2.0-r5, musl 1.2.6-r3 and
 binutils 2.45.1-r1, on Alpine 3.24.4. `cargo xtask build` refuses either
 file if its hash differs.
+
+- `acceptance2` (Phase 3 acceptance item 2: threads, signal handlers on
+  each thread's alternate stack, and a Unix socket to a forked child; see
+  the comments in `acceptance2.c`): SHA-256
+  `7784073c339971e050451b0effd581eae76dd64d2918bb7cd5065cb80c3fbbd6`.
+  Built on 2026-11-26, twice with `--no-cache`, giving the same hash.
+  Every other output was byte-for-byte the same as before. Alpine had
+  updated one toolchain dependency, zstd-libs 1.5.7-r2 to 1.6.0-r1, and
+  `packages.txt` now records that build.
 
 Under Linux, `cargo xtask test` runs each program as
 `ld-musl-x86_64.so.1 program`, since musl's dynamic linker can be run as

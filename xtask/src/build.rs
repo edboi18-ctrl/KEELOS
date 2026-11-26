@@ -501,6 +501,18 @@ pub const TEST_FIXTURES: &[TestFixture] = &[
         stdout: Some("signals: 24 checks passed\n"),
         host_via: Some("lib/ld-musl-x86_64.so.1"),
     },
+    // Phase 3 acceptance item 2: POSIX threads, signal handlers on each
+    // thread's alternate stack, and a Unix socket to a forked child, in
+    // one dynamically linked musl program.
+    TestFixture {
+        path: "test/musl-acceptance2",
+        file: "fixtures/musl-dynamic/acceptance2",
+        hash_file: "fixtures/musl-dynamic/acceptance2.sha256",
+        stdout: Some(
+            "acceptance2: 4 threads took signals on their own alternate stacks; sum 10028 from a forked child over a Unix socket\n",
+        ),
+        host_via: Some("lib/ld-musl-x86_64.so.1"),
+    },
     TestFixture {
         path: "lib/libkeelgreet.so",
         file: "fixtures/musl-dynamic/libkeelgreet.so",

@@ -80,6 +80,8 @@ pub const PHASES: &[Phase] = &[
             "Hello from a musl shared library on Keel (count 3)",
             "threads: 4 workers, counter 40000, results 100, thread-local values kept",
             "signals: 24 checks passed",
+            // Acceptance P3 item 2.
+            "acceptance2: 4 threads took signals on their own alternate stacks; sum 10028 from a forked child over a Unix socket",
         ],
         expect_prefixes: &[],
     },

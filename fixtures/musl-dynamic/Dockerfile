@@ -2,11 +2,12 @@
 # the base image by digest (SR-29); every installed package with its exact
 # version is written to packages.txt; the outputs are hash-pinned by the
 # committed hello.sha256, ld-musl.sha256, greet.sha256,
-# libkeelgreet.sha256, threads.sha256 and signals.sha256.
+# libkeelgreet.sha256, threads.sha256, signals.sha256 and
+# acceptance2.sha256.
 FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS build
 RUN apk add --no-cache gcc musl-dev
 WORKDIR /src
-COPY hello.c greet.c greet-main.c threads.c signals.c ./
+COPY hello.c greet.c greet-main.c threads.c signals.c acceptance2.c ./
 # Alpine's gcc links position-independent and dynamically by default; the
 # interpreter is /lib/ld-musl-x86_64.so.1. --build-id=none and
 # -ffile-prefix-map keep the output independent of the build machine.
@@ -20,7 +21,10 @@ RUN gcc -std=c11 -O2 -ffile-prefix-map=/src=. -Wl,--build-id=none -o hello hello
         -o threads threads.c \
  && gcc -std=c11 -O2 -pthread -ffile-prefix-map=/src=. -Wl,--build-id=none \
         -o signals signals.c \
- && strip greet libkeelgreet.so threads signals \
+ && gcc -std=c11 -O2 -pthread -ffile-prefix-map=/src=. -Wl,--build-id=none \
+        -o acceptance2 acceptance2.c \
+ && strip greet libkeelgreet.so threads signals acceptance2 \
+ && sha256sum acceptance2 > acceptance2.sha256 \
  && sha256sum threads > threads.sha256 \
  && sha256sum signals > signals.sha256 \
  && sha256sum greet > greet.sha256 \
@@ -32,4 +36,4 @@ RUN gcc -std=c11 -O2 -ffile-prefix-map=/src=. -Wl,--build-id=none -o hello hello
  && apk info -W /lib/ld-musl-x86_64.so.1 > ld-musl.owner
 
 FROM scratch
-COPY --from=build /src/hello /src/ld-musl-x86_64.so.1 /src/packages.txt /src/hello.sha256 /src/ld-musl.sha256 /src/ld-musl.owner /src/greet /src/libkeelgreet.so /src/greet.sha256 /src/libkeelgreet.sha256 /src/threads /src/threads.sha256 /src/signals /src/signals.sha256 /
+COPY --from=build /src/hello /src/ld-musl-x86_64.so.1 /src/packages.txt /src/hello.sha256 /src/ld-musl.sha256 /src/ld-musl.owner /src/greet /src/libkeelgreet.so /src/greet.sha256 /src/libkeelgreet.sha256 /src/threads /src/threads.sha256 /src/signals /src/signals.sha256 /src/acceptance2 /src/acceptance2.sha256 /

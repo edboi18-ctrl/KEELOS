@@ -1934,6 +1934,7 @@ fn phase3(t: &mut Runner) {
     phase3_exit_status_order(t);
     phase3_threads(t);
     phase3_signals(t);
+    phase3_acceptance2(t);
     phase3_shared_mappings(t);
     phase3_filesystem(t);
     phase3_descriptors(t);
@@ -2016,6 +2017,39 @@ fn phase3_signals(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  signals: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// Phase 3 acceptance item 2 (fixtures/musl-dynamic/acceptance2): a
+/// dynamically linked musl program whose four threads each take SIGUSR1
+/// on their own alternate stack (SA_ONSTACK, checked in the handler),
+/// then send values over a Unix stream socket, bound in /tmp, to a forked
+/// child that sends back their sum; the main thread takes a signal on
+/// its alternate stack too. It passes on Linux too
+/// (`host.musl-acceptance2`) and its line is checked on serial. Every
+/// frame, process and tmpfs node must come back.
+fn phase3_acceptance2(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/musl-acceptance2";
+    let outside_heap = frames_outside_heap;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && processes_after == processes
+        && frames_after == frames
+        && nodes_after == nodes_before;
+    t.check(
+        "acceptance.musl_threads_signals_socket",
+        ok,
+        "Phase 3 acceptance item 2: a dynamically linked musl program with four POSIX threads, each taking a signal on its own alternate stack, and a Unix socket to a forked child that sums what they send; nothing left over",
+    );
+    if !ok {
+        kprintln!(
+            "  acceptance2: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}; nodes {nodes_before} -> {nodes_after}"
         );
     }
 }
