@@ -71,6 +71,8 @@ pub mod nr {
     pub const CLOCK_GETTIME: u64 = 228;
     pub const NANOSLEEP: u64 = 35;
     pub const VFORK: u64 = 58;
+    pub const MKNOD: u64 = 133;
+    pub const MKNODAT: u64 = 259;
     pub const RT_SIGSUSPEND: u64 = 130;
     pub const RESTART_SYSCALL: u64 = 219;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -406,6 +408,10 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
         )
     });
     t[nr::RESTART_SYSCALL as usize] = Some(|p, _| crate::sleep::restart_syscall(p));
+    t[nr::MKNOD as usize] =
+        Some(|p, a| crate::fscalls::mknodat(p, AT_FDCWD, a[0], a[1] as u32, a[2] as u32));
+    t[nr::MKNODAT as usize] =
+        Some(|p, a| crate::fscalls::mknodat(p, a[0] as u32 as i32, a[1], a[2] as u32, a[3] as u32));
     t[nr::RT_SIGSUSPEND as usize] = Some(|p, a| crate::signal::rt_sigsuspend(p, a[0], a[1]));
     t[nr::GETRANDOM as usize] = Some(|_, a| getrandom(a[0], a[1], a[2] as u32 as u64));
     t
@@ -991,7 +997,8 @@ fn read_at(
             Kind::Directory => return Err(Errno::EISDIR),
             // A descriptor never names a symbolic link itself (open
             // follows it, O_NOFOLLOW refuses it).
-            Kind::Symlink | Kind::Socket => return Err(Errno::EINVAL),
+            // An open FIFO is a pipe end, never a file description.
+            Kind::Symlink | Kind::Socket | Kind::Fifo => return Err(Errno::EINVAL),
             // No lock held: a console read can wait for the keyboard.
             Kind::Device(device) => fs::device_read(device, &mut chunk[..want])?,
         };
@@ -1112,7 +1119,7 @@ pub(crate) fn write_at(
                         Err(_) => break,
                     }
                 }
-                Kind::Symlink | Kind::Socket => return Err(Errno::EINVAL),
+                Kind::Symlink | Kind::Socket | Kind::Fifo => return Err(Errno::EINVAL),
                 Kind::Directory => return Err(Errno::EISDIR),
                 Kind::Device(device) => fs::device_write(device, &chunk[..want]),
             }
@@ -1303,6 +1310,22 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         Ok((node, kind))
     })?;
     let (node, kind) = node;
+    // A FIFO opens as a pipe end on the node's pipe (`fifo_open`, ADR
+    // 0035), which keeps the pin.
+    if kind == Kind::Fifo {
+        let object = crate::ready::open_fifo(p, node, flags)?;
+        let rights = Rights::STAT
+            | Rights::DUPLICATE
+            | if read { Rights::READ } else { Rights::NONE }
+            | if write { Rights::WRITE } else { Rights::NONE };
+        let handle = Handle {
+            object,
+            rights,
+            close_on_exec: flags & O_CLOEXEC != 0,
+        };
+        let fd = p.lock().handles.insert(handle)?;
+        return Ok(fd as u64);
+    }
     let open = OpenFile {
         node,
         kind,

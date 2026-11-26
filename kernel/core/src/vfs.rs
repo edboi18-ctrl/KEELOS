@@ -52,6 +52,7 @@ pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFSOCK: u32 = 0o140000;
+pub const S_IFIFO: u32 = 0o010000;
 
 /// tmpfs's size for each directory entry, and for an empty directory two
 /// of them (`BOGO_DIRENT_SIZE` 20, `mm/shmem.c`), which `stat` reports as a
@@ -126,6 +127,9 @@ enum Contents {
     /// A Unix domain socket's name (bind(2), ADR 0027): which socket, if
     /// any, it names is the socket layer's record, not the node's.
     Socket,
+    /// A FIFO (mknod(2) with S_IFIFO, ADR 0035): its pipe, while open, is
+    /// the pipe layer's, as Linux's `inode->i_pipe`.
+    Fifo,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +168,8 @@ pub enum Kind {
     Symlink,
     /// A Unix socket's name in the filesystem (ADR 0027).
     Socket,
+    /// A FIFO, a named pipe (ADR 0035).
+    Fifo,
 }
 
 /// File status, the parts `stat(2)` reports.
@@ -421,6 +427,7 @@ impl Fs {
             Contents::Device(device) => Kind::Device(device),
             Contents::Symlink(_) => Kind::Symlink,
             Contents::Socket => Kind::Socket,
+            Contents::Fifo => Kind::Fifo,
         })
     }
 
@@ -748,6 +755,19 @@ impl Fs {
         quota: Option<&Arc<Quota>>,
     ) -> Result<Ino, Errno> {
         let node = Node::new(Contents::Socket, permissions, quota.cloned(), self.now());
+        self.add(dir, name, node)
+    }
+
+    /// Creates a FIFO (`vfs_mknod` with S_IFIFO, ADR 0035), owned by
+    /// `quota`, which is charged one node: EEXIST if the name is taken.
+    pub fn create_fifo_as(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        permissions: u32,
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<Ino, Errno> {
+        let node = Node::new(Contents::Fifo, permissions, quota.cloned(), self.now());
         self.add(dir, name, node)
     }
 
@@ -1313,6 +1333,7 @@ impl Fs {
             Contents::Device(device) => (S_IFCHR, 0, node.links, device.number()),
             Contents::Symlink(target) => (S_IFLNK, target.len() as u64, node.links, (0, 0)),
             Contents::Socket => (S_IFSOCK, 0, node.links, (0, 0)),
+            Contents::Fifo => (S_IFIFO, 0, node.links, (0, 0)),
         };
         Ok(Stat {
             ino,

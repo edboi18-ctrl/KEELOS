@@ -201,8 +201,10 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
     let open = file(p, fd, Rights::SEEK)?;
     let mut f = open.lock();
     let size = match f.kind {
-        // A terminal is opened non-seekable (`tty_open`).
+        // A terminal is opened non-seekable (`tty_open`); an open FIFO is
+        // a pipe end, never a file description, but would be too.
         Kind::Device(d) if d.is_tty() => return Err(Errno::ESPIPE),
+        Kind::Fifo => return Err(Errno::ESPIPE),
         Kind::Device(_) => {
             f.offset = 0;
             return Ok(0);
@@ -247,10 +249,11 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
     Ok(new as u64)
 }
 
-/// `d_type` values (`include/linux/fs_types.h`: DT_CHR 2, DT_DIR 4,
-/// DT_REG 8, DT_LNK 10, DT_SOCK 12).
+/// `d_type` values (`include/linux/fs_types.h`: DT_FIFO 1, DT_CHR 2,
+/// DT_DIR 4, DT_REG 8, DT_LNK 10, DT_SOCK 12).
 fn d_type(kind: Kind) -> u8 {
     match kind {
+        Kind::Fifo => 1,
         Kind::Device(_) => 2,
         Kind::Directory => 4,
         Kind::File => 8,
@@ -384,6 +387,50 @@ pub fn mkdirat(p: &ProcessRef, dirfd: i32, path: u64, mode: u32) -> SysResult {
     let umask = p.lock().umask;
     let quota = quota_of(p);
     fs::with(|fs| fs.create_dir_as(parent.dir, name, mode & 0o1777 & !umask, quota.as_ref()))?;
+    Ok(0)
+}
+
+/// mknodat(2) and mknod(2) (`do_mknodat`, ADR 0035), in Linux's order:
+/// - `may_mknod`: a directory's type EPERM, an unknown type EINVAL;
+/// - `filename_create`: the parent's lookup errors; a last component that
+///   is not a name, or a name that exists, EEXIST; with a trailing slash,
+///   EEXIST if it exists, else ENOENT;
+/// - then a regular file (type 0 or S_IFREG), a FIFO or a socket node,
+///   with the umask applied and charged to the compartment's quota. A
+///   character or block device is EPERM: it needs CAP_MKNOD
+///   (`vfs_mknod`), which Keel's compartments do not have; their /dev is
+///   the kernel's.
+pub fn mknodat(p: &ProcessRef, dirfd: i32, path: u64, mode: u32, _dev: u32) -> SysResult {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFBLK: u32 = 0o060000;
+    let kind = mode & S_IFMT;
+    match kind {
+        0 | vfs::S_IFREG | vfs::S_IFIFO | vfs::S_IFSOCK | vfs::S_IFCHR | S_IFBLK => {}
+        vfs::S_IFDIR => return Err(Errno::EPERM),
+        _ => return Err(Errno::EINVAL),
+    }
+    let path = user_path(path)?;
+    let parent = parent_of(p, dirfd, &path)?;
+    let Last::Name(name) = parent.last else {
+        return Err(Errno::EEXIST);
+    };
+    let umask = p.lock().umask;
+    let quota = quota_of(p);
+    let permissions = mode & 0o7777 & !umask;
+    fs::with(|fs| {
+        if fs.child(parent.dir, name).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+        if parent.trailing_slash {
+            return Err(Errno::ENOENT);
+        }
+        match kind {
+            vfs::S_IFIFO => fs.create_fifo_as(parent.dir, name, permissions, quota.as_ref()),
+            vfs::S_IFSOCK => fs.create_socket_as(parent.dir, name, permissions, quota.as_ref()),
+            vfs::S_IFCHR | S_IFBLK => Err(Errno::EPERM),
+            _ => fs.create_file_as(parent.dir, name, permissions, quota.as_ref()),
+        }
+    })?;
     Ok(0)
 }
 

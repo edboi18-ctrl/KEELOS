@@ -50,17 +50,177 @@ pub fn wait(ready: impl FnMut() -> bool, deadline: Option<u64>) -> Waited {
 /// share. Dropping the last descriptor of an end closes it.
 pub struct PipeEnd {
     pub pipe: Arc<IrqMutex<Pipe>>,
+    /// What this open file description reads and writes: one of them for
+    /// an anonymous pipe's end, either or both for a FIFO's open
+    /// (FMODE_READ, FMODE_WRITE; ADR 0035).
+    pub read: bool,
     pub write: bool,
     pub status: IrqMutex<u64>,
     /// A number for stat's st_ino, the pipe's (both ends share it).
     pub ino: u64,
+    /// A FIFO's node, pinned while this is open: stat and statfs report it
+    /// (ADR 0035). None for an anonymous pipe.
+    pub fifo: Option<Ino>,
+    /// A FIFO opened for reading with O_NONBLOCK before any writer: the
+    /// pipe's `w_counter` then. POLLHUP is not reported until a writer
+    /// has come (`f_pipe`, `pipe_poll`).
+    pub hup_after: Option<u32>,
 }
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
-        self.pipe.lock().close_end(self.write);
+        {
+            let mut pipe = self.pipe.lock();
+            if self.read {
+                pipe.close_end(false);
+            }
+            if self.write {
+                pipe.close_end(true);
+            }
+        }
         changed();
+        if let Some(node) = self.fifo {
+            let _ = crate::fs::with(|fs| {
+                fs.unpin(node);
+                Ok(())
+            });
+        }
     }
+}
+
+/// Each FIFO's pipe while it is open (`inode->i_pipe`), by node. The pipe
+/// goes, its data with it, when its last open file description does
+/// (`put_pipe_info`), so the map holds it weakly.
+static FIFOS: IrqMutex<alloc::collections::BTreeMap<Ino, alloc::sync::Weak<IrqMutex<Pipe>>>> =
+    IrqMutex::new(alloc::collections::BTreeMap::new());
+
+/// `fifo_open` (fs/pipe.c, ADR 0035): opens FIFO `node`, which the caller
+/// has pinned (the end unpins it when it goes), with open(2)'s `flags`.
+/// - O_RDONLY: a reader. With no writer it waits for one to open (the
+///   pipe's `w_counter` to change), unless O_NONBLOCK.
+/// - O_WRONLY: a writer. With no reader, ENXIO if O_NONBLOCK, else it
+///   waits for a reader.
+/// - O_RDWR: both, and never waits.
+///
+/// A wait a signal interrupts is ERESTARTSYS (`wait_for_partner`), with
+/// this open's count taken back. Every open wakes waiters on the other
+/// side (`wake_up_partner`).
+pub fn open_fifo(p: &ProcessRef, node: Ino, flags: u64) -> Result<Object, Errno> {
+    let pipe = {
+        let mut fifos = FIFOS.lock();
+        fifos.retain(|_, w| w.strong_count() > 0);
+        match fifos.get(&node).and_then(alloc::sync::Weak::upgrade) {
+            Some(pipe) => pipe,
+            None => {
+                let pipe = Arc::new(IrqMutex::new(Pipe::fifo()));
+                fifos.insert(node, Arc::downgrade(&pipe));
+                pipe
+            }
+        }
+    };
+    let access = flags & crate::abi::O_ACCMODE;
+    let (read, write) = (access != O_WRONLY, access != O_RDONLY);
+    let nonblock = flags & O_NONBLOCK != 0;
+    let unpin = || {
+        let _ = crate::fs::with(|fs| {
+            fs.unpin(node);
+            Ok(())
+        });
+    };
+    let mut hup_after = None;
+    // Opens on the other side since `start`, or a signal, end a wait.
+    let wait = |partner_writers: bool, start: u32| {
+        let moved = |pipe: &Pipe| {
+            if partner_writers {
+                pipe.w_counter != start
+            } else {
+                pipe.r_counter != start
+            }
+        };
+        loop {
+            if moved(&pipe.lock()) {
+                return true;
+            }
+            if crate::signal::pending_unblocked(p) || sched::interrupted() {
+                return moved(&pipe.lock());
+            }
+            wait(
+                || moved(&pipe.lock()) || crate::signal::pending_unblocked(p),
+                None,
+            );
+        }
+    };
+    match (read, write) {
+        (true, false) => {
+            let start = {
+                let mut q = pipe.lock();
+                q.r_counter = q.r_counter.wrapping_add(1);
+                q.readers += 1;
+                q.w_counter
+            };
+            changed();
+            let writers = pipe.lock().writers;
+            if writers == 0 {
+                if nonblock {
+                    hup_after = Some(start);
+                } else if !wait(true, start) {
+                    pipe.lock().close_end(false);
+                    changed();
+                    unpin();
+                    return Err(Errno::ERESTARTSYS);
+                }
+            }
+        }
+        (false, true) => {
+            let start = {
+                let mut q = pipe.lock();
+                if nonblock && q.readers == 0 {
+                    drop(q);
+                    unpin();
+                    return Err(Errno::ENXIO);
+                }
+                q.w_counter = q.w_counter.wrapping_add(1);
+                q.writers += 1;
+                q.r_counter
+            };
+            changed();
+            let readers = pipe.lock().readers;
+            if readers == 0 && !wait(false, start) {
+                pipe.lock().close_end(true);
+                changed();
+                unpin();
+                return Err(Errno::ERESTARTSYS);
+            }
+        }
+        _ => {
+            {
+                let mut q = pipe.lock();
+                q.readers += 1;
+                q.writers += 1;
+                q.r_counter = q.r_counter.wrapping_add(1);
+                q.w_counter = q.w_counter.wrapping_add(1);
+            }
+            changed();
+        }
+    }
+    Ok(Object::Pipe(Arc::new(PipeEnd {
+        pipe,
+        read,
+        write,
+        // f_flags as a file's: O_LARGEFILE added; O_CREAT, O_EXCL,
+        // O_NOCTTY, O_TRUNC and O_CLOEXEC not kept.
+        status: IrqMutex::new(
+            (flags | crate::abi::O_LARGEFILE)
+                & !(crate::abi::O_CREAT
+                    | crate::abi::O_EXCL
+                    | crate::abi::O_NOCTTY
+                    | crate::abi::O_TRUNC
+                    | O_CLOEXEC),
+        ),
+        ino: node,
+        fifo: Some(node),
+        hup_after,
+    })))
 }
 
 /// An eventfd, as an open file description.
@@ -90,9 +250,12 @@ pub fn pipe2(p: &ProcessRef, fds: u64, flags: u64) -> SysResult {
     let end = |write: bool| {
         Object::Pipe(Arc::new(PipeEnd {
             pipe: pipe.clone(),
+            read: !write,
             write,
             status: IrqMutex::new(status | if write { O_WRONLY } else { O_RDONLY }),
             ino,
+            fifo: None,
+            hup_after: None,
         }))
     };
     let base = Rights::STAT | Rights::DUPLICATE;
@@ -439,11 +602,29 @@ fn write_eventfd(file: &EventFile, segs: &[(u64, u64)]) -> SysResult {
     }
 }
 
+/// `pipe_poll`: the reader's events if the end reads, the writer's if it
+/// writes (both for a FIFO opened O_RDWR); no POLLHUP for a FIFO's
+/// nonblocking reader until a writer has opened it.
+fn pipe_poll(end: &PipeEnd) -> u16 {
+    let pipe = end.pipe.lock();
+    let mut mask = 0;
+    if end.read {
+        mask |= pipe.poll(true);
+        if end.hup_after == Some(pipe.w_counter) {
+            mask &= !keel_core::poll::POLLHUP;
+        }
+    }
+    if end.write {
+        mask |= pipe.poll(false);
+    }
+    mask
+}
+
 /// The poll mask of a pipe end, eventfd or epoll instance, or None for a
 /// file.
 pub fn poll_mask(object: &Object) -> Option<u16> {
     Some(match object {
-        Object::Pipe(end) => end.pipe.lock().poll(!end.write),
+        Object::Pipe(end) => pipe_poll(end),
         Object::EventFd(file) => file.counter.lock().poll(),
         Object::Epoll(ep) => crate::epoll::poll_mask(ep),
         Object::Socket(s) => s.poll(),
@@ -475,6 +656,12 @@ const ANON_INODE_INO: u64 = 0xFFFF << 48;
 pub fn stat_bytes(object: &Object) -> Option<[u8; 144]> {
     const S_IFIFO: u32 = 0o010000;
     let (ino, mode, dev) = match object {
+        // A FIFO is its node on tmpfs (`vfs_getattr` of the inode).
+        Object::Pipe(end) if end.fifo.is_some() => {
+            let node = end.fifo?;
+            let stat = crate::fs::with(|fs| fs.stat(node)).ok()?;
+            return Some(crate::abi::stat_bytes(&stat));
+        }
         Object::Pipe(end) => (end.ino, S_IFIFO | 0o600, PIPEFS_DEV),
         // An epoll instance is the same anonymous inode.
         Object::EventFd(_) | Object::Epoll(_) => (ANON_INODE_INO, 0o600, ANON_INODE_DEV),
@@ -500,6 +687,8 @@ pub fn stat_bytes(object: &Object) -> Option<[u8; 144]> {
 /// eventfd (ANON_INODE_FS_MAGIC), `include/uapi/linux/magic.h`.
 pub fn statfs_magic(object: &Object) -> Option<u64> {
     match object {
+        // A FIFO is on tmpfs: the file path answers.
+        Object::Pipe(end) if end.fifo.is_some() => None,
         Object::Pipe(_) => Some(0x5049_5045),
         Object::EventFd(_) | Object::Epoll(_) => Some(0x0904_1934),
         // SOCKFS_MAGIC.

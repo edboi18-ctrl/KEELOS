@@ -87,13 +87,41 @@ impl Wakes {
         }
     }
 
+    /// The wakes of two queues as one (an object that waits on both, as a
+    /// FIFO opened for reading and writing): each key's counts added. A
+    /// key that finds no slot is counted as a wake for everything, so a
+    /// wake is never lost, only possibly spurious.
+    pub fn merged(&self, other: &Wakes) -> Wakes {
+        let mut out = *self;
+        for &(key, n) in other.counts.iter().filter(|&&(_, n)| n > 0) {
+            let slot = out
+                .counts
+                .iter()
+                .position(|&(k, m)| k == key && m > 0)
+                .or_else(|| out.counts.iter().position(|&(_, m)| m == 0));
+            match slot {
+                Some(i) => {
+                    out.counts[i].0 = key;
+                    out.counts[i].1 += n;
+                }
+                None => out.wake_all_slot_by(n),
+            }
+        }
+        out
+    }
+
     fn wake_all_slot(&mut self) {
+        self.wake_all_slot_by(1);
+    }
+
+    /// `n` wakes for everything.
+    fn wake_all_slot_by(&mut self, n: u64) {
         if let Some(i) = self.counts.iter().position(|&(k, _)| k == 0) {
-            self.counts[i].1 += 1;
+            self.counts[i].1 += n;
         } else {
             // Turn the least used slot into the everything slot.
             let i = (0..4).min_by_key(|&i| self.counts[i].1).unwrap_or(0);
-            self.counts[i] = (0, self.counts[i].1 + 1);
+            self.counts[i] = (0, self.counts[i].1 + n);
         }
     }
 

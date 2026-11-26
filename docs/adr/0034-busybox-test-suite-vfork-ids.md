@@ -79,10 +79,11 @@ The rules are Linux v6.12's:
    time zone data (date). The other 8 (awk, two of cpio, dd, three of
    sed, unzip) were not looked into; they fail on Keel too.
 
-   `keel-expected.txt` is every one of those passes, except 18 that need
-   what Keel lacks:
+   `keel-expected.txt` is every one of those passes, except 18 that
+   needed what Keel lacked (15 since ADR 0035 added FIFOs):
    - **chroot(2)**, which 13 mdev tests run in;
-   - **FIFOs** (mkfifo is mknod with S_IFIFO), for 3 diff tests;
+   - **FIFOs** (mkfifo is mknod with S_IFIFO), for 3 diff tests (done
+     in ADR 0035);
    - **the PID directories of /proc**, which pidof lists (2 tests).
 
 ## Not yet covered

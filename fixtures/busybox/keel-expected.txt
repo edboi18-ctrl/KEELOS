@@ -17,10 +17,6 @@
 #   mdev regexp substring match + replace
 #   mdev stops on first rule
 #   move rule does not delete node with name == device_name
-# Not yet on Keel: FIFOs: mkfifo is mknod(2) with S_IFIFO, not implemented:
-#   diff -rN does not read non-regular files
-#   diff of dir and fifo
-#   diff of file and fifo
 # Not yet on Keel: the PID directories in /proc, which pidof lists (procfs is the traced subset, ADR 0024):
 #   pidof (exit with success)
 #   pidof this
@@ -351,6 +347,9 @@ PASS: diff -B does not ignore non-blank single line change
 PASS: diff always takes context from old file
 PASS: diff diff1 diff2/subdir
 PASS: diff dir dir2/file/-
+PASS: diff of dir and fifo
+PASS: diff of file and fifo
+PASS: diff -rN does not read non-regular files
 PASS: diff diff1 diff2/
 PASS: dirname-handles-absolute-path
 PASS: dirname-handles-empty-path

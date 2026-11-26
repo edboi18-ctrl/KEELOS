@@ -332,6 +332,26 @@ pub fn vfork_exec(path: &CStr, argv: &[&CStr], envp: &[&CStr]) -> i64 {
     unsafe { vfork_exec_raw(path.as_ptr().cast(), args.as_ptr(), env.as_ptr()) }
 }
 
+/// mknodat(2).
+pub fn mknodat(dirfd: i32, path: &CStr, mode: u32, dev: u64) -> i64 {
+    call6(
+        259,
+        [
+            dirfd as u32 as u64,
+            path.as_ptr() as u64,
+            u64::from(mode),
+            dev,
+            0,
+            0,
+        ],
+    )
+}
+
+/// mknod(2).
+pub fn mknod(path: &CStr, mode: u32, dev: u64) -> i64 {
+    call3(133, path.as_ptr() as u64, u64::from(mode), dev)
+}
+
 /// getuid(2), getgid(2), geteuid(2) and getegid(2), by number (102, 104,
 /// 107, 108).
 pub fn get_id(number: u64) -> i64 {

@@ -33,6 +33,11 @@ pub struct Pipe {
     data: VecDeque<u8>,
     pub readers: u32,
     pub writers: u32,
+    /// How many times a FIFO has been opened for reading and for writing
+    /// (`r_counter`, `w_counter`): a FIFO's open waits for the other count
+    /// to change (`wait_for_partner`, ADR 0035).
+    pub r_counter: u32,
+    pub w_counter: u32,
     /// The wakes of the readers' queue (`rd_wait`) and the writers'
     /// (`wr_wait`), for epoll (ADR 0026).
     pub rd_wakes: Wakes,
@@ -52,8 +57,20 @@ impl Pipe {
             data: VecDeque::new(),
             readers: 1,
             writers: 1,
+            r_counter: 0,
+            w_counter: 0,
             rd_wakes: Wakes::default(),
             wr_wakes: Wakes::default(),
+        }
+    }
+
+    /// A FIFO's pipe as its first open makes it (`alloc_pipe_info`): no
+    /// reader and no writer yet; each open adds its own.
+    pub fn fifo() -> Self {
+        Pipe {
+            readers: 0,
+            writers: 0,
+            ..Pipe::new()
         }
     }
 

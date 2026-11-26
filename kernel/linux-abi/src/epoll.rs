@@ -114,12 +114,13 @@ fn downgrade(object: &Object) -> Option<Target> {
 /// the console its read queue.
 fn wakes_of(object: &Object) -> Wakes {
     match object {
+        // A FIFO opened O_RDWR waits on both (`pipe_poll` by f_mode).
         Object::Pipe(end) => {
             let pipe = end.pipe.lock();
-            if end.write {
-                pipe.wr_wakes
-            } else {
-                pipe.rd_wakes
+            match (end.read, end.write) {
+                (true, true) => pipe.rd_wakes.merged(&pipe.wr_wakes),
+                (false, true) => pipe.wr_wakes,
+                _ => pipe.rd_wakes,
             }
         }
         Object::EventFd(file) => file.counter.lock().wakes,
