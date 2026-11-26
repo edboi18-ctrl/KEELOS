@@ -327,8 +327,11 @@ fn main(startup: &Startup) -> i32 {
     let mut io = [0u8; 64];
     let zero_tty = sys::ioctl(zero, TCGETS, &mut io);
     c.check("TCGETS on /dev/zero is ENOTTY", zero_tty == ENOTTY);
-    if keel {
-        // On Linux the harness captures stdout in a pipe, so these differ.
+    // On Linux, and in Keel's conformance runs (ADR 0039), the harness
+    // captures stdout in a pipe or a file, so these are checked only when
+    // stdout is Keel's console.
+    let console = sys::ioctl(1, TCGETS, &mut io) == 0;
+    if keel && console {
         c.check(
             "Keel only: stdout is a terminal with a size",
             sys::ioctl(1, TIOCGWINSZ, &mut io) == 0 && u16::from_le_bytes([io[0], io[1]]) > 0,
@@ -337,6 +340,8 @@ fn main(startup: &Startup) -> i32 {
             "Keel only: unknown terminal ioctl is ENOTTY",
             sys::ioctl(1, 0x5499, &mut io) == ENOTTY,
         );
+    }
+    if keel {
         // Files: create, write, stat, exclusive create, read back.
         let f = sys::openat(
             sys::AT_FDCWD,

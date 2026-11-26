@@ -199,7 +199,7 @@ gets only the direction it is for.
 | `/dev/console` | 5:1 | A terminal (ADR 0029): input from the keyboard and COM1, by interrupt, through the N_TTY line discipline (a serial console's settings, changeable with TCSETS). Output goes to COM1 and the screen, filtered to text (no control characters but tab, newline, CR and backspace, so no escape sequences). Every process shares the one console until compartments give each its own. | `fs.dev_nodes`, `fs.devices`, `console.keyboard_line`, `console.serial_line` |
 | `/dev/tty` | 5:0 | The opener's controlling terminal (ENXIO without one; ADR 0030). | `exec.job_control` |
 | `/dev/ptmx` | 5:2 | Opening it makes a pty pair and its slave node (ADR 0029); at most 64 at once (ENOSPC). | `exec.terminals` |
-| `/dev/pts/N` | 136+N/256 : N%256 | A pty slave, mode 0600, there while its master is open; locked until TIOCSPTLCK unlocks it (EIO). | `exec.terminals` |
+| `/dev/pts/N` | 136+N/256 : N%256 | A pty slave, mode 0600, there while its master is open, in the `/dev/pts` of the tree of the process that opened `/dev/ptmx` (each compartment its own, ADR 0039); locked until TIOCSPTLCK unlocks it (EIO). | `exec.terminals` |
 | `/dev/null` | 1:3 | Reads return end of file; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
 | `/dev/zero` | 1:5 | Reads return zeros; writes are discarded. No authority. | `fs.dev_nodes`, `fs.devices` |
 | `/dev/urandom` | 1:9 | Reads return bytes from the kernel generator (as getrandom); writes are discarded (they are not mixed in, so no process can influence the pool). No authority. | `fs.dev_nodes`, `fs.devices` |

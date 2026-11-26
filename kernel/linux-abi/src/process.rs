@@ -328,9 +328,17 @@ pub struct Spawned {
 
 /// The console as stdin (read) and stdout/stderr (write).
 fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
+    console_handles_as(handles, &[(true, false), (false, true), (false, true)])
+}
+
+/// The console, once for each (read, write) in `modes`, in order.
+fn console_handles_as(
+    handles: &mut HandleTable<Object>,
+    modes: &[(bool, bool)],
+) -> Result<(), Errno> {
     let console = crate::fs::lookup(b"/dev/console")?;
     let kind = Kind::Device(Device::Console);
-    for (read, write) in [(true, false), (false, true), (false, true)] {
+    for &(read, write) in modes {
         crate::fs::with(|fs| {
             fs.pin(console);
             Ok(())
@@ -358,6 +366,34 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Standard input and output from tmpfs files (the conformance tests,
+/// ADR 0039): fd 0 reads `stdin` from its start, fd 1 writes `stdout`, fd
+/// 2 is the console. Each open pins its node, as open(2) does.
+fn file_handles(handles: &mut HandleTable<Object>, stdin: Ino, stdout: Ino) -> Result<(), Errno> {
+    for (node, write) in [(stdin, false), (stdout, true)] {
+        crate::fs::with(|fs| {
+            fs.pin(node);
+            Ok(())
+        })?;
+        let file = OpenFile {
+            node,
+            kind: Kind::File,
+            offset: 0,
+            append: false,
+            status: crate::abi::O_LARGEFILE | if write { crate::abi::O_WRONLY } else { 0 },
+            comm: None,
+            proc: None,
+            tty: None,
+        };
+        handles.insert(Handle {
+            object: Object::File(Arc::new(IrqMutex::new(file))),
+            rights: file_rights(!write, write, Kind::File),
+            close_on_exec: false,
+        })?;
+    }
+    console_handles_as(handles, &[(false, true)])
+}
+
 /// Starts a loaded program as a new process in the system compartment,
 /// with the console on fds 0-2. The first process started gets PID 1.
 pub fn spawn(name: &'static str, loaded: &Loaded) -> Result<Spawned, Errno> {
@@ -375,13 +411,28 @@ pub fn spawn_in(
     name: &'static str,
     loaded: &Loaded,
 ) -> Result<Spawned, Errno> {
+    spawn_in_with(compartment, name, loaded, None)
+}
+
+/// As [`spawn_in`], with standard input and output from the tmpfs files
+/// `stdio` (input, output) instead of the console; standard error stays
+/// the console.
+pub fn spawn_in_with(
+    compartment: &Arc<Compartment>,
+    name: &'static str,
+    loaded: &Loaded,
+    stdio: Option<(Ino, Ino)>,
+) -> Result<Spawned, Errno> {
     let member = compartment.admit()?;
     loaded
         .space
         .attach_budget(compartment.memory().clone())
         .map_err(|_| Errno::ENOMEM)?;
     let mut handles = HandleTable::new(HANDLE_LIMIT);
-    console_handles(&mut handles)?;
+    match stdio {
+        Some((stdin, stdout)) => file_handles(&mut handles, stdin, stdout)?,
+        None => console_handles(&mut handles)?,
+    }
     let mut processes = PROCESSES.lock();
     let pid = member.pid();
     let root = compartment.root();

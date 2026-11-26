@@ -1,0 +1,4 @@
+exit 0
+syscalls: write works
+syscalls: writev works
+syscalls: all checks passed

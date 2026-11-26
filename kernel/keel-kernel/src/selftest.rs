@@ -71,6 +71,9 @@ pub enum Scenario {
     FaultInPanic = 6,
     /// Phase 3: BusyBox's own test suite (ADR 0034).
     BusyboxSuite = 7,
+    /// Phase 3: the conformance programs, each in a compartment, their
+    /// output for xtask to compare with Linux's (ADR 0039).
+    Conformance = 8,
     Unknown = 255,
 }
 
@@ -95,6 +98,7 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
         Some("smap") => Scenario::Smap,
         Some("fault_in_panic") => Scenario::FaultInPanic,
         Some("busybox_testsuite") => Scenario::BusyboxSuite,
+        Some("conformance") => Scenario::Conformance,
         Some(_) => Scenario::Unknown,
     }
 }
@@ -213,6 +217,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
         (2, Scenario::None) => phase2(&mut runner),
         (3, Scenario::None) => phase3(&mut runner),
         (3, Scenario::BusyboxSuite) => phase3_busybox_suite(&mut runner),
+        (3, Scenario::Conformance) => phase3_conformance(&mut runner),
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -2064,6 +2069,193 @@ fn phase3_acceptance2(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  acceptance2: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}; nodes {nodes_before} -> {nodes_after}"
+        );
+    }
+}
+
+/// The tree the conformance programs' compartments share (ADR 0039):
+/// what they look for, linked from the system tree, and nothing else.
+/// - `/dev`: null, zero, urandom, tty and ptmx (made by the kernel: a
+///   compartment cannot make devices), and an empty `pts`;
+/// - `/tmp`, mode 1777;
+/// - `/test`: every file of the system's `/test`; `/bin/keel-shell`;
+///   `/lib`'s files (musl's dynamic linker and the test library);
+///   `/etc/keel-release`.
+fn conformance_tree() -> Result<(), keel_core::errno::Errno> {
+    use keel_core::vfs::{Device, Kind, ROOT};
+    keel_linux_abi::fs::with(|fs| {
+        let top = fs.create_dir(ROOT, b"conformance", 0o755)?;
+        let dev = fs.create_dir(top, b"dev", 0o755)?;
+        fs.create_dir(dev, b"pts", 0o755)?;
+        for (name, device) in [
+            (&b"null"[..], Device::Null),
+            (b"zero", Device::Zero),
+            (b"urandom", Device::Urandom),
+            (b"tty", Device::Tty),
+            (b"ptmx", Device::Ptmx),
+        ] {
+            fs.create_device(dev, name, device)?;
+        }
+        fs.create_dir(top, b"tmp", 0o1777)?;
+        for (dir, only) in [
+            (&b"test"[..], None),
+            (b"bin", Some(&b"keel-shell"[..])),
+            (b"lib", None),
+            (b"etc", Some(&b"keel-release"[..])),
+        ] {
+            let mut path = alloc::vec![b'/'];
+            path.extend_from_slice(dir);
+            let from = fs.lookup(ROOT, ROOT, &path)?;
+            let to = fs.create_dir(top, dir, 0o755)?;
+            for (name, ino) in fs.entries(from)? {
+                if fs.kind(ino)? == Kind::File && only.is_none_or(|o| o == name.as_slice()) {
+                    fs.link(ino, to, &name)?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A hex field of the conformance list.
+fn unhex(text: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.chunks(2)
+        .map(|pair| {
+            let digit = |c: u8| (c as char).to_digit(16);
+            Some((digit(pair[0])? * 16 + digit(pair[1])?) as u8)
+        })
+        .collect()
+}
+
+/// Phase 3 acceptance item 1 (ADR 0039): every program in
+/// `/test/conformance.list` (written by xtask), each in a compartment of
+/// its own on the tree [`conformance_tree`] makes, with its arguments,
+/// environment and standard input, standard output a tmpfs file. Its
+/// outcome goes on the results channel, which programs cannot write:
+/// `CONF <name> out <hex>` lines, then `CONF <name> end exit <status>`
+/// (or `end fault <status>` if it ended by a fault). xtask compares them
+/// with Linux's. This boot's own check is that every program ran and
+/// ended within CONFORMANCE_LIMIT_S, and that every process and frame
+/// outside the kernel heap came back.
+fn phase3_conformance(t: &mut Runner) {
+    use alloc::vec::Vec;
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs, process};
+    const CONFORMANCE_LIMIT_S: u64 = 900;
+    let list = fs::read_file(b"/test/conformance.list");
+    let (Ok(list), Ok(())) = (list, conformance_tree()) else {
+        t.check(
+            "conformance.ran",
+            false,
+            "reading the list and making the tree",
+        );
+        return;
+    };
+    let outside_heap = frames_outside_heap;
+    let (frames, processes) = (outside_heap(), process::count());
+    let mut ran = 0;
+    let mut problems = 0;
+    for line in list.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+        let [name, path, args, env, stdin] = fields[..] else {
+            problems += 1;
+            continue;
+        };
+        let name = core::str::from_utf8(name).unwrap_or("?");
+        let list_of = |field: &[u8]| -> Option<Vec<Vec<u8>>> {
+            field
+                .split(|&b| b == b',')
+                .filter(|f| !f.is_empty())
+                .map(unhex)
+                .collect()
+        };
+        let mut abs = alloc::vec![b'/'];
+        abs.extend_from_slice(path);
+        let (Some(args), Some(env), Some(stdin)) = (list_of(args), list_of(env), unhex(stdin))
+        else {
+            problems += 1;
+            continue;
+        };
+        let mut argv: Vec<&[u8]> = alloc::vec![abs.as_slice()];
+        argv.extend(args.iter().map(Vec::as_slice));
+        let envp: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+        let limits = Limits {
+            processes: 512,
+            ..Limits::UNLIMITED
+        };
+        let files = fs::with(|f| {
+            Ok((
+                f.create_detached(stdin, 0o600)?,
+                f.create_detached(Vec::new(), 0o600)?,
+            ))
+        });
+        let started = match (compartment::create(b"/conformance", limits), files) {
+            (Ok(comp), Ok((input, output))) => fs::read_file(&abs)
+                .ok()
+                .and_then(|file| {
+                    keel_linux_abi::exec::load_in(comp.root(), &file, &abs, &argv, &envp).ok()
+                })
+                .and_then(|loaded| {
+                    process::spawn_in_with(&comp, "conformance", &loaded, Some((input, output)))
+                        .ok()
+                })
+                .map(|s| (s, input, output)),
+            _ => None,
+        };
+        let Some((spawned, input, output)) = started else {
+            kprintln!("conformance: {name}: could not start");
+            problems += 1;
+            continue;
+        };
+        let start = time::monotonic_nanos();
+        let ended = loop {
+            if sched::join_timeout(spawned.thread, 1000) {
+                break true;
+            }
+            if time::monotonic_nanos() - start > CONFORMANCE_LIMIT_S * 1_000_000_000 {
+                break false;
+            }
+        };
+        if !ended {
+            kprintln!("conformance: {name}: did not end within {CONFORMANCE_LIMIT_S} s");
+            problems += 1;
+            break;
+        }
+        sched::sleep_ms(20);
+        let out = fs::with(|f| f.contents(output)).unwrap_or_default();
+        let _ = fs::with(|f| {
+            f.unpin(input);
+            f.unpin(output);
+            Ok(())
+        });
+        for chunk in out.chunks(48) {
+            let mut text = alloc::string::String::new();
+            for b in chunk {
+                let _ = core::fmt::Write::write_fmt(&mut text, format_args!("{b:02x}"));
+            }
+            kresult!("CONF {name} out {text}");
+        }
+        match sched::exit_status(spawned.thread) {
+            Some((code, None)) => kresult!("CONF {name} end exit {code}"),
+            Some((code, Some(_))) => kresult!("CONF {name} end fault {code}"),
+            None => kresult!("CONF {name} end unknown"),
+        }
+        ran += 1;
+    }
+    sched::sleep_ms(100);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = problems == 0 && ran > 0 && processes_after == processes && frames_after == frames;
+    t.check(
+        "conformance.ran",
+        ok,
+        "every conformance program ran in a compartment of its own and ended; every process and frame outside the kernel heap back (xtask compares their output with Linux's)",
+    );
+    if !ok {
+        kprintln!(
+            "  conformance: {ran} ran, {problems} problems; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

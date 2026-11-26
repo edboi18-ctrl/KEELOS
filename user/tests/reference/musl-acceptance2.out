@@ -1,0 +1,2 @@
+exit 0
+acceptance2: 4 threads took signals on their own alternate stacks; sum 10028 from a forked child over a Unix socket

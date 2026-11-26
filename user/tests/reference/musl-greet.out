@@ -1,0 +1,2 @@
+exit 0
+Hello from a musl shared library on Keel (count 3)

@@ -360,8 +360,23 @@ fn ids(argv0: &[u8]) -> i32 {
     if sys::wait4(0, &mut st, 1) != ECHILD || sys::wait4(-a, &mut st, 0) != i64::from(a) {
         return 18;
     }
-    // 12. kill(-1, 0): some process can be signalled.
-    if sys::kill(-1, 0) != 0 {
+    // 12. kill(-1, 0) with a child waiting: some process can be
+    //     signalled. (Alone, as PID 1 of a compartment or a PID namespace,
+    //     there would be none: kill(-1) skips the caller and PID 1.)
+    let mut gate = [-1i32; 2];
+    if sys::pipe2(&mut gate, None) != 0 {
+        return 19;
+    }
+    let waiting = spawn(|| {
+        sys::close(gate[1]);
+        let mut b = [0u8; 1];
+        sys::read(gate[0], &mut b);
+        0
+    });
+    sys::close(gate[0]);
+    let found = sys::kill(-1, 0) == 0;
+    sys::close(gate[1]);
+    if reap(waiting) != Some(0) || !found {
         return 19;
     }
     0

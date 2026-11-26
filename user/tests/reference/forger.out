@@ -1,0 +1,4 @@
+exit 0
+TEST forged.result PASS forged by a user program
+TEST SUMMARY passed=1 failed=0
+KEEL P1 OK

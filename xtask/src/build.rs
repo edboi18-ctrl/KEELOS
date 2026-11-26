@@ -855,6 +855,13 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
             archive.add_file(program.path, util::read(&binary)?);
         }
     }
+    if let BootMode::Test(..) | BootMode::Fuzz { .. } | BootMode::Stress { .. } = mode {
+        let programs = crate::conformance::programs();
+        archive.add_file(
+            crate::conformance::LIST_PATH,
+            crate::conformance::list_text(&programs),
+        );
+    }
     if let BootMode::Test(3, Some(BUSYBOX_SUITE)) = mode {
         add_busybox_suite(&root, &mut archive)?;
     }

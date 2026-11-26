@@ -39,10 +39,28 @@ fn main(startup: &Startup) -> i32 {
             sys::mmap_keep(hint, 4096, 0)
         };
         if result < 0 {
-            sys::write_number(b"maplimit: ", count, b" mappings, then an error\n");
+            // The count goes to standard error: it depends on the cap
+            // (Linux's vm.max_map_count) and on how many mappings the
+            // program starts with (Linux adds the vDSO and its data page,
+            // Keel has none), so it is not part of the output compared
+            // with Linux's (ADR 0039).
+            let mut digits = [0u8; 20];
+            let mut at = digits.len();
+            let mut rest = count;
+            loop {
+                at -= 1;
+                digits[at] = b'0' + (rest % 10) as u8;
+                rest /= 10;
+                if rest == 0 {
+                    break;
+                }
+            }
+            sys::writev(2, &[b"maplimit: ", &digits[at..], b" mappings\n"]);
             return if result == ENOMEM && count >= AT_LEAST {
+                sys::write(1, b"maplimit: ENOMEM at the map-count cap\n");
                 0
             } else {
+                sys::write(1, b"maplimit: not ENOMEM at the cap\n");
                 1
             };
         }

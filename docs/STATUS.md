@@ -186,7 +186,7 @@ Started 2026-11-22, after the Phase 2 audit cleared it
 | P3-S4 (in part) | Per-compartment limits and accounting | Processes and memory done (ADR 0014). Processes: `EAGAIN` at the limit, as fork(2) at `RLIMIT_NPROC`. Memory: every user page and user page table an address space holds is charged to its compartment's budget. A fault past the limit ends the program, and all frames come back. `compartment.memory_limit`: 64 MiB of touches against 17 MiB stop within the limit, the budget and the free frame count return to where they were, and another compartment runs normally (security acceptance P3 item 3, for memory). Each rule fails its test when removed. tmpfs: each compartment's file bytes and created nodes are capped by its own quota. Bytes are charged to a file's owner; a file the kernel placed is charged to the first compartment that grows it. `ENOSPC` at the limit. `compartment.tmpfs_quota`: two compartments each reach exactly their own 64 KiB and 8 nodes, and truncation gives bytes back. This closes Phase 2 audit item 1. Each rule fails its test when removed. Left for P3-S4: none of the audit's items. Handles are bounded per process (1024) and processes per compartment. |
 
 Phase 3 acceptance progress (the task rows above stop at P3-S4; ADRs
-0020 to 0037 record the later tasks):
+0020 to 0039 record the later tasks). All four functional items pass:
 - Item 2 (a dynamically linked musl program using pthreads, a signal
   handler on an alternate stack, and a Unix socket to a forked child):
   `acceptance.musl_threads_signals_socket`, from
@@ -209,7 +209,14 @@ Phase 3 acceptance progress (the task rows above stop at P3-S4; ADRs
   and clone, 61 MiB an hour) and two windows in which kill(2) of an
   ending child was ESRCH. `stress.short` runs 20 seconds of it in every
   phase 3 boot.
-- Item 1: not yet.
+- Item 1 (all conformance tests match Linux reference output): ADR
+  0039. `cargo xtask linux-test` records the 40 programs' exit status
+  and standard output under Linux in `user/tests/reference/` (CI checks
+  them with `--check`). The phase 3 `conformance` boot runs each in a
+  compartment of its own and reports on the results channel, and xtask
+  compares: all 40 match. The first run found that ptys did not work in
+  a compartment (fixed: each compartment's own `/dev/pts`), and three
+  programs whose output depended on where they ran.
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 

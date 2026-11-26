@@ -1,0 +1,2 @@
+exit 0
+rights: read-only and write-only handles refuse the other operation

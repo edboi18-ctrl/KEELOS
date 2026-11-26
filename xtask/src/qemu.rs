@@ -73,7 +73,9 @@ pub const PHASES: &[Phase] = &[
         number: 3,
         complete: false,
         // BusyBox's test suite, in a boot of its own (ADR 0034).
-        scenarios: &[crate::build::BUSYBOX_SUITE],
+        // and the conformance programs, each in a compartment, whose
+        // output must match Linux's (ADR 0039).
+        scenarios: &[crate::build::BUSYBOX_SUITE, crate::conformance::SCENARIO],
         // P3-T2 and P3-T7: the dynamically linked musl programs' lines.
         expect_lines: &[
             "Hello from dynamically linked musl on Keel",
@@ -622,6 +624,21 @@ fn test_boot(
                     "  TEST results.channel_isolated PASS a program's forged result lines reached the console but not the result channel"
                 );
             }
+            // The conformance boot: each program's outcome against Linux's.
+            if scenario == Some(crate::conformance::SCENARIO) {
+                let (lines, all) = crate::conformance::compare(&capture.results)?;
+                for line in &lines {
+                    println!("  {line}");
+                }
+                if !all {
+                    return Err(format!(
+                        "phase {number}: conformance FAILED: {} of {} programs differ from Linux",
+                        lines.iter().filter(|l| l.contains(" FAIL ")).count(),
+                        lines.len()
+                    )
+                    .into());
+                }
+            }
             // Where this boot put the kernel and the direct map (KASLR).
             let layout = capture
                 .results
@@ -1063,7 +1080,7 @@ fn regions_vary(layouts: &[&String]) -> Result<()> {
 /// A scenario's boot timeout: the BusyBox suite runs about a thousand
 /// tests, so it gets at least an hour (it takes minutes with KVM).
 fn scenario_timeout(scenario: &str, timeout: Duration) -> Duration {
-    if scenario == crate::build::BUSYBOX_SUITE {
+    if scenario == crate::build::BUSYBOX_SUITE || scenario == crate::conformance::SCENARIO {
         timeout.max(Duration::from_secs(3600))
     } else {
         timeout

@@ -207,6 +207,9 @@ pub struct PtyLine {
     pub pty: IrqMutex<Pty>,
     /// The slave's node in /dev/pts while the master is open.
     node: IrqMutex<Option<Ino>>,
+    /// The /dev/pts directory it was made in: the opener's own (ADR
+    /// 0039), where `devpts_pty_kill` removes it.
+    dir: IrqMutex<Option<Ino>>,
     /// The slave's session and foreground group (ADR 0030).
     job: IrqMutex<Option<Job>>,
 }
@@ -248,13 +251,10 @@ impl Drop for TtyOpen {
                 line.pty.lock().master_closed = true;
                 hang_up(&Ctty::Pty(Arc::downgrade(line)), false);
                 let node = line.node.lock().take();
-                if node.is_some() {
+                let dir = line.dir.lock().take();
+                if let (Some(_), Some(dir)) = (node, dir) {
                     let name = line.index.to_string();
-                    let _ = crate::fs::with(|fs| {
-                        let dir =
-                            fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/dev/pts")?;
-                        fs.unlink(dir, name.as_bytes())
-                    });
+                    let _ = crate::fs::with(|fs| fs.unlink(dir, name.as_bytes()));
                 }
             }
             End::Slave => {
@@ -315,19 +315,26 @@ fn new_pty() -> Result<Arc<PtyLine>, Errno> {
             index: index as u32,
             pty: IrqMutex::new(Pty::new()),
             node: IrqMutex::new(None),
+            dir: IrqMutex::new(None),
             job: IrqMutex::new(None),
         });
         ptys[index] = Arc::downgrade(&line);
         line
     };
     // devpts_pty_new: a character device 136:N, mode 0600 (devpts's
-    // default), named N.
+    // default), named N, in the opener's own /dev/pts (ADR 0039): each
+    // compartment has its own tree, as each Linux devpts mount its own
+    // instance. (The numbers are shared, so they are not dense per
+    // compartment.)
     let name = line.index.to_string();
-    let ino = crate::fs::with(|fs| {
-        let dir = fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/dev/pts")?;
-        fs.create_device_mode(dir, name.as_bytes(), Device::Pts(line.index), 0o600)
+    let root = caller().map_or(keel_core::vfs::ROOT, |p| p.lock().root);
+    let (dir, ino) = crate::fs::with(|fs| {
+        let dir = fs.lookup(root, root, b"/dev/pts")?;
+        let ino = fs.create_device_mode(dir, name.as_bytes(), Device::Pts(line.index), 0o600)?;
+        Ok((dir, ino))
     })?;
     *line.node.lock() = Some(ino);
+    *line.dir.lock() = Some(dir);
     Ok(line)
 }
 

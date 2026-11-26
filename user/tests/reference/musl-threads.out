@@ -1,0 +1,2 @@
+exit 0
+threads: 4 workers, counter 40000, results 100, thread-local values kept

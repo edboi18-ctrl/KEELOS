@@ -5,6 +5,7 @@
 
 mod audit;
 mod build;
+mod conformance;
 mod cpio;
 mod dist;
 mod fetch;
@@ -40,6 +41,9 @@ Commands:
                             Boot the fork, thread and signal stress test
                             for N minutes (default 60); fails on a kernel
                             panic, a failed check or a leaked frame
+  linux-test [--check]      Run the conformance programs under Linux and
+                            record their output in user/tests/reference
+                            (--check: compare with it instead)
   fuzz-pe [--minutes N] [--seed S]
                             Fuzz the PE parser on the host for N minutes
                             (default 30); fails on a parser panic
@@ -147,6 +151,11 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
             qemu::test(phase, scenario.as_deref(), &options, timeout)
+        }
+        "linux-test" => {
+            let check = take_flag(&mut args, "--check");
+            no_extra_args(&args)?;
+            conformance::linux_test(check)
         }
         "fuzz" => {
             let options = run_options(&mut args)?;
