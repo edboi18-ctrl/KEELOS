@@ -297,6 +297,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: true,
     },
     TestProgram {
+        path: "test/spawnprobe",
+        binary: "spawnprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
+    TestProgram {
         path: "test/sleepprobe",
         binary: "sleepprobe",
         args: &[],
@@ -505,6 +513,52 @@ pub const PE_FIXTURES: &[TestFixture] = &[TestFixture {
     stdout: Some("Hello from a Windows executable on Keel\r\n"),
     host_via: None,
 }];
+
+/// The phase 3 scenario that runs BusyBox's own test suite (ADR 0034).
+pub const BUSYBOX_SUITE: &str = "busybox_testsuite";
+
+/// Where the suite goes in the initramfs: `runtest` wants the busybox
+/// binary and its `.config` one directory above `testsuite/`.
+const BUSYBOX_SUITE_DIR: &str = "test/bb";
+
+/// BusyBox's test suite for its scenario's boot (ADR 0034):
+/// `test/bb/busybox` and `test/bb/.config` (the build's), the members of
+/// `fixtures/busybox/testsuite.tar` (checked against `testsuite.sha256`)
+/// with their modes under `test/bb/`, and the tests expected to pass on
+/// Keel (`fixtures/busybox/keel-expected.txt`) as `test/bb/expected.txt`.
+fn add_busybox_suite(root: &Path, archive: &mut cpio::Archive) -> Result<()> {
+    let busybox = TEST_FIXTURES
+        .iter()
+        .find(|f| f.path == "bin/busybox")
+        .ok_or("the busybox fixture is missing")?;
+    archive.add_file(
+        &format!("{BUSYBOX_SUITE_DIR}/busybox"),
+        load_fixture(root, busybox)?,
+    );
+    archive.add_file(
+        &format!("{BUSYBOX_SUITE_DIR}/.config"),
+        util::read(&root.join("fixtures/busybox/busybox.config"))?,
+    );
+    let suite = TestFixture {
+        path: "",
+        file: "fixtures/busybox/testsuite.tar",
+        hash_file: "fixtures/busybox/testsuite.sha256",
+        stdout: None,
+        host_via: None,
+    };
+    for entry in crate::tar::read(&load_fixture(root, &suite)?)? {
+        let path = format!("{BUSYBOX_SUITE_DIR}/{}", entry.path);
+        match entry.data {
+            Some(data) => archive.add_file_mode(&path, data, entry.mode),
+            None => archive.add_dir(&path),
+        }
+    }
+    archive.add_file(
+        &format!("{BUSYBOX_SUITE_DIR}/expected.txt"),
+        util::read(&root.join("fixtures/busybox/keel-expected.txt"))?,
+    );
+    Ok(())
+}
 
 /// Reads a fixture and checks it against its recorded SHA-256 (SR-29: every
 /// input is verified); a mismatch stops the build.
@@ -748,6 +802,9 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
         for (program, binary) in STD_PROGRAMS.iter().zip(build_std_tests(&root)?) {
             archive.add_file(program.path, util::read(&binary)?);
         }
+    }
+    if let BootMode::Test(3, Some(BUSYBOX_SUITE)) = mode {
+        add_busybox_suite(&root, &mut archive)?;
     }
     let initramfs = archive.to_bytes()?;
 

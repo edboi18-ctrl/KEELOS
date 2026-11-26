@@ -26,6 +26,9 @@ const S_IFREG: u32 = 0o100000; // regular file
 #[derive(Default)]
 pub struct Archive {
     members: BTreeMap<String, Option<Vec<u8>>>,
+    /// Permission bits given explicitly (`add_file_mode`), instead of the
+    /// rule in `to_bytes`.
+    modes: BTreeMap<String, u32>,
 }
 
 impl Archive {
@@ -45,6 +48,22 @@ impl Archive {
                 .or_insert(None);
         }
         self.members.insert(path.to_string(), Some(data));
+    }
+
+    /// Adds one file with these permission bits, as a tar member has them.
+    pub fn add_file_mode(&mut self, path: &str, data: Vec<u8>, mode: u32) {
+        self.add_file(path, data);
+        self.modes.insert(path.to_string(), mode & 0o777);
+    }
+
+    /// Adds a directory (and its parents).
+    pub fn add_dir(&mut self, path: &str) {
+        for (slash, _) in path.match_indices('/') {
+            self.members
+                .entry(path[..slash].to_string())
+                .or_insert(None);
+        }
+        self.members.entry(path.to_string()).or_insert(None);
     }
 
     fn add_dir_entries(&mut self, dir: &Path, prefix: &str) -> Result<()> {
@@ -79,6 +98,9 @@ impl Archive {
         for (inode, (name, contents)) in (1u32..).zip(&self.members) {
             let (mode, nlink, data): (u32, u32, &[u8]) = match contents {
                 None => (S_IFDIR | 0o755, 2, &[]),
+                Some(data) if self.modes.contains_key(name) => {
+                    (S_IFREG | self.modes[name], 1, data)
+                }
                 // Programs and libraries (ELF, by their magic) are 0755, as
                 // installed on Linux, so access(X_OK) and stat report them
                 // executable; everything else 0644.

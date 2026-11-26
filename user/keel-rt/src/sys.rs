@@ -167,6 +167,197 @@ pub fn fork() -> i64 {
     call3(nr::FORK, 0, 0, 0)
 }
 
+/// The two vfork helpers below. No Rust code runs in a vfork child: it
+/// shares the parent's memory and, here, its stack, which compiled code
+/// could overwrite under the parent (as musl writes vfork in assembly).
+/// So each child path is all assembly and uses no stack at all.
+///
+/// Assembly reasoning (spec section 1, rule 4) for `vfork_then_exit_raw`
+/// Entry state (psABI 1.0 section 3.2.3, System V calling convention):
+///   RDI = the system call number (58 vfork, or 56 clone), RSI = clone's
+///   flags (vfork ignores them), RDX = a pointer to a 16-byte timespec,
+///   RCX = a pointer to a 32-bit flag, R8D = the child's exit code. RSP is
+///   8 mod 16 (a `call` just pushed the return address). RBX, RBP and
+///   R12 to R15 must be preserved.
+/// Instructions:
+///   - `push r12`, `push r13`, `push r14`: save the callee-saved registers
+///     this uses.
+///   - `mov r12, rdx`, `mov r13, rcx`, `mov r14, r8`: keep the child's
+///     arguments where SYSCALL leaves them alone. Linux's SYSCALL returns
+///     with every register as it was except RAX (the result), RCX and R11
+///     (`entry_SYSCALL_64`, arch/x86/entry/entry_64.S; `man 2 syscall`),
+///     and Keel's entry stub does the same; RDX and R8 are about to carry
+///     clone's arguments.
+///   - `mov rax, rdi`: the number. `mov rdi, rsi`, `xor esi, esi`,
+///     `xor edx, edx`, `xor r10d, r10d`, `xor r8d, r8d`: clone's x86-64
+///     arguments (flags, newsp 0 = the same stack, parent_tid, child_tid,
+///     tls; `kernel/fork.c`, no CLONE_BACKWARDS on x86-64). A 32-bit write
+///     zero-extends into the whole register (SDM Vol. 1 section 3.4.1.1).
+///   - `syscall`: RAX is the child's PID in the parent, 0 in the child,
+///     -errno if nothing was made.
+///   - `test rax, rax`, `jz 2f`: the child goes to 2.
+///   - Parent (or failure): `pop r14`, `pop r13`, `pop r12` restore the
+///     saved registers in reverse order, and `ret` returns RAX.
+///   - Child, at 2, using no stack: `mov rdi, r12`, `xor esi, esi`,
+///     `mov eax, 35`, `syscall`: nanosleep(ts, NULL). `mov dword ptr
+///     [r13], 1`: sets the flag in the memory the child has (the parent's
+///     own with CLONE_VM, a copy without). `mov edi, r14d`, `mov eax, 231`,
+///     `syscall`: exit_group(code), which does not return; `ud2` would
+///     trap if it did.
+///
+/// Exit state (parent): RAX the result; RSP, RBX, RBP, R12 to R15 as at
+///   entry.
+#[unsafe(naked)]
+unsafe extern "C" fn vfork_then_exit_raw(
+    number: u64,
+    flags: u64,
+    nap: *const u8,
+    flag: *const u32,
+    code: u64,
+) -> i64 {
+    core::arch::naked_asm!(
+        "push r12",
+        "push r13",
+        "push r14",
+        "mov r12, rdx",
+        "mov r13, rcx",
+        "mov r14, r8",
+        "mov rax, rdi",
+        "mov rdi, rsi",
+        "xor esi, esi",
+        "xor edx, edx",
+        "xor r10d, r10d",
+        "xor r8d, r8d",
+        "syscall",
+        "test rax, rax",
+        "jz 2f",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "ret",
+        "2:",
+        "mov rdi, r12",
+        "xor esi, esi",
+        "mov eax, 35",
+        "syscall",
+        "mov dword ptr [r13], 1",
+        "mov edi, r14d",
+        "mov eax, 231",
+        "syscall",
+        "ud2",
+    )
+}
+
+/// Assembly reasoning (spec section 1, rule 4) for `vfork_exec_raw`
+/// Entry state: RDI = the path, RSI = a NULL-terminated argv array, RDX =
+///   a NULL-terminated envp array (execve's own argument registers);
+///   RSP 8 mod 16.
+/// Instructions:
+///   - `mov eax, 58`, `syscall`: vfork. RDI, RSI and RDX come back
+///     unchanged in both processes (SYSCALL changes only RAX, RCX, R11).
+///   - `test rax, rax`, `jnz 1f`: the parent, or a failure, returns RAX
+///     at 1 (`ret`; nothing was pushed).
+///   - Child, using no stack: `mov eax, 59`, `syscall`: execve(path, argv,
+///     envp), which does not return if it succeeds. If it fails:
+///     `mov edi, 127`, `mov eax, 231`, `syscall`: exit_group(127), as a
+///     shell reports a command it could not run; `ud2` if that returned.
+///
+/// Exit state (parent): RAX the child's PID or -errno; RSP as at entry.
+#[unsafe(naked)]
+unsafe extern "C" fn vfork_exec_raw(path: *const u8, argv: *const u64, envp: *const u64) -> i64 {
+    core::arch::naked_asm!(
+        "mov eax, 58",
+        "syscall",
+        "test rax, rax",
+        "jnz 1f",
+        "mov eax, 59",
+        "syscall",
+        "mov edi, 127",
+        "mov eax, 231",
+        "syscall",
+        "ud2",
+        "1:",
+        "ret",
+    )
+}
+
+/// vfork(2) (`clone` None) or clone(2) with `clone` as its flags (with
+/// CLONE_VFORK, and SIGCHLD in the low byte), where the child sleeps for
+/// `nap`, sets `flag` to 1 and exits with `code`. Returns the child's PID
+/// or -errno. With CLONE_VM the flag is the parent's own.
+pub fn vfork_then_exit(
+    clone: Option<u64>,
+    nap: &[u8; 16],
+    flag: &core::sync::atomic::AtomicU32,
+    code: u8,
+) -> i64 {
+    let (number, flags) = match clone {
+        None => (58, 0),
+        Some(flags) => (56, flags),
+    };
+    // SAFETY: the child runs only the assembly above, which reads `nap`
+    // and writes `flag` (an atomic, so a write from another process is
+    // sound: the parent reads it with an atomic load after the kernel has
+    // let it go on) and touches no other memory, no stack included; it
+    // ends with exit_group. The parent returns normally.
+    unsafe {
+        vfork_then_exit_raw(
+            number,
+            flags,
+            nap.as_ptr(),
+            flag.as_ptr() as *const u32,
+            u64::from(code),
+        )
+    }
+}
+
+/// vfork(2), and execve(2) of `path` with `argv` and `envp` in the child
+/// (exit status 127 if that fails). Returns the child's PID or -errno.
+pub fn vfork_exec(path: &CStr, argv: &[&CStr], envp: &[&CStr]) -> i64 {
+    let mut args = [0u64; EXECVE_MAX];
+    let mut env = [0u64; EXECVE_MAX];
+    if argv.len() >= EXECVE_MAX || envp.len() >= EXECVE_MAX {
+        return -7; // E2BIG
+    }
+    for (slot, arg) in args.iter_mut().zip(argv) {
+        *slot = arg.as_ptr() as u64;
+    }
+    for (slot, var) in env.iter_mut().zip(envp) {
+        *slot = var.as_ptr() as u64;
+    }
+    // SAFETY: the child runs only the assembly above: execve with these
+    // NULL-terminated arrays of pointers to NUL-terminated strings, all
+    // alive in this frame until the parent goes on (vfork shares them),
+    // then exit_group. No Rust code and no stack are used in the child.
+    unsafe { vfork_exec_raw(path.as_ptr().cast(), args.as_ptr(), env.as_ptr()) }
+}
+
+/// getuid(2), getgid(2), geteuid(2) and getegid(2), by number (102, 104,
+/// 107, 108).
+pub fn get_id(number: u64) -> i64 {
+    if ![102, 104, 107, 108].contains(&number) {
+        return -22;
+    }
+    call3(number, 0, 0, 0)
+}
+
+/// getresuid(2) (`group` false) or getresgid(2): real, effective, saved.
+pub fn getres_ids(group: bool, ids: &mut [u32; 3]) -> i64 {
+    let [a, b, c] = ids;
+    call3(
+        if group { 120 } else { 118 },
+        a as *mut u32 as u64,
+        b as *mut u32 as u64,
+        c as *mut u32 as u64,
+    )
+}
+
+/// getresuid(2) with hostile pointers.
+pub fn getresuid_from(at: [Hostile; 3]) -> i64 {
+    let [a, b, c] = at;
+    call3(118, a.0, b.0, c.0)
+}
+
 /// wait4(2) with the status written to `status` and no rusage.
 pub fn wait4(pid: i32, status: &mut i32, options: u32) -> i64 {
     call6(

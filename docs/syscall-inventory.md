@@ -23,7 +23,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 | 13 | `rt_sigprocmask` | 62162 | 0 | 62419 | complete | `syscalls.conformance`, `exec.signals` |
 | 14 | `membarrier` | 19 | 12 | 19 | missing |  |
 | 15 | `rt_sigaction` | 161 | 0 | 161 | partial (no SA_RESTART) | `syscalls.conformance`, `exec.signals` |
-| 16 | `getuid` | 24 | 0 | 24 | missing |  |
+| 16 | `getuid` | 24 | 0 | 24 | complete (always 0) | `exec.spawn` |
 | 17 | `lseek` | 188 | 0 | 188 | complete | `exec.filesystem` |
 | 18 | `munmap` | 1999 | 11 | 2001 | partial | `syscalls.conformance` |
 | 19 | `prctl` | 33 | 0 | 33 | partial (PR_SET_NAME, PR_GET_NAME) | `exec.procfs` |

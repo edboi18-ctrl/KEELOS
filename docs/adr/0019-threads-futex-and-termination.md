@@ -39,7 +39,8 @@ lets `kill(SIGKILL)` end a looping child (`badexec`).
      `CLONE_CHILD_CLEARTID`, `CLONE_CHILD_SETTID` and `CLONE_DETACHED`
      (which Linux ignores). That is the Wine trace's set and musl's.
    - Anything else is `EINVAL` for now: `CLONE_VFORK`, `CLONE_VM` without
-     `CLONE_THREAD`, namespaces.
+     `CLONE_THREAD`, namespaces. (ADR 0034 adds `CLONE_VFORK`, alone and
+     with `CLONE_VM`.)
    - The new thread starts with the caller's registers, with RAX = 0 and
      RSP = the given stack. It has the caller's FS/GS bases, with FS =
      tls under `CLONE_SETTLS` (`EPERM` outside the user half), and the
@@ -116,6 +117,7 @@ lets `kill(SIGKILL)` end a looping child (`badexec`).
 
 - Signal delivery (P3-T6). With it come the other signals, `SIGCHLD`,
   and interrupting a blocked call with `EINTR` and `SA_RESTART`.
-- `vfork` and `CLONE_VFORK`, which musl's `posix_spawn` uses.
+- `vfork` and `CLONE_VFORK`, which musl's `posix_spawn` uses (done in
+  ADR 0034).
 - Shared futex keys, futex `BITSET` and PI commands, and
   `membarrier`. musl handles `membarrier`'s `ENOSYS`.

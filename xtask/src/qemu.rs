@@ -72,7 +72,8 @@ pub const PHASES: &[Phase] = &[
     Phase {
         number: 3,
         complete: false,
-        scenarios: &[],
+        // BusyBox's test suite, in a boot of its own (ADR 0034).
+        scenarios: &[crate::build::BUSYBOX_SUITE],
         // P3-T2 and P3-T7: the dynamically linked musl programs' lines.
         expect_lines: &[
             "Hello from dynamically linked musl on Keel",
@@ -1014,7 +1015,22 @@ fn regions_vary(layouts: &[&String]) -> Result<()> {
     }
 }
 
-pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Result<()> {
+/// A scenario's boot timeout: the BusyBox suite runs about a thousand
+/// tests, so it gets at least an hour (it takes minutes with KVM).
+fn scenario_timeout(scenario: &str, timeout: Duration) -> Duration {
+    if scenario == crate::build::BUSYBOX_SUITE {
+        timeout.max(Duration::from_secs(3600))
+    } else {
+        timeout
+    }
+}
+
+pub fn test(
+    phase: Option<u32>,
+    only_scenario: Option<&str>,
+    options: &RunOptions,
+    timeout: Duration,
+) -> Result<()> {
     let selected: Vec<&Phase> = match phase {
         None => PHASES.iter().collect(),
         Some(n) => match PHASES.iter().find(|p| p.number == n) {
@@ -1030,10 +1046,28 @@ pub fn test(phase: Option<u32>, options: &RunOptions, timeout: Duration) -> Resu
     if selected.iter().any(|p| p.number >= 1) {
         test_user_programs_on_host()?;
     }
+    if let (Some("main"), [phase]) = (only_scenario, selected.as_slice()) {
+        test_boot(phase, None, options, timeout)?;
+        println!("xtask: phase {} main boot PASSED", phase.number);
+        return Ok(());
+    }
+    if let (Some(name), [phase]) = (only_scenario, selected.as_slice()) {
+        let scenario = phase
+            .scenarios
+            .iter()
+            .copied()
+            .find(|s| *s == name)
+            .ok_or_else(|| format!("phase {} has no scenario {name}", phase.number))?;
+        let timeout = scenario_timeout(scenario, timeout);
+        test_boot(phase, Some(scenario), options, timeout)?;
+        println!("xtask: phase {} scenario {name} PASSED", phase.number);
+        return Ok(());
+    }
     for phase in selected {
         let mut layouts = Vec::new();
         layouts.push(test_boot(phase, None, options, timeout)?);
         for &scenario in phase.scenarios {
+            let timeout = scenario_timeout(scenario, timeout);
             layouts.push(test_boot(phase, Some(scenario), options, timeout)?);
         }
         // Phase 1 has the boots (main and six scenarios) to compare.

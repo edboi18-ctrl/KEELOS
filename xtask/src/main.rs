@@ -12,6 +12,7 @@ mod fuzzpe;
 mod limine;
 mod qemu;
 mod syscalls;
+mod tar;
 mod util;
 mod verify;
 
@@ -27,8 +28,10 @@ Commands:
   build                     Build the kernel and initramfs; populate target/esp
   run   [--gdb] [--kvm] [--accel NAME]
                             Build, then boot in QEMU with serial on stdio
-  test  [--phase N] [--kvm] [--accel NAME] [--timeout SECONDS]
+  test  [--phase N [--scenario NAME]] [--kvm] [--accel NAME] [--timeout SECONDS]
                             Build, boot headless, run the in-guest tests
+                            (--scenario: only that boot of the phase, or
+                            `main` for the phase's main boot alone)
   fuzz  [--minutes N] [--seed S] [--kvm] [--accel NAME]
                             Boot the in-guest system-call fuzzer for N
                             minutes (default 60); fails on a kernel panic
@@ -127,6 +130,10 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
             let phase = take_value(&mut args, "--phase")?
                 .map(|v| v.parse::<u32>().map_err(|_| "--phase needs a number"))
                 .transpose()?;
+            let scenario = take_value(&mut args, "--scenario")?;
+            if scenario.is_some() && phase.is_none() {
+                return Err("--scenario needs --phase".into());
+            }
             let timeout = take_value(&mut args, "--timeout")?
                 .map(|v| v.parse::<u64>().map_err(|_| "--timeout needs seconds"))
                 .transpose()?
@@ -135,7 +142,7 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
             if options.gdb {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
-            qemu::test(phase, &options, timeout)
+            qemu::test(phase, scenario.as_deref(), &options, timeout)
         }
         "fuzz" => {
             let options = run_options(&mut args)?;

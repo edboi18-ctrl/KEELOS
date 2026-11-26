@@ -79,6 +79,28 @@ the configuration turns PIE off: with this toolchain, BusyBox's `-static`
 link (without `-no-pie`) gave a static PIE. It needs no interpreter, and
 Keel loads it at a random bias.
 
+## The test suite on Keel (ADR 0034)
+
+`cargo xtask test` runs BusyBox's own test suite on Keel in a phase 3
+boot of its own (`--phase 3 --scenario busybox_testsuite` runs that boot
+alone). Two files in this directory go with it:
+
+- **`linux-results.txt`:** the reference, the outcome lines `runtest`
+  printed under Linux 6.18 as root. It was made as follows:
+  - a directory with `bin/` holding `busybox` and a symbolic link to it
+    for every applet in `applets.txt` (`bin/sh` among them), `dev/` with
+    `null`, `zero`, `full`, `random` and `urandom`, `tmp/` (mode 1777),
+    and `bb/` holding `busybox`, `busybox.config` as `.config`, and
+    `testsuite.tar` unpacked;
+  - run with `unshare --mount --pid --fork --mount-proc=DIR/proc chroot
+    DIR /bin/sh -c 'cd /bb/testsuite && PATH=/bin HOME=/tmp ./runtest'`,
+    so the tests run as root but cannot reach the host's files, mounts
+    or processes.
+
+  Result: 909 PASS, 14 FAIL, 12 SKIPPED, 1 UNTESTED, in 92 seconds.
+- **`keel-expected.txt`:** the tests that must pass on Keel: every PASS
+  above except those its header lists, with what Keel lacks for each.
+
 ## Licences of what the binary contains
 
 - **BusyBox:** GPL-2.0-only. Its licence is in `LICENSE-busybox.txt`

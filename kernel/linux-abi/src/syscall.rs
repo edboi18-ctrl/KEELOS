@@ -57,6 +57,12 @@ pub mod nr {
     pub const EXECVE: u64 = 59;
     pub const WAIT4: u64 = 61;
     pub const GETPPID: u64 = 110;
+    pub const GETUID: u64 = 102;
+    pub const GETGID: u64 = 104;
+    pub const GETEUID: u64 = 107;
+    pub const GETEGID: u64 = 108;
+    pub const GETRESUID: u64 = 118;
+    pub const GETRESGID: u64 = 120;
     pub const EXIT: u64 = 60;
     pub const FCNTL: u64 = 72;
     pub const SIGALTSTACK: u64 = 131;
@@ -64,6 +70,7 @@ pub mod nr {
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const NANOSLEEP: u64 = 35;
+    pub const VFORK: u64 = 58;
     pub const RT_SIGSUSPEND: u64 = 130;
     pub const RESTART_SYSCALL: u64 = 219;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -379,6 +386,14 @@ static TABLE: [Option<Handler>; TABLE_SIZE as usize] = {
     t[nr::ARCH_PRCTL as usize] = Some(|_, a| arch_prctl(a[0], a[1]));
     t[nr::SET_TID_ADDRESS as usize] = Some(|p, a| Ok(set_tid_address(p, a[0])));
     t[nr::GETPID as usize] = Some(|p, _| Ok(u64::from(p.lock().pid())));
+    // Every Keel process is root in its compartment (ADR 0030, ADR 0034):
+    // real, effective and saved IDs 0.
+    t[nr::GETUID as usize] = Some(|_, _| Ok(0));
+    t[nr::GETGID as usize] = Some(|_, _| Ok(0));
+    t[nr::GETEUID as usize] = Some(|_, _| Ok(0));
+    t[nr::GETEGID as usize] = Some(|_, _| Ok(0));
+    t[nr::GETRESUID as usize] = Some(|_, a| getres_ids([a[0], a[1], a[2]]));
+    t[nr::GETRESGID as usize] = Some(|_, a| getres_ids([a[0], a[1], a[2]]));
     t[nr::CLOCK_GETTIME as usize] = Some(|_, a| clock_gettime(a[0] as u32 as u64, a[1]));
     t[nr::NANOSLEEP as usize] = Some(|p, a| crate::sleep::nanosleep(p, a[0], a[1]));
     t[nr::CLOCK_NANOSLEEP as usize] = Some(|p, a| {
@@ -492,6 +507,11 @@ fn dispatch(call: &SyscallArgs) -> i64 {
         // do not get.
         nr::FORK => match process::current() {
             Some(p) => process::fork(&p, &call.frame),
+            None => unimplemented(number, &a),
+        },
+        // vfork: CLONE_VM | CLONE_VFORK with SIGCHLD (ADR 0034).
+        nr::VFORK => match process::current() {
+            Some(p) => process::vfork(&p, &call.frame, process::Vfork::Share, 0),
             None => unimplemented(number, &a),
         },
         // rt_sigreturn replaces every register, so it needs the caller's
@@ -846,6 +866,9 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
     // one (still the CPU's until now) be dropped.
     let switched = sched::exec_current(loaded.space, loaded.entry, loaded.rsp);
     drop(old_space);
+    // A vfork child has left its parent's memory: the parent goes on
+    // (`exec_mmap` -> `mm_release`, ADR 0034).
+    process::release_vfork(p);
     if switched.is_err() {
         // Past the point of no return there is nothing to return to: as
         // Linux's bprm_execve (force_fatal_sig(SIGSEGV), `fs/exec.c`), the
@@ -1683,8 +1706,10 @@ fn set_tid_address(p: &Arc<IrqMutex<Process>>, address: u64) -> u64 {
 /// (EINVAL). Without CLONE_VM it is fork (the exit signal in the low byte
 /// is ignored: nothing is delivered yet), with the child on `stack` if
 /// given. With CLONE_VM: a thread, if the flags are within the set
-/// `process::clone_thread` supports; anything else (vfork's CLONE_VFORK,
-/// CLONE_VM without CLONE_THREAD, namespaces, ...) is EINVAL for now.
+/// `process::clone_thread` supports. CLONE_VM | CLONE_VFORK (vfork's own
+/// flags) and CLONE_VFORK alone are a vfork (ADR 0034). Anything else
+/// (CLONE_VM without CLONE_THREAD otherwise, namespaces, ...) is EINVAL
+/// for now.
 fn clone(
     p: &Arc<IrqMutex<Process>>,
     frame: &keel_hal::arch::x86_64::idt::TrapFrame,
@@ -1697,6 +1722,15 @@ fn clone(
         || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
     {
         return Err(Errno::EINVAL);
+    }
+    // vfork's flags, as musl's posix_spawn passes them (with a stack), or
+    // CLONE_VFORK alone (ADR 0034).
+    match flags & !CLONE_DETACHED {
+        f if f == CLONE_VM | CLONE_VFORK => {
+            return process::vfork(p, frame, process::Vfork::Share, stack);
+        }
+        CLONE_VFORK => return process::vfork(p, frame, process::Vfork::Copy, stack),
+        _ => {}
     }
     if flags & CLONE_VM == 0 {
         if flags & !CLONE_DETACHED != 0 {
@@ -1719,6 +1753,16 @@ fn clone(
         return Err(Errno::EINVAL);
     }
     process::clone_thread(p, frame, flags, stack, parent_tid, child_tid, tls)
+}
+
+/// getresuid(2) and getresgid(2) (`kernel/sys.c`): the real, effective and
+/// saved IDs, all 0, written in that order; the first that cannot be
+/// written ends the call with EFAULT (`put_user`).
+fn getres_ids(at: [u64; 3]) -> SysResult {
+    for address in at {
+        copy_to_user(address, &0u32.to_le_bytes()).map_err(fault)?;
+    }
+    Ok(0)
 }
 
 fn clock_gettime(clock: u64, buf: u64) -> SysResult {

@@ -56,6 +56,8 @@ pub enum Scenario {
     StackOverflow = 4,
     Smap = 5,
     FaultInPanic = 6,
+    /// Phase 3: BusyBox's own test suite (ADR 0034).
+    BusyboxSuite = 7,
     Unknown = 255,
 }
 
@@ -79,6 +81,7 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
         Some("stack_overflow") => Scenario::StackOverflow,
         Some("smap") => Scenario::Smap,
         Some("fault_in_panic") => Scenario::FaultInPanic,
+        Some("busybox_testsuite") => Scenario::BusyboxSuite,
         Some(_) => Scenario::Unknown,
     }
 }
@@ -196,6 +199,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
         (1, Scenario::None) => phase1(&mut runner),
         (2, Scenario::None) => phase2(&mut runner),
         (3, Scenario::None) => phase3(&mut runner),
+        (3, Scenario::BusyboxSuite) => phase3_busybox_suite(&mut runner),
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -1943,6 +1947,7 @@ fn phase3(t: &mut Runner) {
     phase3_console_interrupt(t);
     phase3_stop_continue(t);
     phase3_sleep(t);
+    phase3_spawn(t);
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
@@ -2593,6 +2598,41 @@ fn phase3_sleep(t: &mut Runner) {
     }
 }
 
+/// ADR 0034: user/tests/spawnprobe, which passes under Linux too
+/// (`host.spawnprobe`): vfork, CLONE_VFORK and the ID calls, here with
+/// `root` (every ID 0). Run twice; after the second run every node, frame
+/// and process is back.
+fn phase3_spawn(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/spawnprobe";
+    let outside_heap = frames_outside_heap;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run_test_program(PROGRAM, &[PROGRAM, b"root"]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM, b"root"])
+    } else {
+        warm
+    };
+    sched::sleep_ms(400);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.spawn",
+        ok,
+        "vfork and clone's CLONE_VFORK as on Linux: the parent waiting until the child execs or exits, the memory shared with CLONE_VM and copied without, a failed execve; getuid, geteuid, getgid, getegid, getresuid and getresgid (all 0); every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  spawnprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
 /// Phase 3 acceptance item 3 (P3-T13 part 2): static BusyBox `sh` runs
 /// interactively on the serial console and runs `ls`, `cat`, pipelines
 /// and background jobs. `/sbin/keel-init --once --shell /bin/busybox sh`
@@ -2747,6 +2787,92 @@ fn phase3_console_busybox(t: &mut Runner) {
             kprintln!("  /tmp/b{}: {:?}", i + 1, text(r));
         }
     }
+}
+
+/// ADR 0034: BusyBox's own test suite (`fixtures/busybox/testsuite.tar`),
+/// a boot of its own. BusyBox's shell installs its applets in /bin, as
+/// the Linux reference run had them, and runs `runtest` in
+/// /test/bb/testsuite with its output in /tmp/bbts.log. Every test
+/// `/test/bb/expected.txt` lists as passing must pass; the others are
+/// reported, so the list can grow as Keel does.
+fn phase3_busybox_suite(t: &mut Runner) {
+    use alloc::collections::BTreeMap;
+    use keel_linux_abi::{exec, fs, process};
+    const BUSYBOX: &[u8] = b"/bin/busybox";
+    const SCRIPT: &[u8] = b"/bin/busybox --install -s /bin && cd /test/bb/testsuite && PATH=/bin HOME=/tmp ./runtest >/tmp/bbts.log 2>&1";
+    let begin = time::monotonic_nanos();
+    let ran = fs::read_file(BUSYBOX)
+        .ok()
+        .and_then(|file| exec::load(&file, BUSYBOX, &[BUSYBOX, b"sh", b"-c", SCRIPT], &[]).ok())
+        .and_then(|loaded| process::spawn("runtest", &loaded).ok())
+        .map(|spawned| {
+            // Under an hour, inside the boot's own timeout.
+            let ended = sched::join_timeout(spawned.thread, 55 * 60 * 1000);
+            (ended, sched::exit_status(spawned.thread))
+        });
+    let seconds = (time::monotonic_nanos() - begin) / 1_000_000_000;
+    let text = |path: &[u8]| {
+        fs::read_file(path)
+            .ok()
+            .map(|v| alloc::string::String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default()
+    };
+    let log = text(b"/tmp/bbts.log");
+    let expected = text(b"/test/bb/expected.txt");
+    // Each test's outcomes by name (a name can repeat).
+    let mut outcome: BTreeMap<&str, alloc::vec::Vec<&str>> = BTreeMap::new();
+    let mut counts = [0u32; 4];
+    const KINDS: [&str; 4] = ["PASS", "FAIL", "SKIPPED", "UNTESTED"];
+    for line in log.lines() {
+        for (k, kind) in KINDS.iter().enumerate() {
+            if let Some(name) = line.strip_prefix(kind).and_then(|r| r.strip_prefix(": ")) {
+                counts[k] += 1;
+                outcome.entry(name).or_default().push(kind);
+            }
+        }
+    }
+    let mut wanted: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in expected.lines() {
+        if let Some(name) = line.strip_prefix("PASS: ") {
+            *wanted.entry(name).or_default() += 1;
+        }
+    }
+    let passes = |name: &str| {
+        outcome
+            .get(name)
+            .map_or(0, |v| v.iter().filter(|k| **k == "PASS").count())
+    };
+    let missing: alloc::vec::Vec<&str> = wanted
+        .iter()
+        .filter(|(name, n)| passes(name) < **n)
+        .map(|(name, _)| *name)
+        .collect();
+    let new: alloc::vec::Vec<&str> = outcome
+        .keys()
+        .filter(|name| passes(name) > wanted.get(*name).copied().unwrap_or(0))
+        .copied()
+        .collect();
+    kprintln!(
+        "busybox testsuite: {} PASS, {} FAIL, {} SKIPPED, {} UNTESTED in {seconds} s; runtest {ran:?}",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3]
+    );
+    for line in log.lines().filter(|l| l.starts_with("FAIL: ")) {
+        kprintln!("  {line}");
+    }
+    for name in &new {
+        kprintln!("  passes, not yet in expected.txt: {name}");
+    }
+    for name in &missing {
+        kprintln!("  REGRESSION: expected to pass: {name}");
+    }
+    t.check(
+        "busybox.testsuite",
+        ran.is_some_and(|(ended, _)| ended) && counts[0] > 0 && missing.is_empty(),
+        "BusyBox 1.37.0's own test suite, run by its shell on Keel: every test fixtures/busybox/keel-expected.txt lists passes",
+    );
 }
 
 /// The scheduler keeps the last 1024 exit statuses. A thread whose 1100

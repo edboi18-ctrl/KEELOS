@@ -175,6 +175,21 @@ pub struct Process {
     /// Continued, until wait4's WCONTINUED reports it
     /// (`SIGNAL_STOP_CONTINUED`).
     pub continue_report: bool,
+    /// A vfork child's `vfork_done` (ADR 0034): set, and the parent woken,
+    /// when it execs or exits.
+    pub vfork_done: Option<Arc<core::sync::atomic::AtomicBool>>,
+}
+
+/// Woken when a vfork child execs or exits (`complete_vfork_done`).
+static VFORK_DONE: sched::WaitQueue = sched::WaitQueue::new();
+
+/// `mm_release`'s `complete_vfork_done`: a vfork child no longer uses its
+/// parent's memory, because it has exec'd or is exiting; its parent goes on.
+pub fn release_vfork(p: &Arc<IrqMutex<Process>>) {
+    if let Some(done) = p.lock().vfork_done.take() {
+        done.store(true, core::sync::atomic::Ordering::SeqCst);
+        VFORK_DONE.wake_all();
+    }
 }
 
 /// One thread of a process.
@@ -378,6 +393,7 @@ pub fn spawn_in(
         stopped: false,
         stop_report: None,
         continue_report: false,
+        vfork_done: None,
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.
@@ -409,6 +425,43 @@ pub fn current() -> Option<Arc<IrqMutex<Process>>> {
 /// copy), its clear_child_tid is not inherited and it has no children of
 /// its own.
 pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno> {
+    fork_with(p, frame, Vfork::No)
+}
+
+/// How a fork treats the parent's memory and the calling thread
+/// (`kernel_clone`'s CLONE_VM and CLONE_VFORK).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Vfork {
+    /// fork: a copy-on-write copy; the parent goes on.
+    No,
+    /// CLONE_VFORK alone: a copy, and the calling thread waits until the
+    /// child execs or exits.
+    Copy,
+    /// vfork(2), CLONE_VM | CLONE_VFORK: the child uses the parent's
+    /// address space itself, and the calling thread waits as for `Copy`.
+    Share,
+}
+
+/// vfork(2) and clone with CLONE_VFORK (ADR 0034), as `kernel_clone`:
+/// a child as fork makes, but with `Vfork::Share` it runs in the parent's
+/// own address space (on `stack`, or the parent's stack if 0), and the
+/// calling thread waits, killable only (`wait_for_vfork_done`:
+/// TASK_KILLABLE), until the child execs or exits. Signals sent to the
+/// parent meanwhile are taken after.
+pub fn vfork(
+    p: &Arc<IrqMutex<Process>>,
+    frame: &TrapFrame,
+    mode: Vfork,
+    stack: u64,
+) -> Result<u64, Errno> {
+    let mut registers = *frame;
+    if stack != 0 {
+        registers.rsp = stack;
+    }
+    fork_with(p, &registers, mode)
+}
+
+fn fork_with(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame, mode: Vfork) -> Result<u64, Errno> {
     let (
         compartment,
         space,
@@ -450,10 +503,16 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         )
     };
     let member = compartment.admit()?;
-    let child_space = space.duplicate().map_err(|_| Errno::ENOMEM)?;
-    child_space
-        .attach_budget(compartment.memory().clone())
-        .map_err(|_| Errno::ENOMEM)?;
+    let child_space = if mode == Vfork::Share {
+        // The same address space, already charged to the compartment.
+        space
+    } else {
+        let copy = space.duplicate().map_err(|_| Errno::ENOMEM)?;
+        copy.attach_budget(compartment.memory().clone())
+            .map_err(|_| Errno::ENOMEM)?;
+        copy
+    };
+    let done = (mode != Vfork::No).then(|| Arc::new(core::sync::atomic::AtomicBool::new(false)));
     let pid = member.pid();
     let child = Arc::new(IrqMutex::new(Process {
         member,
@@ -482,6 +541,7 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         stopped: false,
         stop_report: None,
         continue_report: false,
+        vfork_done: done.clone(),
     }));
     let mut registers = *frame;
     registers.rax = 0;
@@ -501,6 +561,12 @@ pub fn fork(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame) -> Result<u64, Errno>
         pid,
         status: None,
     });
+    drop(processes);
+    if let Some(done) = done {
+        VFORK_DONE.wait_until(|| {
+            done.load(core::sync::atomic::Ordering::SeqCst) || sched::exit_requested().is_some()
+        });
+    }
     Ok(u64::from(pid))
 }
 
@@ -511,6 +577,7 @@ pub mod clone_flags {
     pub const CLONE_FS: u64 = 0x200;
     pub const CLONE_FILES: u64 = 0x400;
     pub const CLONE_SIGHAND: u64 = 0x800;
+    pub const CLONE_VFORK: u64 = 0x4000;
     pub const CLONE_THREAD: u64 = 0x1_0000;
     pub const CLONE_SYSVSEM: u64 = 0x4_0000;
     pub const CLONE_SETTLS: u64 = 0x8_0000;
@@ -760,6 +827,8 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
         }
         return;
     }
+    // A vfork child no longer uses its parent's memory (`mm_release`).
+    release_vfork(&process);
     let (handles, space, children, parent, code, signal, owner) = {
         let mut p = process.lock();
         (

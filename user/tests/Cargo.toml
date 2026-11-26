@@ -152,6 +152,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "spawnprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "sleepprobe"
 test = false
 bench = false
