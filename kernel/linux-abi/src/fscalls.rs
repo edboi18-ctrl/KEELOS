@@ -71,7 +71,23 @@ fn directory(p: &ProcessRef, fd: i32) -> Result<Arc<IrqMutex<crate::process::Ope
     file(p, fd, Rights::ENUMERATE)
 }
 
+/// The absolute `/proc` path a lookup of relative `path` from `dirfd`
+/// names, if `dirfd` is a procfs directory (ADR 0037); `..` stops at that
+/// directory, as at any directory handle (ADR 0012).
+pub(crate) fn in_proc_dir(p: &ProcessRef, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
+    if dirfd == AT_FDCWD || path.is_empty() || path.first() == Some(&b'/') {
+        return None;
+    }
+    let dir = file_or(p, dirfd, Rights::NONE, Errno::ENOTDIR)
+        .ok()?
+        .lock()
+        .proc?;
+    crate::procfs::relative(dir, path)
+}
+
 /// Where a lookup of `path` relative to `dirfd` starts: `(root, base)`.
+/// Other calls than open, stat, readlink and access relative to a procfs
+/// directory are EACCES: procfs makes, removes and renames nothing.
 /// `modify` asks for CREATE on a directory handle as well as ENUMERATE.
 fn start(p: &ProcessRef, dirfd: i32, path: &[u8], modify: bool) -> Result<(Ino, Ino), Errno> {
     let (root, cwd) = {
@@ -92,6 +108,9 @@ fn start(p: &ProcessRef, dirfd: i32, path: &[u8], modify: bool) -> Result<(Ino, 
     let dir = dir.lock();
     if dir.kind != Kind::Directory {
         return Err(Errno::ENOTDIR);
+    }
+    if dir.proc.is_some() {
+        return Err(Errno::EACCES);
     }
     Ok((dir.node, dir.node))
 }
@@ -148,6 +167,7 @@ pub fn newfstatat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, flags: u32) -
         return Err(Errno::EINVAL);
     }
     let path = path_arg(path)?;
+    let path = in_proc_dir(p, dirfd, &path).unwrap_or(path);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     if let Some(hit) = crate::procfs::lookup(p, &path, follow) {
         return match hit? {
@@ -162,6 +182,13 @@ pub fn newfstatat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, flags: u32) -
     }
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         let target = object(p, dirfd, Rights::STAT)?;
+        if let Object::File(f) = &target
+            && let Some(node) = f.lock().proc
+        {
+            let b = crate::abi::stat_bytes_on(&crate::procfs::stat(node), crate::abi::PROCFS_DEV);
+            copy_to_user(buf, &b).map_err(fault)?;
+            return Ok(0);
+        }
         if let Some(b) = crate::ready::stat_bytes(&target) {
             copy_to_user(buf, &b).map_err(fault)?;
             return Ok(0);
@@ -272,11 +299,17 @@ fn d_type(kind: Kind) -> u8 {
 /// reports it; d_off is the index of the next entry.
 pub fn getdents64(p: &ProcessRef, fd: i32, buf: u64, count: u32) -> SysResult {
     let open = directory(p, fd)?;
-    let (node, index) = {
+    let (node, index, proc) = {
         let f = open.lock();
-        (f.node, f.offset)
+        (f.node, f.offset, f.proc)
     };
     let count = count as usize;
+    if let Some(dir) = proc {
+        let (out, next) = crate::procfs::getdents(p, dir, index, count)?;
+        copy_to_user(buf, &out).map_err(fault)?;
+        open.lock().offset = next;
+        return Ok(out.len() as u64);
+    }
     let (out, next) = fs::with(|fs| {
         if fs.stat(node)?.nlink == 0 {
             return Err(Errno::ENOENT);
@@ -349,7 +382,14 @@ pub fn chdir(p: &ProcessRef, path: u64) -> SysResult {
 /// start check, ADR 0022).
 pub fn fchdir(p: &ProcessRef, fd: i32) -> SysResult {
     let open = directory(p, fd)?;
-    let node = open.lock().node;
+    let (node, proc) = {
+        let f = open.lock();
+        (f.node, f.proc)
+    };
+    // A working directory in /proc is not supported (ADR 0024).
+    if proc.is_some() {
+        return Err(Errno::EACCES);
+    }
     set_cwd(p, node)
 }
 
@@ -596,6 +636,7 @@ pub fn readlinkat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, size: i32) ->
         return Err(Errno::EINVAL);
     }
     let path = user_path(path)?;
+    let path = in_proc_dir(p, dirfd, &path).unwrap_or(path);
     let target = match crate::procfs::lookup(p, &path, false) {
         Some(hit) => match hit? {
             crate::procfs::Hit::Node(node) => crate::procfs::readlink(p, node)?,
@@ -720,6 +761,7 @@ pub fn faccessat2(p: &ProcessRef, dirfd: i32, path: u64, mode: u32, flags: u32) 
         return Err(Errno::EINVAL);
     }
     let path = path_arg(path)?;
+    let path = in_proc_dir(p, dirfd, &path).unwrap_or(path);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let stat = match crate::procfs::lookup(p, &path, follow) {
         Some(hit) => match hit? {
@@ -1242,6 +1284,12 @@ pub fn statfs(p: &ProcessRef, path: u64, buf: u64) -> SysResult {
 /// fstatfs(2): of the filesystem holding the descriptor's file.
 pub fn fstatfs(p: &ProcessRef, fd: i32, buf: u64) -> SysResult {
     let target = object(p, fd, Rights::NONE)?;
+    if let Object::File(f) = &target
+        && f.lock().proc.is_some()
+    {
+        copy_to_user(buf, &crate::procfs::statfs_bytes()).map_err(fault)?;
+        return Ok(0);
+    }
     let mut b = statfs_bytes(p)?;
     if let Some(magic) = crate::ready::statfs_magic(&target) {
         // pipefs and the anon-inode filesystem are pseudo filesystems:

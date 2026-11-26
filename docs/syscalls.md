@@ -142,7 +142,7 @@ addresses.
 | 200 | `tkill` | Complete | none; the TID must be in the caller's compartment (ESRCH) | ADR 0020. As tgkill without the process check. |
 | 202 | `futex` | Partial: WAIT, WAKE, REQUEUE, CMP_REQUEUE (private and shared alike) | none (own memory) | ADR 0019. Misaligned EINVAL; mismatch EAGAIN, checked under the wake lock; relative timeout ETIMEDOUT, bad timespec EINVAL; requeue counts negative EINVAL, CMP mismatch EAGAIN; other commands and FUTEX_CLOCK_REALTIME ENOSYS. Keys are (address space, address). A signal for the thread cuts a wait short with EINTR (no SA_RESTART yet; ADR 0020). |
 | 213 | `epoll_create` | Complete | none (makes a handle: READ, WRITE, STAT, DUPLICATE) | ADR 0026. A size of 0 or less EINVAL; otherwise epoll_create1(0). |
-| 217 | `getdents64` | Complete | ENUMERATE (after the type check: ENOTDIR first) | ADR 0022. `struct linux_dirent64` records: ".", "..", then the names in byte order, d_type as Linux (DT_DIR, DT_REG, DT_LNK, DT_CHR), d_ino as stat's st_ino, d_off the next index. EINVAL if not even one record fits; ENOENT for a removed directory. Resumes by index, so a directory changed between calls can skip or repeat a name. |
+| 217 | `getdents64` | Complete | ENUMERATE (after the type check: ENOTDIR first) | ADR 0022. `struct linux_dirent64` records: ".", "..", then the names in byte order, d_type as Linux (DT_DIR, DT_REG, DT_LNK, DT_CHR), d_ino as stat's st_ino, d_off the next index. EINVAL if not even one record fits; ENOENT for a removed directory. Resumes by index, so a directory changed between calls can skip or repeat a name. A procfs directory lists as procfs does (ADR 0037; see procfs below). |
 | 218 | `set_tid_address` | Complete | none | Sets the calling thread's clear_child_tid and returns its TID. At thread exit, if other threads share the memory, 0 is written there and one futex waiter woken (Linux's mm_release). |
 | 219 | `restart_syscall` | Complete for the sleeps | none (own thread) | ADR 0033. Resumes the thread's interrupted relative sleep (its deadline and `rem`); with none, EINTR (`do_no_restart_syscall`). The return to user mode substitutes it for a call that returned ERESTART_RESTARTBLOCK when no handler runs. |
 | 228 | `clock_gettime` | MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE, BOOTTIME, REALTIME, REALTIME_COARSE | none | No real-time clock yet: the REALTIME clocks count from boot as if boot were 1970-01-01. CPU-time and other clocks EINVAL. |
@@ -223,9 +223,10 @@ thread exit status 128 + the signal).
 
 ## procfs
 
-ADR 0024. Paths under `/proc` (absolute, after lexical `.`/`..`) are
-procfs's, over whatever the process tree holds there, and show only the
-caller's compartment's processes:
+ADRs 0024 and 0037. Paths under `/proc` (absolute, after lexical
+`.`/`..`, or relative to a procfs directory's descriptor) are procfs's,
+over whatever the process tree holds there, and show only the caller's
+compartment's processes, running and zombies:
 
 | Path | Kind | Contents |
 | --- | --- | --- |
@@ -234,9 +235,14 @@ caller's compartment's processes:
 | `/proc/<pid>`, `/proc/<pid>/task`, `/proc/<pid>/task/<tid>` | directories 0555 | |
 | `/proc/<pid>/exe` (also under a task) | link | the program's path; followed by stat and open |
 | `/proc/<pid>/comm`, `/proc/<pid>/task/<tid>/comm` | file 0644 | the thread's name and a newline; a write renames a thread of the caller's process |
+| `/proc/<pid>/cmdline` | file 0444 | the argv exec gave, each string with its NUL; empty for a zombie |
+| `/proc/<pid>/stat` | file 0444 | `do_task_stat`'s 52 fields; what Keel does not keep is 0 (ADR 0037) |
 | `/proc/cpuinfo` | file 0444 | Linux's x86 format from CPUID (without microcode, cache size, synthesized flags and bugs) |
 | `/proc/net`, `/proc/net/dev` | directory; file 0444 | the header lines (no interfaces yet) |
 
-Files open as snapshots taken at the open. Directories cannot be opened
-yet (EACCES). statfs reports PROC_SUPER_MAGIC.
+Files open as snapshots taken at the open. Directories open read-only
+to be listed (O_DIRECTORY on a file ENOTDIR; writing or O_CREAT EISDIR),
+in Linux's order and positions: `/proc`'s PIDs at PID + 258 after
+`self` and `thread-self` at 256 and 257. They cannot be a working
+directory (fchdir EACCES). statfs reports PROC_SUPER_MAGIC.
 

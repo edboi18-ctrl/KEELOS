@@ -122,6 +122,8 @@ pub struct Loaded {
     /// The program's path as given to the loader (`/proc/<pid>/exe` and
     /// the first thread's name come from it; ADR 0024).
     pub path: Vec<u8>,
+    /// argv, each string with its NUL (`/proc/<pid>/cmdline`, ADR 0037).
+    pub cmdline: Vec<u8>,
 }
 
 /// `AT_CLKTCK`: Linux reports CLOCKS_PER_SEC, which is USER_HZ, 100
@@ -280,6 +282,10 @@ pub fn load_in(
         entry,
         interpreter_base: interpreter.map(|(_, base)| base),
         path: path.to_vec(),
+        cmdline: argv
+            .iter()
+            .flat_map(|a| a.iter().copied().chain([0]))
+            .collect(),
         rsp: initial.rsp,
         random: quality,
         brk_start: image.span().1 + bias + random::below(BRK_RANDOM_BYTES / PAGE) * PAGE,

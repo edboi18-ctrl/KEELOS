@@ -1950,6 +1950,7 @@ fn phase3(t: &mut Runner) {
     phase3_spawn(t);
     phase3_fifos(t);
     phase3_scripts(t);
+    phase3_procdirs(t);
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
@@ -2699,6 +2700,41 @@ fn phase3_scripts(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  scriptprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// ADR 0037: user/tests/pidprobe, which passes under Linux too
+/// (`host.pidprobe`): /proc's directories listed, and /proc/<pid>/stat
+/// and cmdline. Run twice; after the second run every node, frame and
+/// process is back.
+fn phase3_procdirs(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/pidprobe";
+    let outside_heap = frames_outside_heap;
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let warm = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames, processes, nodes_before) = (outside_heap(), process::count(), nodes());
+    let status = if warm == Some((0, None)) {
+        run_test_program(PROGRAM, &[PROGRAM])
+    } else {
+        warm
+    };
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) = (outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.procdirs",
+        ok,
+        "/proc's process directories as on Linux: /proc listed with self, thread-self and the compartment's PIDs at PID + 258, /proc/<pid> and its task directory listed, lseek back to a position, EINVAL for a short buffer, ENOTDIR and EISDIR opens; /proc/<pid>/stat's 52 fields (R, S, T, Z, the parent, group, session and terminal, a name with \") (\") and cmdline as exec gave it, empty for a zombie; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  pidprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

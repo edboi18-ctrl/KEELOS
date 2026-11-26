@@ -352,6 +352,7 @@ pub fn memfd_create(p: &ProcessRef, name: u64, flags: u64) -> SysResult {
         status: crate::abi::O_RDWR | crate::abi::O_LARGEFILE,
         comm: None,
         tty: None,
+        proc: None,
     };
     let fd = p.lock().handles.insert(Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),

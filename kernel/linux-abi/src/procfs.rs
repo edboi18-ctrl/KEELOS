@@ -3,11 +3,16 @@
 //! there), and seen per compartment: `/proc/<pid>` exists only for the
 //! caller's compartment's PIDs, as in a Linux PID namespace (ADR 0014).
 //!
-//! Only absolute paths reach it: `/proc...` after `.`, `..` and repeated
-//! slashes are taken out lexically. A path relative to a directory inside
-//! `/proc`, or a working directory there, is not supported (no descriptor
-//! or working directory can name a procfs directory). Its nodes and the
-//! file formats are `keel_core::procfs`'s.
+//! Absolute paths reach it: `/proc...` after `.`, `..` and repeated
+//! slashes are taken out lexically. So do paths relative to a procfs
+//! directory's descriptor (ADR 0037), as the directory's path and the
+//! relative one, whose `..` stops at that directory as with any directory
+//! handle (ADR 0012). A working directory in `/proc` is not supported.
+//! Its nodes and the file formats are `keel_core::procfs`'s.
+//!
+//! A compartment's processes are its running ones and its zombies (ADR
+//! 0037), as a PID namespace's: a zombie stays until its parent reaps
+//! it.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -78,12 +83,43 @@ impl View for Caller<'_> {
         target(self.p, pid).is_some_and(|t| t.lock().threads.values().any(|th| th.tid == tid))
     }
 
+    /// A zombie has no program (`proc_exe_link`: no mm, ENOENT).
     fn exe(&self, pid: u32) -> Option<Vec<u8>> {
-        target(self.p, pid).map(|t| t.lock().exe.clone())
+        target(self.p, pid).and_then(|t| {
+            let t = t.lock();
+            t.space.is_some().then(|| t.exe.clone())
+        })
+    }
+
+    fn pids(&self) -> Vec<u32> {
+        let mut pids: Vec<u32> = visible(self.p).iter().map(|t| t.lock().pid()).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    fn tasks(&self, pid: u32) -> Vec<u32> {
+        target(self.p, pid).map_or_else(Vec::new, |t| {
+            let t = t.lock();
+            let mut tids: Vec<u32> = t.threads.values().map(|th| th.tid).collect();
+            // The first thread (TID = PID) first, then by creation (TIDs
+            // count up): `first_tid`, `next_thread`.
+            tids.sort_unstable_by_key(|&tid| (tid != pid, tid));
+            tids
+        })
     }
 }
 
-/// Process `pid` of the caller's compartment.
+/// The caller's compartment's processes: the running ones and the
+/// zombies.
+fn visible(p: &ProcessRef) -> Vec<ProcessRef> {
+    let compartment = p.lock().member.compartment().clone();
+    let mut all = process::members(&compartment, |_| true);
+    all.extend(process::zombies(&compartment, |_| true));
+    all
+}
+
+/// Process `pid` of the caller's compartment, running or a zombie.
 fn target(p: &ProcessRef, pid: u32) -> Option<ProcessRef> {
     let (compartment, mine) = {
         let process = p.lock();
@@ -93,6 +129,7 @@ fn target(p: &ProcessRef, pid: u32) -> Option<ProcessRef> {
         return Some(p.clone());
     }
     process::find_in(&compartment, pid)
+        .or_else(|| process::zombies(&compartment, |z| z.pid() == pid).pop())
 }
 
 /// Looks `path` up in procfs: None if it is not a `/proc` path; else the
@@ -138,6 +175,8 @@ fn ino(node: Node) -> Ino {
         Node::Tasks(p) => (10, p, 0),
         Node::Task(p, t) => (11, p, t),
         Node::TaskComm(p, t) => (12, p, t),
+        Node::Cmdline(p) => (13, p, 0),
+        Node::Stat(p) => (14, p, 0),
     };
     (0xFFFF << 48) | (tag << 44) | (u64::from(a & 0x3f_ffff) << 22) | u64::from(b & 0x3f_ffff)
 }
@@ -209,6 +248,21 @@ pub fn contents(
         }
         Node::NetDev => Ok((procfs::NET_DEV.as_bytes().to_vec(), None)),
         Node::Comm(pid) => comm(p, pid, pid).map(|(t, c)| (t, Some(c))),
+        Node::Cmdline(pid) => {
+            let t = target(p, pid).ok_or(Errno::ENOENT)?;
+            let t = t.lock();
+            // `get_mm_cmdline`: nothing without an address space.
+            let text = if t.space.is_some() {
+                t.cmdline.clone()
+            } else {
+                Vec::new()
+            };
+            Ok((text, None))
+        }
+        Node::Stat(pid) => {
+            let t = target(p, pid).ok_or(Errno::ENOENT)?;
+            Ok((procfs::stat_line(&stat_info(p, &t)), None))
+        }
         Node::TaskComm(pid, tid) => comm(p, pid, tid).map(|(t, c)| (t, Some(c))),
         _ => Err(Errno::EISDIR),
     }
@@ -242,10 +296,12 @@ pub fn write_comm(target: &process::CommTarget, data: &[u8]) -> Result<usize, Er
 ///   with O_EXCL on an existing one EEXIST;
 /// - O_NOFOLLOW on a link ELOOP; a followed `exe` link opens the program
 ///   in the real tree;
-/// - a directory cannot be opened yet (EACCES), so none can be listed or
-///   used as a working directory (ADR 0024).
+/// - as `do_open`: O_DIRECTORY on something not a directory ENOTDIR;
+///   then a directory opened with O_CREAT, or for writing, EISDIR
+///   (`may_open`); else it opens to be listed (ADR 0037), not to be a
+///   working directory.
 pub fn open(p: &ProcessRef, path: &[u8], flags: u64) -> Option<Result<Hit, Errno>> {
-    use crate::abi::{O_ACCMODE, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY};
+    use crate::abi::{O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY};
     let follow = flags & O_NOFOLLOW == 0 && !(flags & O_CREAT != 0 && flags & O_EXCL != 0);
     let hit = match lookup(p, path, follow)? {
         Err(Errno::ENOENT) if flags & O_CREAT != 0 => return Some(Err(Errno::EACCES)),
@@ -256,9 +312,16 @@ pub fn open(p: &ProcessRef, path: &[u8], flags: u64) -> Option<Result<Hit, Errno
             return Err(Errno::EEXIST);
         }
         if let Hit::Node(node) = &hit {
+            if flags & O_DIRECTORY != 0 && node.kind() == Kind::File {
+                return Err(Errno::ENOTDIR);
+            }
             match node.kind() {
                 Kind::Symlink => return Err(Errno::ELOOP),
-                Kind::Directory => return Err(Errno::EACCES),
+                Kind::Directory => {
+                    if flags & O_CREAT != 0 || flags & O_ACCMODE != O_RDONLY {
+                        return Err(Errno::EISDIR);
+                    }
+                }
                 Kind::File => {
                     let writes = flags & O_ACCMODE != O_RDONLY;
                     if writes && !matches!(node, Node::Comm(_) | Node::TaskComm(..)) {
@@ -269,6 +332,180 @@ pub fn open(p: &ProcessRef, path: &[u8], flags: u64) -> Option<Result<Hit, Errno
         }
         Ok(hit)
     }))
+}
+
+/// What `/proc/<pid>/stat` shows of `t` (`do_task_stat`), read by `p`:
+/// - **state:** Z for a zombie, T if stopped, R for the reader itself,
+///   else S. Keel's scheduler does not say whether another thread is
+///   runnable: one waiting for the CPU reads as S, where Linux gives R;
+/// - **the name** is the first thread's;
+/// - **the parent:** its PID, 0 for a process the kernel started or
+///   whose parent has gone (getppid's rule);
+/// - **the terminal:** its device number and foreground group, or 0 and
+///   -1 without one;
+/// - **the start** in clock ticks since boot; the address space's size
+///   and resident pages; the initial stack pointer and the break's
+///   start;
+/// - **signals:** the first thread's pending and blocked sets, and the
+///   dispositions ignored and caught;
+/// - **wchan** 1 for a single-threaded process not running;
+/// - **the exit signal** SIGCHLD for a forked process, 0 for one the
+///   kernel started (as Linux's `kernel_init`);
+/// - **the exit code** a zombie's wait status.
+pub fn stat_info(p: &ProcessRef, t: &ProcessRef) -> procfs::StatInfo {
+    use keel_core::signal::{NSIG, SIG_DFL, SIG_IGN};
+    let reader = Arc::ptr_eq(p, t);
+    let parent = t
+        .lock()
+        .parent
+        .as_ref()
+        .and_then(alloc::sync::Weak::upgrade);
+    let ppid = parent.as_ref().map_or(0, |q| q.lock().pid());
+    let process = t.lock();
+    let pid = process.pid();
+    let first = process
+        .threads
+        .values()
+        .find(|th| th.tid == pid)
+        .or_else(|| process.threads.values().next());
+    let zombie = process.space.is_none();
+    let state = if zombie {
+        b'Z'
+    } else if process.stopped {
+        b'T'
+    } else if reader {
+        b'R'
+    } else {
+        b'S'
+    };
+    let (tty_nr, tpgid) = crate::tty::stat_fields(process.ctty.as_ref());
+    let (mut ignored, mut caught) = (0u64, 0u64);
+    for sig in 1..=NSIG as i32 {
+        match process.signals.action(sig).map(|a| a.handler) {
+            Some(SIG_IGN) => ignored |= 1 << (sig - 1),
+            Some(SIG_DFL) | None => {}
+            Some(_) => caught |= 1 << (sig - 1),
+        }
+    }
+    let (vsize, rss) = process
+        .space
+        .as_ref()
+        .map_or((0, 0), |s| (s.mapped_bytes(), s.resident_bytes() / 4096));
+    let threads = process.threads.len() as u32;
+    procfs::StatInfo {
+        pid,
+        comm: first.map_or_else(|| process.exit_comm.clone(), |th| th.comm.clone()),
+        state,
+        ppid,
+        pgid: process.pgid,
+        sid: process.sid,
+        tty_nr,
+        tpgid,
+        num_threads: threads,
+        // USER_HZ 100: one tick is 10 ms.
+        start_time: process.started / 10_000_000,
+        vsize,
+        rss,
+        start_stack: process.start_stack,
+        start_brk: process.brk_start,
+        pending: first.map_or(0, |th| th.signals.pending.set()),
+        blocked: first.map_or(0, |th| th.signals.blocked()),
+        ignored,
+        caught,
+        wchan: u64::from(state != b'R' && threads < 2),
+        exit_signal: if process.parent.is_some() { 17 } else { 0 },
+        exit_code: process.exit_status.unwrap_or(0),
+    }
+}
+
+/// The getdents64 records of procfs directory `dir` from position `from`
+/// (`linux_dirent64`, as `fscalls::getdents64` writes them): what fits in
+/// `count` bytes (EINVAL if not even the first), and the position to go
+/// on from. ENOENT once a process directory's process is gone
+/// (`proc_pident_readdir`, `proc_task_readdir`).
+pub fn getdents(
+    p: &ProcessRef,
+    dir: Node,
+    from: u64,
+    count: usize,
+) -> Result<(Vec<u8>, u64), Errno> {
+    let view = Caller { p };
+    let gone = match dir {
+        Node::Pid(pid) | Node::Tasks(pid) => !view.has_pid(pid),
+        Node::Task(pid, tid) => !view.has_task(pid, tid),
+        _ => false,
+    };
+    if gone {
+        return Err(Errno::ENOENT);
+    }
+    let (entries, end) = procfs::list(dir, &view);
+    let root = p.lock().root;
+    let mut out = Vec::new();
+    let mut at = from;
+    let start = entries
+        .iter()
+        .position(|e| e.pos >= from)
+        .unwrap_or(entries.len());
+    for (i, e) in entries.iter().enumerate().skip(start) {
+        let next = entries.get(i + 1).map_or(end, |n| n.pos);
+        let (ino, kind) = match e.node {
+            Some(node) => (stat(node).ino, node.kind()),
+            None => (root, Kind::Directory),
+        };
+        let d_type = match kind {
+            Kind::Directory => 4,
+            Kind::File => 8,
+            Kind::Symlink => 10,
+        };
+        let reclen = (19 + e.name.len() + 1).next_multiple_of(8);
+        if out.len() + reclen > count {
+            if out.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            return Ok((out, at));
+        }
+        let s = out.len();
+        out.resize(s + reclen, 0);
+        out[s..s + 8].copy_from_slice(&(ino + 1).to_le_bytes());
+        out[s + 8..s + 16].copy_from_slice(&next.to_le_bytes());
+        out[s + 16..s + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        out[s + 18] = d_type;
+        out[s + 19..s + 19 + e.name.len()].copy_from_slice(&e.name);
+        at = next;
+    }
+    Ok((out, at))
+}
+
+/// The absolute path a lookup of `path` relative to procfs directory
+/// `dir` names: the directory's path, then `path`'s components, `..`
+/// stopping at `dir` (a directory handle is its lookups' root, ADR 0012).
+pub fn relative(dir: Node, path: &[u8]) -> Option<Vec<u8>> {
+    let base = procfs::path_of(dir)?.into_bytes();
+    let depth = base.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
+    let mut parts: Vec<&[u8]> = base
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    for c in path.split(|&b| b == b'/') {
+        match c {
+            b"" | b"." => {}
+            b".." => {
+                if parts.len() > depth {
+                    parts.pop();
+                }
+            }
+            c => parts.push(c),
+        }
+    }
+    let mut out = Vec::new();
+    for c in parts {
+        out.push(b'/');
+        out.extend_from_slice(c);
+    }
+    if path.last() == Some(&b'/') {
+        out.push(b'/');
+    }
+    Some(out)
 }
 
 /// statfs(2) for procfs (`simple_statfs` with PROC_SUPER_MAGIC 0x9fa0):

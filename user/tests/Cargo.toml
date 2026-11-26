@@ -157,6 +157,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "pidprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "fifoprobe"
 test = false
 bench = false

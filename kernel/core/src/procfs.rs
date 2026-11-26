@@ -1,12 +1,16 @@
 //! The procfs subset Keel provides (P3-T9, ADR 0024), as pure data and
 //! tested on the host: path parsing, `/proc/cpuinfo` from CPUID, and
-//! `/proc/net/dev`. `keel-linux-abi` answers lookups with it.
+//! `/proc/net/dev`, the directory listings and `/proc/<pid>/stat`.
+//! `keel-linux-abi` answers lookups with it.
 //!
-//! The Wine traces use exactly these (`docs/syscall-inventory.md`):
-//! `/proc` itself, `/proc/self` and `/proc/<pid>` (readlink), their `exe`
-//! links, `/proc/<pid>/task/<tid>/comm` (thread names), `/proc/cpuinfo`
-//! and `/proc/net/dev`. Formats are Linux v6.12's
-//! (`arch/x86/kernel/cpu/proc.c`, `fs/proc/base.c`, `fs/proc/self.c`,
+//! The Wine traces use these (`docs/syscall-inventory.md`): `/proc`
+//! itself, `/proc/self` and `/proc/<pid>` (readlink), their `exe` links,
+//! `/proc/<pid>/task/<tid>/comm` (thread names), `/proc/cpuinfo` and
+//! `/proc/net/dev`. Beyond the traces (ADR 0037), what `ps` and `pidof`
+//! read: the directories listed, `/proc/<pid>/stat` and
+//! `/proc/<pid>/cmdline`. Formats are Linux v6.12's
+//! (`arch/x86/kernel/cpu/proc.c`, `fs/proc/base.c`, `fs/proc/root.c`,
+//! `fs/proc/generic.c`, `fs/proc/array.c`, `fs/proc/self.c`,
 //! `fs/proc/thread_self.c`, `net/core/net-procfs.c`).
 
 use alloc::format;
@@ -28,6 +32,10 @@ pub enum Node {
     Exe(u32),
     /// `/proc/<pid>/comm`: the thread group leader's name.
     Comm(u32),
+    /// `/proc/<pid>/cmdline`: the process's argv.
+    Cmdline(u32),
+    /// `/proc/<pid>/stat`: its status line.
+    Stat(u32),
     /// `/proc/<pid>/task`.
     Tasks(u32),
     /// `/proc/<pid>/task/<tid>`.
@@ -50,7 +58,12 @@ impl Node {
                 Kind::Directory
             }
             Node::SelfLink | Node::ThreadSelf | Node::Exe(_) => Kind::Symlink,
-            Node::Comm(_) | Node::TaskComm(..) | Node::CpuInfo | Node::NetDev => Kind::File,
+            Node::Comm(_)
+            | Node::Cmdline(_)
+            | Node::Stat(_)
+            | Node::TaskComm(..)
+            | Node::CpuInfo
+            | Node::NetDev => Kind::File,
         }
     }
 
@@ -95,6 +108,10 @@ pub trait View {
     fn has_task(&self, pid: u32, tid: u32) -> bool;
     /// The program's path of process `pid` (what `exe` reads as).
     fn exe(&self, pid: u32) -> Option<Vec<u8>>;
+    /// The PIDs of the caller's compartment, in increasing order.
+    fn pids(&self) -> Vec<u32>;
+    /// The TIDs of process `pid`, its first thread first.
+    fn tasks(&self, pid: u32) -> Vec<u32>;
 }
 
 /// A number as procfs reads one in a path: decimal digits only, no sign,
@@ -142,6 +159,8 @@ pub fn resolve(rest: &[&[u8]], follow_last: bool, view: &dyn View) -> Resolved {
             (Node::Net, b"dev") => Node::NetDev,
             (Node::Pid(p), b"exe") => Node::Exe(p),
             (Node::Pid(p), b"comm") => Node::Comm(p),
+            (Node::Pid(p), b"cmdline") => Node::Cmdline(p),
+            (Node::Pid(p), b"stat") => Node::Stat(p),
             (Node::Pid(p), b"task") => Node::Tasks(p),
             (Node::Tasks(p), n) => match number(n) {
                 Some(tid) if view.has_task(p, tid) => Node::Task(p, tid),
@@ -179,6 +198,229 @@ pub fn resolve(rest: &[&[u8]], follow_last: bool, view: &dyn View) -> Resolved {
         i += 1;
     }
     Resolved::Node(at)
+}
+
+/// `FIRST_PROCESS_ENTRY` (`include/linux/proc_fs.h`): where `/proc`'s
+/// listing goes from its fixed entries to `self`, `thread-self` and the
+/// PIDs (`proc_root_readdir`).
+const FIRST_PROCESS_ENTRY: u64 = 256;
+/// `TGID_OFFSET` (`fs/proc/base.c`): PID n is at position n + 258.
+pub const TGID_OFFSET: u64 = FIRST_PROCESS_ENTRY + 2;
+/// `PID_MAX_LIMIT` on 64-bit (`include/linux/threads.h`): the position
+/// after the last PID is PID_MAX_LIMIT + TGID_OFFSET.
+const PID_MAX_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// A directory entry: its position (what getdents64's d_off and lseek
+/// take back to), its name, and its node; None for `..` of `/proc`,
+/// which is in the real tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub pos: u64,
+    pub name: Vec<u8>,
+    pub node: Option<Node>,
+}
+
+/// The entries of directory `dir`, in order, and the position after the
+/// last one. As Linux lists them:
+/// - **`/proc`** (`proc_root_readdir`): `.` and `..`, the fixed entries
+///   in `proc_readdir_de`'s order (shorter names first, then by byte),
+///   then from position 256 `self` and `thread-self`, then each PID at
+///   PID + 258 (`proc_pid_readdir`), increasing; the end is
+///   PID_MAX_LIMIT + 258;
+/// - **`/proc/<pid>`** (`proc_pident_readdir`): `.`, `..`, then its
+///   entries in `tgid_base_stuff`'s order, the ones Keel has; the task
+///   directories in `tid_base_stuff`'s;
+/// - **`/proc/<pid>/task`** (`proc_task_readdir`): `.`, `..`, then the
+///   threads, the first one first.
+///
+/// Positions other than `/proc`'s are indices; the end is one past the
+/// last.
+pub fn list(dir: Node, view: &dyn View) -> (Vec<Entry>, u64) {
+    let mut out = Vec::new();
+    let mut put = |pos: u64, name: &[u8], node: Option<Node>| {
+        out.push(Entry {
+            pos,
+            name: name.to_vec(),
+            node,
+        });
+    };
+    let parent = match dir {
+        Node::Root => None,
+        Node::Pid(_) | Node::Net => Some(Node::Root),
+        Node::Tasks(p) => Some(Node::Pid(p)),
+        Node::Task(p, _) => Some(Node::Tasks(p)),
+        _ => return (out, 0),
+    };
+    put(0, b".", Some(dir));
+    put(1, b"..", parent);
+    let fixed: Vec<(&[u8], Node)> = match dir {
+        Node::Root => alloc::vec![(&b"net"[..], Node::Net), (b"cpuinfo", Node::CpuInfo)],
+        Node::Net => alloc::vec![(&b"dev"[..], Node::NetDev)],
+        Node::Pid(p) => alloc::vec![
+            (&b"task"[..], Node::Tasks(p)),
+            (b"comm", Node::Comm(p)),
+            (b"cmdline", Node::Cmdline(p)),
+            (b"stat", Node::Stat(p)),
+            (b"exe", Node::Exe(p)),
+        ],
+        Node::Task(p, t) => {
+            alloc::vec![(&b"comm"[..], Node::TaskComm(p, t)), (b"exe", Node::Exe(p))]
+        }
+        _ => Vec::new(),
+    };
+    let mut pos = 2;
+    for (name, node) in fixed {
+        put(pos, name, Some(node));
+        pos += 1;
+    }
+    match dir {
+        Node::Root => {
+            put(FIRST_PROCESS_ENTRY, b"self", Some(Node::SelfLink));
+            put(
+                FIRST_PROCESS_ENTRY + 1,
+                b"thread-self",
+                Some(Node::ThreadSelf),
+            );
+            for pid in view.pids() {
+                put(
+                    u64::from(pid) + TGID_OFFSET,
+                    format!("{pid}").as_bytes(),
+                    Some(Node::Pid(pid)),
+                );
+            }
+            (out, PID_MAX_LIMIT + TGID_OFFSET)
+        }
+        Node::Tasks(p) => {
+            for tid in view.tasks(p) {
+                put(pos, format!("{tid}").as_bytes(), Some(Node::Task(p, tid)));
+                pos += 1;
+            }
+            (out, pos)
+        }
+        _ => (out, pos),
+    }
+}
+
+/// The path of a procfs directory, for lookups relative to it.
+pub fn path_of(dir: Node) -> Option<String> {
+    match dir {
+        Node::Root => Some(String::from("/proc")),
+        Node::Net => Some(String::from("/proc/net")),
+        Node::Pid(p) => Some(format!("/proc/{p}")),
+        Node::Tasks(p) => Some(format!("/proc/{p}/task")),
+        Node::Task(p, t) => Some(format!("/proc/{p}/task/{t}")),
+        _ => None,
+    }
+}
+
+/// What `/proc/<pid>/stat` shows of a process (`do_task_stat` with
+/// `whole`, `fs/proc/array.c`). Fields Keel does not keep are not here
+/// and read as 0: fault counts, CPU times, the code and data bounds, the
+/// argument and environment bounds, wchan's address, the CPU, real-time
+/// priority and policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatInfo {
+    pub pid: u32,
+    /// The thread group leader's name.
+    pub comm: Vec<u8>,
+    /// R, S, T or Z.
+    pub state: u8,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    /// The controlling terminal's device number (`new_encode_dev`), 0
+    /// for none.
+    pub tty_nr: u32,
+    /// The terminal's foreground group, -1 without one.
+    pub tpgid: i64,
+    pub num_threads: u32,
+    /// Clock ticks (USER_HZ 100) from boot to the process's start.
+    pub start_time: u64,
+    /// The address space's size in bytes and resident pages.
+    pub vsize: u64,
+    pub rss: u64,
+    pub start_stack: u64,
+    pub start_brk: u64,
+    /// Signal sets as bit masks (signal n at bit n - 1).
+    pub pending: u64,
+    pub blocked: u64,
+    pub ignored: u64,
+    pub caught: u64,
+    /// 1 if single-threaded and not running (`!task_is_running`).
+    pub wchan: u64,
+    pub exit_signal: i32,
+    /// The wait status, for a zombie; else 0.
+    pub exit_code: i32,
+}
+
+/// RLIMIT_RSS's soft limit: RLIM_INFINITY (`INIT_RLIMITS`).
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// `/proc/<pid>/stat`: the 52 fields of `do_task_stat`, in its order,
+/// separated by spaces, with a newline. The obsolete signal fields keep
+/// only signals 1-31 (`& 0x7fffffff`).
+pub fn stat_line(s: &StatInfo) -> Vec<u8> {
+    let low = |v: u64| v & 0x7fff_ffff;
+    let mut out = format!("{} (", s.pid).into_bytes();
+    out.extend_from_slice(&s.comm);
+    out.extend_from_slice(b") ");
+    out.push(s.state);
+    let fields: [i128; 49] = [
+        s.ppid.into(),
+        s.pgid.into(),
+        s.sid.into(),
+        s.tty_nr.into(),
+        s.tpgid.into(),
+        0,  // flags
+        0,  // min_flt
+        0,  // cmin_flt
+        0,  // maj_flt
+        0,  // cmaj_flt
+        0,  // utime
+        0,  // stime
+        0,  // cutime
+        0,  // cstime
+        20, // priority: task_prio, 120 - MAX_RT_PRIO
+        0,  // nice
+        s.num_threads.into(),
+        0, // itrealvalue
+        s.start_time.into(),
+        s.vsize.into(),
+        s.rss.into(),
+        RLIM_INFINITY.into(),
+        0, // start_code
+        0, // end_code
+        s.start_stack.into(),
+        0, // esp
+        0, // eip
+        low(s.pending).into(),
+        low(s.blocked).into(),
+        low(s.ignored).into(),
+        low(s.caught).into(),
+        s.wchan.into(),
+        0, // nswap
+        0, // cnswap
+        s.exit_signal.into(),
+        0, // processor
+        0, // rt_priority
+        0, // policy
+        0, // delayacct_blkio_ticks
+        0, // guest_time
+        0, // cguest_time
+        0, // start_data
+        0, // end_data
+        s.start_brk.into(),
+        0, // arg_start
+        0, // arg_end
+        0, // env_start
+        0, // env_end
+        s.exit_code.into(),
+    ];
+    for f in fields {
+        out.extend_from_slice(format!(" {f}").as_bytes());
+    }
+    out.push(b'\n');
+    out
 }
 
 /// `/proc/net/dev` with no network interfaces: the two header lines of
@@ -566,6 +808,16 @@ mod tests {
         fn exe(&self, pid: u32) -> Option<Vec<u8>> {
             Some(format!("/bin/p{pid}").into_bytes())
         }
+        fn pids(&self) -> Vec<u32> {
+            alloc::vec![3, 7]
+        }
+        fn tasks(&self, pid: u32) -> Vec<u32> {
+            if pid == 7 {
+                alloc::vec![7, 9]
+            } else {
+                alloc::vec![3]
+            }
+        }
     }
 
     fn r(path: &[&[u8]], follow: bool) -> Resolved {
@@ -612,6 +864,89 @@ mod tests {
             (Node::Exe(1).permissions(), Node::CpuInfo.permissions()),
             (0o777, 0o444)
         );
+    }
+
+    fn names(dir: Node) -> Vec<(u64, String, Option<Node>)> {
+        let (entries, _) = list(dir, &V);
+        entries
+            .into_iter()
+            .map(|e| (e.pos, String::from_utf8(e.name).unwrap(), e.node))
+            .collect()
+    }
+
+    #[test]
+    fn directories_list_as_procfs() {
+        let s = |n: &str| String::from(n);
+        assert_eq!(
+            names(Node::Root),
+            alloc::vec![
+                (0, s("."), Some(Node::Root)),
+                (1, s(".."), None),
+                (2, s("net"), Some(Node::Net)),
+                (3, s("cpuinfo"), Some(Node::CpuInfo)),
+                (256, s("self"), Some(Node::SelfLink)),
+                (257, s("thread-self"), Some(Node::ThreadSelf)),
+                (261, s("3"), Some(Node::Pid(3))),
+                (265, s("7"), Some(Node::Pid(7))),
+            ]
+        );
+        assert_eq!(list(Node::Root, &V).1, 4 * 1024 * 1024 + 258);
+        let pid: Vec<String> = names(Node::Pid(7)).into_iter().map(|e| e.1).collect();
+        assert_eq!(pid, [".", "..", "task", "comm", "cmdline", "stat", "exe"]);
+        assert_eq!(
+            names(Node::Tasks(7)),
+            alloc::vec![
+                (0, s("."), Some(Node::Tasks(7))),
+                (1, s(".."), Some(Node::Pid(7))),
+                (2, s("7"), Some(Node::Task(7, 7))),
+                (3, s("9"), Some(Node::Task(7, 9))),
+            ]
+        );
+        assert_eq!(list(Node::Tasks(7), &V).1, 4);
+        let task: Vec<String> = names(Node::Task(7, 9)).into_iter().map(|e| e.1).collect();
+        assert_eq!(task, [".", "..", "comm", "exe"]);
+        assert_eq!(names(Node::Net)[2], (2, s("dev"), Some(Node::NetDev)));
+        assert!(list(Node::Stat(7), &V).0.is_empty());
+        assert_eq!(r(&[b"7", b"stat"], true), Resolved::Node(Node::Stat(7)));
+        assert_eq!(
+            r(&[b"7", b"cmdline"], true),
+            Resolved::Node(Node::Cmdline(7))
+        );
+        assert_eq!(path_of(Node::Task(7, 9)).as_deref(), Some("/proc/7/task/9"));
+        assert_eq!(path_of(Node::Stat(7)), None);
+    }
+
+    #[test]
+    fn stat_line_is_do_task_stats() {
+        let info = StatInfo {
+            pid: 12,
+            comm: b"a) (b".to_vec(),
+            state: b'S',
+            ppid: 1,
+            pgid: 12,
+            sid: 5,
+            tty_nr: 34816,
+            tpgid: 12,
+            num_threads: 2,
+            start_time: 345,
+            vsize: 8192,
+            rss: 2,
+            start_stack: 0x7ff0,
+            start_brk: 0x5000,
+            pending: 1 << 31 | 1 << 9,
+            blocked: 2,
+            ignored: 4,
+            caught: 8,
+            wchan: 0,
+            exit_signal: 17,
+            exit_code: 0,
+        };
+        let line = String::from_utf8(stat_line(&info)).unwrap();
+        assert_eq!(
+            line,
+            "12 (a) (b) S 1 12 5 34816 12 0 0 0 0 0 0 0 0 0 20 0 2 0 345 8192 2 18446744073709551615 0 0 32752 0 0 512 2 4 8 0 0 0 17 0 0 0 0 0 0 0 0 20480 0 0 0 0 0\n"
+        );
+        assert_eq!(line.split(' ').count(), 53); // 52 fields, the name in two
     }
 
     #[test]

@@ -412,6 +412,24 @@ fn with_job<R>(tty: &Ctty, f: impl FnOnce(&mut Option<Job>) -> R) -> Option<R> {
     }
 }
 
+/// `/proc/<pid>/stat`'s terminal fields (`do_task_stat`): the controlling
+/// terminal's device number as `new_encode_dev` packs it, and its
+/// foreground group (0 if it has none); 0 and -1 without a terminal.
+pub fn stat_fields(ctty: Option<&Ctty>) -> (u32, i64) {
+    let Some(tty) = ctty.filter(|t| t.alive()) else {
+        return (0, -1);
+    };
+    let (major, minor) = match tty {
+        Ctty::Console => keel_core::vfs::Device::Console.number(),
+        Ctty::Pty(w) => w.upgrade().map_or((0, 0), |line| {
+            keel_core::vfs::Device::Pts(line.index).number()
+        }),
+    };
+    let nr = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+    let pgrp = with_job(tty, |j| j.as_ref().map(|j| j.pgrp)).flatten();
+    (nr, pgrp.map_or(0, i64::from))
+}
+
 /// `tty`'s session: its compartment, session and foreground group, if it
 /// has one (and the compartment is still there).
 fn job_of(tty: &Ctty) -> Option<(Arc<Compartment>, u32, u32)> {

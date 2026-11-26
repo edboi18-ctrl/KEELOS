@@ -46,6 +46,9 @@ pub struct OpenFile {
     /// The terminal end, for a terminal (`/dev/console`, `/dev/ptmx`,
     /// `/dev/pts/N`; ADR 0029).
     pub tty: Option<Arc<crate::tty::TtyOpen>>,
+    /// For a procfs directory opened to be listed (ADR 0037): which one.
+    /// Its `node` is then a detached placeholder.
+    pub proc: Option<keel_core::procfs::Node>,
 }
 
 /// The thread a `comm` file renames.
@@ -178,6 +181,21 @@ pub struct Process {
     /// A vfork child's `vfork_done` (ADR 0034): set, and the parent woken,
     /// when it execs or exits.
     pub vfork_done: Option<Arc<core::sync::atomic::AtomicBool>>,
+    /// Its argv as its program was started with, each string with its
+    /// NUL, as `/proc/<pid>/cmdline` reads (ADR 0037). Linux reads the
+    /// process's own memory there, so a program that rewrites its argv
+    /// changes it; Keel keeps what exec gave. fork copies it.
+    pub cmdline: Vec<u8>,
+    /// When it was made (fork or spawn), in nanoseconds since boot
+    /// (`start_boottime`).
+    pub started: u64,
+    /// The initial stack pointer exec gave it (`mm->start_stack`).
+    pub start_stack: u64,
+    /// The first thread's name once that thread has exited, for a zombie's
+    /// stat.
+    pub exit_comm: Vec<u8>,
+    /// A zombie's wait status (`exit_code`).
+    pub exit_status: Option<i32>,
 }
 
 /// Woken when a vfork child execs or exits (`complete_vfork_done`).
@@ -326,6 +344,7 @@ fn console_handles(handles: &mut HandleTable<Object>) -> Result<(), Errno> {
             // or write as the descriptor is.
             status: crate::abi::O_LARGEFILE | if write { crate::abi::O_WRONLY } else { 0 },
             comm: None,
+            proc: None,
             tty: Some(Arc::new(crate::tty::TtyOpen {
                 line: crate::tty::Line::Console,
             })),
@@ -394,6 +413,11 @@ pub fn spawn_in(
         stop_report: None,
         continue_report: false,
         vfork_done: None,
+        cmdline: loaded.cmdline.clone(),
+        started: keel_hal::time::monotonic_nanos(),
+        start_stack: loaded.rsp,
+        exit_comm: Vec::new(),
+        exit_status: None,
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.
@@ -476,6 +500,7 @@ fn fork_with(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame, mode: Vfork) -> Resu
         exe,
         comm,
         (pgid, sid, ctty),
+        (cmdline, start_stack),
     ) = {
         let process = p.lock();
         (
@@ -500,6 +525,7 @@ fn fork_with(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame, mode: Vfork) -> Resu
             // copy_process: the group, session and controlling terminal
             // are inherited; a child is never a session leader.
             (process.pgid, process.sid, process.ctty.clone()),
+            (process.cmdline.clone(), process.start_stack),
         )
     };
     let member = compartment.admit()?;
@@ -542,6 +568,11 @@ fn fork_with(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame, mode: Vfork) -> Resu
         stop_report: None,
         continue_report: false,
         vfork_done: done.clone(),
+        cmdline,
+        started: keel_hal::time::monotonic_nanos(),
+        start_stack,
+        exit_comm: Vec::new(),
+        exit_status: None,
     }));
     let mut registers = *frame;
     registers.rax = 0;
@@ -807,6 +838,11 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
             p.killed_by.get_or_insert(((status - 128) & 0x7f) as i32);
         }
         let info = p.threads.remove(&thread.0);
+        if let Some(info) = &info
+            && info.tid == p.pid()
+        {
+            p.exit_comm = info.comm.clone();
+        }
         let others: Vec<u64> = p.threads.keys().copied().collect();
         (info, others, p.space.clone())
     };
@@ -860,6 +896,7 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
         Some(signal) => signal & 0x7f,
         None => ((code & 0xff) << 8) as i32,
     };
+    process.lock().exit_status = Some(wait_status);
     if let Some(parent) = parent {
         // do_notify_parent: SIGCHLD (CLD_KILLED with the signal, or
         // CLD_EXITED with the code) unless the parent ignores it; a parent

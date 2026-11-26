@@ -1,6 +1,6 @@
 # BusyBox 1.37.0 tests that must pass on Keel (ADR 0034): every PASS
 # of the Linux reference run (linux-results.txt) except those listed
-# below, each with what Keel lacks. busybox.testsuite fails if one of
+# below, each with the reason. busybox.testsuite fails if one of
 # these does not pass, and reports tests that pass but are not here.
 #
 # Excluded by the spec, permanently: mdev runs in a chroot and makes
@@ -20,9 +20,6 @@
 #   mdev regexp substring match + replace
 #   mdev stops on first rule
 #   move rule does not delete node with name == device_name
-# Not yet on Keel: the PID directories in /proc, which pidof lists (procfs is the traced subset, ADR 0024):
-#   pidof (exit with success)
-#   pidof this
 #
 PASS: busybox as unknown name
 PASS: busybox --help busybox
@@ -548,6 +545,8 @@ PASS: paste-multi-stdin
 PASS: paste-pairs
 PASS: paste-separate
 PASS: pidof (exit with error)
+PASS: pidof (exit with success)
+PASS: pidof this
 PASS: pidof -o init
 PASS: printf produces no further output 1
 PASS: printf produces no further output 2

@@ -86,7 +86,7 @@ The rules are Linux v6.12's:
     epoll on an O_RDWR end becoming ready when another descriptor
     writes; an unlinked FIFO still working.
 - **`busybox.testsuite`:** the three diff tests with FIFOs now pass and
-  are in `keel-expected.txt` (894 tests).
+  are in `keel-expected.txt` (894 tests then).
 - **Mutations** on Keel, 12, all caught (the fifoprobe check that failed
   in brackets):
   - **Opens:** a blocking reader not waiting (9), or a writer (9); a

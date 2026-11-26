@@ -880,6 +880,8 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
         let old = process.space.replace(loaded.space.clone());
         process.brk_start = loaded.brk_start;
         process.brk = loaded.brk_start;
+        process.cmdline = loaded.cmdline.clone();
+        process.start_stack = loaded.rsp;
         if let Some(t) = process.threads.get_mut(&sched::current().0) {
             t.clear_child_tid = 0;
             // begin_new_exec: the thread is named after the file, as
@@ -1246,6 +1248,12 @@ fn close(p: &Arc<IrqMutex<Process>>, fd: i32) -> SysResult {
 
 fn fstat(p: &Arc<IrqMutex<Process>>, fd: i32, buf: u64) -> SysResult {
     let node = match object(p, fd, Rights::STAT)? {
+        Object::File(file) if file.lock().proc.is_some() => {
+            let node = file.lock().proc.ok_or(Errno::EBADF)?;
+            let b = crate::abi::stat_bytes_on(&crate::procfs::stat(node), crate::abi::PROCFS_DEV);
+            copy_to_user(buf, &b).map_err(fault)?;
+            return Ok(0);
+        }
         Object::File(file) => file.lock().node,
         other => {
             let b = crate::ready::stat_bytes(&other).ok_or(Errno::EINVAL)?;
@@ -1263,6 +1271,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         return Err(Errno::EINVAL);
     }
     let path = user_path(path)?;
+    let path = crate::fscalls::in_proc_dir(p, dirfd, &path).unwrap_or(path);
     if let Some(hit) = crate::procfs::open(p, &path, flags) {
         return open_proc(p, hit?, flags);
     }
@@ -1369,6 +1378,7 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
         status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
         comm: None,
         tty: None,
+        proc: None,
     };
     let mut open = open;
     // A terminal: its end (a new pty pair for /dev/ptmx). On failure the
@@ -1386,13 +1396,20 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
 }
 
 /// openat of a `/proc` path (ADR 0024): a procfs file as a snapshot in a
-/// detached, pinned tmpfs node; a followed `exe` link as the program
-/// itself, read only (a running program is not opened for writing:
-/// ETXTBSY, as Linux's `deny_write_access`).
+/// detached, pinned tmpfs node; a directory to be listed, with an empty
+/// detached node in its place (ADR 0037); a followed `exe` link as the
+/// program itself, read only (a running program is not opened for
+/// writing: ETXTBSY, as Linux's `deny_write_access`).
 fn open_proc(p: &Arc<IrqMutex<Process>>, hit: crate::procfs::Hit, flags: u64) -> SysResult {
     let access = flags & O_ACCMODE;
     let (read, write) = (access != O_WRONLY, access != O_RDONLY);
+    let mut dir = None;
     let (node, comm) = match hit {
+        crate::procfs::Hit::Node(node) if node.kind() == keel_core::procfs::Kind::Directory => {
+            dir = Some(node);
+            let perms = node.permissions();
+            (fs::with(|fs| fs.create_detached(Vec::new(), perms))?, None)
+        }
         crate::procfs::Hit::Node(node) => {
             let (data, comm) = crate::procfs::contents(p, node)?;
             let perms = node.permissions();
@@ -1409,18 +1426,24 @@ fn open_proc(p: &Arc<IrqMutex<Process>>, hit: crate::procfs::Hit, flags: u64) ->
             (ino, None)
         }
     };
+    let kind = if dir.is_some() {
+        Kind::Directory
+    } else {
+        Kind::File
+    };
     let open = OpenFile {
         node,
-        kind: Kind::File,
+        kind,
         offset: 0,
         append: false,
         status: (flags | O_LARGEFILE) & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC),
         comm,
         tty: None,
+        proc: dir,
     };
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),
-        rights: file_rights(read, write, Kind::File),
+        rights: file_rights(read, write, kind),
         close_on_exec: flags & O_CLOEXEC != 0,
     };
     let fd = p.lock().handles.insert(handle)?;
@@ -1720,6 +1743,7 @@ fn open_pty_peer(
         status: (flags & (O_ACCMODE | O_NONBLOCK)) | O_LARGEFILE,
         comm: None,
         tty: Some(slave),
+        proc: None,
     };
     let handle = Handle {
         object: Object::File(Arc::new(IrqMutex::new(open))),

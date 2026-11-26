@@ -103,10 +103,11 @@ sysfs (`/sys/devices/system/cpu/...`), which P3-T9 does not cover.
 
 ## Not yet covered
 
-- **Opening a procfs directory** is EACCES, so procfs cannot be listed or
-  be a working directory. Nor can a relative path reach procfs.
+- **A procfs working directory.** Listing procfs directories and
+  lookups relative to their descriptors came with ADR 0037.
 - **The other procfs files:** `/proc/self/fd/`, `maps`, `status`,
-  `stat`, `meminfo` and the rest. None is in the traces.
+  `meminfo` and the rest. None is in the traces. `stat` and `cmdline`
+  came with ADR 0037.
 - **`/proc/cpuinfo` omits** what Linux derives rather than reads:
   - `microcode` (an MSR);
   - `cache size`;
