@@ -2012,7 +2012,15 @@ fn kill(p: &Arc<IrqMutex<Process>>, pid: i32, signal: i32) -> SysResult {
         }
         _ => {}
     }
-    let target = process::find_in(&compartment, pid as u32).ok_or(Errno::ESRCH)?;
+    let Some(target) = process::find_in(&compartment, pid as u32) else {
+        // A zombie keeps its PID until it is reaped (`kill_pid_info_type`
+        // finds it; its `sighand` goes only in `release_task`): the
+        // signal is accepted and goes nowhere.
+        if process::zombies(&compartment, |z| z.pid() == pid as u32).is_empty() {
+            return Err(Errno::ESRCH);
+        }
+        return Ok(0);
+    };
     if signal != 0 {
         crate::signal::send_to_process(&target, info);
     }
@@ -2032,7 +2040,13 @@ fn tgkill(p: &Arc<IrqMutex<Process>>, tgid: Option<i32>, tid: i32, signal: i32) 
         let process = p.lock();
         (process.member.compartment().clone(), process.pid())
     };
-    let (target, thread) = process::find_thread(&compartment, tid as u32).ok_or(Errno::ESRCH)?;
+    let Some((target, thread)) = process::find_thread(&compartment, tid as u32) else {
+        // A zombie's first thread keeps its TID until the zombie is
+        // reaped, as for kill(2).
+        let zombie = tgid.is_none_or(|g| g == tid)
+            && !process::zombies(&compartment, |z| z.pid() == tid as u32).is_empty();
+        return if zombie { Ok(0) } else { Err(Errno::ESRCH) };
+    };
     if tgid.is_some_and(|g| target.lock().pid() != g as u32) {
         return Err(Errno::ESRCH);
     }

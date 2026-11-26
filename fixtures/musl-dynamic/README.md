@@ -27,8 +27,9 @@ the same as `fixtures/musl-hello`. The build writes these files to `out/`:
   `musl-1.2.6-r3`;
 - `greet` and `libkeelgreet.so`, with `greet.sha256` and
   `libkeelgreet.sha256`;
-- `threads`, `signals` and `acceptance2`, with `threads.sha256`,
-  `signals.sha256` and `acceptance2.sha256`.
+- `threads`, `signals`, `acceptance2` and `stress`, with
+  `threads.sha256`, `signals.sha256`, `acceptance2.sha256` and
+  `stress.sha256`.
 
 ## Reference build
 
@@ -70,6 +71,12 @@ file if its hash differs.
   Every other output was byte-for-byte the same as before. Alpine had
   updated one toolchain dependency, zstd-libs 1.5.7-r2 to 1.6.0-r1, and
   `packages.txt` now records that build.
+- `stress` (Phase 3 acceptance item 4, the fork, thread and signal
+  stress test; see `stress.c` and ADR 0038): a static musl build (static
+  PIE), so it needs no dynamic linker in the compartment it runs in.
+  SHA-256 `c60e37f01f0acb1e99c234d9643fdf8ec1d8dc0f3c79932977241dd612d75083`,
+  built twice with `--no-cache`, giving the same hash; no other output
+  changed.
 
 Under Linux, `cargo xtask test` runs each program as
 `ld-musl-x86_64.so.1 program`, since musl's dynamic linker can be run as

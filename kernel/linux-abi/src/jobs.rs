@@ -169,12 +169,15 @@ pub fn kill_group(compartment: &Arc<Compartment>, pgid: u32, info: SigInfo) -> R
 
 /// kill(2) with PID -1 (`kill_something_info`): every process of the
 /// caller's compartment but its PID 1 and the caller. ESRCH if there is
-/// none.
+/// none; zombies count, as `for_each_process` still finds them until
+/// they are reaped, and the signal goes nowhere for them.
 pub fn kill_all(p: &ProcessRef, info: SigInfo) -> Result<(), Errno> {
     let compartment = compartment_of(p);
     let me = p.lock().pid();
     let targets = process::members(&compartment, |q| q.pid() > 1 && q.pid() != me);
-    if targets.is_empty() {
+    if targets.is_empty()
+        && process::zombies(&compartment, |q| q.pid() > 1 && q.pid() != me).is_empty()
+    {
         return Err(Errno::ESRCH);
     }
     if info.signo != 0 {

@@ -197,7 +197,19 @@ Phase 3 acceptance progress (the task rows above stop at P3-S4; ADRs
 - Item 3 (static BusyBox `sh` on the serial console): `console.busybox`
   (ADR 0034). BusyBox's own suite passes the 896 tests
   `fixtures/busybox/keel-expected.txt` lists (`busybox.testsuite`).
-- Items 1 and 4: not yet.
+- Item 4 (one hour of randomized fork, thread and signal stress, no
+  panic, the frame count back to baseline): `cargo xtask stress
+  --minutes 60 --seed 20261126` passed (ADR 0038). After a 20-second
+  warm-up, the hour forked and reaped 89,360 children, with 19,816 stops,
+  46,572 signals and 29,926 thread pairs. Every frame outside the kernel
+  heap came back, and the heap's live bytes ended where they started
+  (3,218,777 to 3,235,513, no growth over the hour). Free frames ended
+  12 below the baseline: heap pages kept from its peak, holding nothing.
+  On the way it found and fixed a kernel heap leak (192 bytes per fork
+  and clone, 61 MiB an hour) and two windows in which kill(2) of an
+  ending child was ESRCH. `stress.short` runs 20 seconds of it in every
+  phase 3 boot.
+- Item 1: not yet.
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 

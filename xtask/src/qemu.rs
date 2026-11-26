@@ -687,6 +687,49 @@ pub fn fuzz(minutes: u64, seed: u64, options: &RunOptions) -> Result<()> {
     }
 }
 
+/// `cargo xtask stress`: boots the fork, thread and signal stress test
+/// (Phase 3 acceptance item 4) for `minutes`, from `seed`. Passes when
+/// the kernel reports the session passed (no failed check, every frame
+/// outside the kernel heap back) and QEMU exited cleanly with no panic.
+/// The full serial log goes to `target/test-logs/stress.log`.
+pub fn stress(minutes: u64, seed: u64, options: &RunOptions) -> Result<()> {
+    println!("xtask: ---- fork, thread and signal stress: {minutes} min, seed {seed} ----");
+    let esp = build::build(BootMode::Stress { minutes, seed })?;
+    // The program may run 10 minutes past its time before the kernel
+    // calls it hung (STRESS_GRACE_S); boot takes well under five.
+    let timeout = Duration::from_secs(minutes * 60 + 600 + 300);
+    let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |_| false)?;
+    let mut text = capture.lines.join("\n");
+    text.push('\n');
+    let log = util::workspace_root()
+        .join("target")
+        .join("test-logs")
+        .join("stress.log");
+    util::write(&log, text.as_bytes())?;
+    let result = if capture.timed_out {
+        Err(format!("timed out after {} s", timeout.as_secs()))
+    } else {
+        verdict(None, &capture.results, &capture.lines, capture.exit_code)
+    };
+    match result {
+        Ok(()) => {
+            for line in capture
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("TEST ") || l.starts_with("stress: "))
+            {
+                println!("  {line}");
+            }
+            println!("xtask: stress PASSED (log: {})", log.display());
+            Ok(())
+        }
+        Err(reason) => {
+            print_tail(&capture.lines);
+            Err(format!("stress FAILED: {reason} (log: {})", log.display()).into())
+        }
+    }
+}
+
 /// Text Limine prints when a file does not match its pinned hash
 /// (Limine 12.9.6, `common/lib/uri.c`, `uri_hash_mismatch`).
 const LIMINE_HASH_PANIC: &str = "does not match";

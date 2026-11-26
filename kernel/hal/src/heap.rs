@@ -173,6 +173,16 @@ pub fn allocations() -> u64 {
     ALLOCATIONS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Bytes the global allocator has handed out and not had back (the sizes
+/// asked for, not the blocks used), for finding leaks: a count that
+/// climbs while the work it measures does not is memory kept by mistake.
+static LIVE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bytes allocated from the kernel heap and not yet freed.
+pub fn live_bytes() -> u64 {
+    LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // SAFETY: `allocate` returns null or memory valid for `layout` that no
 // other allocation overlaps (blocks come off one free list at a time and
 // pages are fresh); `deallocate` only accepts what `allocate` returned
@@ -180,10 +190,15 @@ pub fn allocations() -> u64 {
 unsafe impl<P: PageSource + Send> GlobalAlloc for LockedHeap<P> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        self.0.lock().allocate(layout)
+        let block = self.0.lock().allocate(layout);
+        if !block.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as u64, core::sync::atomic::Ordering::Relaxed);
+        }
+        block
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size() as u64, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: forwarded from GlobalAlloc's contract on the caller.
         unsafe { self.0.lock().deallocate(ptr, layout) }
     }

@@ -20,6 +20,9 @@ pub enum BootMode {
     /// Run the system-call fuzzer for `minutes` from `seed` (with the
     /// phase 1 test programs in the initramfs), then exit QEMU.
     Fuzz { minutes: u64, seed: u64 },
+    /// Run the fork, thread and signal stress program for `minutes` from
+    /// `seed` (Phase 3 acceptance item 4), then exit QEMU.
+    Stress { minutes: u64, seed: u64 },
 }
 
 /// The files of a finished build, in the order they sit on the boot volume.
@@ -513,6 +516,16 @@ pub const TEST_FIXTURES: &[TestFixture] = &[
         ),
         host_via: Some("lib/ld-musl-x86_64.so.1"),
     },
+    // Phase 3 acceptance item 4: the fork, thread and signal stress
+    // program, static so that it runs in a compartment with an empty tree.
+    // Under Linux it runs for its default 5 seconds.
+    TestFixture {
+        path: "test/musl-stress",
+        file: "fixtures/musl-dynamic/stress",
+        hash_file: "fixtures/musl-dynamic/stress.sha256",
+        stdout: Some("stress: passed\n"),
+        host_via: None,
+    },
     TestFixture {
         path: "lib/libkeelgreet.so",
         file: "fixtures/musl-dynamic/libkeelgreet.so",
@@ -774,6 +787,9 @@ pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
         BootMode::Fuzz { minutes, seed } => {
             conf.push_str(&format!("    cmdline: test=1 fuzz={minutes} seed={seed}\n"))
         }
+        BootMode::Stress { minutes, seed } => conf.push_str(&format!(
+            "    cmdline: test=3 stress={minutes} seed={seed}\n"
+        )),
         BootMode::Test(phase, Some(scenario)) => {
             conf.push_str(&format!("    cmdline: test={phase} scenario={scenario}\n"))
         }
@@ -828,7 +844,7 @@ pub fn build_tree(mode: BootMode) -> Result<BootTree> {
     for ((path, _), binary) in SYSTEM_PROGRAMS.iter().zip(build_system_programs(&root)?) {
         archive.add_file(path, util::read(&binary)?);
     }
-    if let BootMode::Test(..) | BootMode::Fuzz { .. } = mode {
+    if let BootMode::Test(..) | BootMode::Fuzz { .. } | BootMode::Stress { .. } = mode {
         for (program, binary) in TEST_PROGRAMS.iter().zip(build_user_tests(&root)?) {
             archive.add_file(program.path, util::read(&binary)?);
         }

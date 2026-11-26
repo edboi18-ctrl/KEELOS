@@ -291,7 +291,16 @@ fn user_thread_start() {
     };
     match entry {
         Some(UserEntry::Start(rip, rsp, argument)) => entry::enter_user(rip, rsp, argument),
-        Some(UserEntry::Frame(frame)) => entry::enter_user_frame(*frame),
+        Some(UserEntry::Frame(boxed)) => {
+            // `enter_user_frame` never returns, so nothing in this arm is
+            // ever dropped: moving the frame out with `*boxed` would leave
+            // the box's 192 bytes allocated for good, one leak per fork and
+            // clone (found by the stress test, ADR 0038). Copy it out and
+            // free the box first.
+            let frame = *boxed;
+            drop(boxed);
+            entry::enter_user_frame(frame)
+        }
         None => exit_with(-1),
     }
 }

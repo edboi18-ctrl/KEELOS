@@ -108,6 +108,7 @@ extern "C" fn kmain() -> ! {
             let cmdline = boot::cmdline();
             if selftest::requested_phase(cmdline).is_some()
                 || selftest::requested_fuzz(cmdline).is_some()
+                || selftest::requested_stress(cmdline).is_some()
             {
                 let [heap, mmio, stacks] = paging::region_bases();
                 kresult!("boot: regions heap {heap:#018x} mmio {mmio:#018x} stacks {stacks:#018x}");
@@ -221,6 +222,15 @@ extern "C" fn kmain_on_boot_stack() -> ! {
             ExitCode::Failure
         });
     }
+    if let Some((minutes, seed)) = selftest::requested_stress(boot::cmdline()) {
+        TEST_MODE.store(true, Ordering::Relaxed);
+        let passed = selftest::run_stress(minutes, seed);
+        exit_qemu(if passed {
+            ExitCode::Success
+        } else {
+            ExitCode::Failure
+        });
+    }
     let test_phase = selftest::requested_phase(boot::cmdline());
     if let Some(phase) = test_phase {
         TEST_MODE.store(true, Ordering::Relaxed);
@@ -292,7 +302,10 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
     // which is trusted only as far as the boot chain is (audit finding 2);
     // whoever can edit it can also replace the kernel.
     let cmdline = boot::cmdline();
-    if selftest::requested_phase(cmdline).is_some() || selftest::requested_fuzz(cmdline).is_some() {
+    if selftest::requested_phase(cmdline).is_some()
+        || selftest::requested_fuzz(cmdline).is_some()
+        || selftest::requested_stress(cmdline).is_some()
+    {
         match boot::hhdm_offset() {
             Some(offset) => kresult!("boot: HHDM offset {offset:#018x}"),
             None => kprintln!("boot: no HHDM response"),

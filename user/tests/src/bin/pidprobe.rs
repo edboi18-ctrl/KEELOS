@@ -20,6 +20,7 @@ use keel_rt::Startup;
 use keel_rt::sys::{self, AT_FDCWD};
 
 const ENOENT: i64 = -2;
+const ESRCH: i64 = -3;
 const ENOTDIR: i64 = -20;
 const EISDIR: i64 = -21;
 const EINVAL: i64 = -22;
@@ -589,7 +590,9 @@ fn child_files(me: &mut Buf<512>, held: &Held, own_cmdline: &[u8]) -> i32 {
         return 10;
     }
     // 11. Exited and not yet reaped, it is Z, and its cmdline is empty;
-    //     reaped, it is gone from /proc.
+    //     kill and tgkill still find it (it keeps its PID until reaped:
+    //     `kill_pid_info_type`) and accept a signal, which goes nowhere.
+    //     Reaped, it is gone from /proc, and kill and tgkill are ESRCH.
     sys::close(held.release);
     if !state_becomes(held.pid, b'Z') {
         return 11;
@@ -598,10 +601,21 @@ fn child_files(me: &mut Buf<512>, held: &Held, own_cmdline: &[u8]) -> i32 {
     if read_file(&mut proc_path(held.pid, b"/cmdline"), &mut got).is_err() || got.len != 0 {
         return 11;
     }
+    let zombie = held.pid as i32;
+    if sys::kill(zombie, 0) != 0
+        || sys::kill(zombie, SIGCONT) != 0
+        || sys::tgkill(zombie, zombie, 0) != 0
+        || sys::tgkill(zombie, zombie, SIGCONT) != 0
+    {
+        return 11;
+    }
     if sys::wait4(held.pid as i32, &mut status, 0) != held.pid || status != 0 {
         return 11;
     }
-    if sys::open(proc_path(held.pid, b"/stat").c(), sys::O_RDONLY, 0) != ENOENT {
+    if sys::open(proc_path(held.pid, b"/stat").c(), sys::O_RDONLY, 0) != ENOENT
+        || sys::kill(zombie, 0) != ESRCH
+        || sys::tgkill(zombie, zombie, 0) != ESRCH
+    {
         return 11;
     }
     let fd = open_dir(&mut lit(b"/proc"));

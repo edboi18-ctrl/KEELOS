@@ -398,6 +398,16 @@ pub fn kill(pid: i32, signal: i32) -> i64 {
     call3(nr::KILL, pid as u32 as u64, signal as u32 as u64, 0)
 }
 
+/// tgkill(2) (234).
+pub fn tgkill(tgid: i32, tid: i32, signal: i32) -> i64 {
+    call3(
+        234,
+        tgid as u32 as u64,
+        tid as u32 as u64,
+        signal as u32 as u64,
+    )
+}
+
 /// gettid(2).
 pub fn gettid() -> i64 {
     call3(nr::GETTID, 0, 0, 0)

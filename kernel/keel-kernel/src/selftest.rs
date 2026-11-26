@@ -44,6 +44,19 @@ pub fn requested_fuzz(cmdline: &str) -> Option<(u64, u64)> {
     Some((value("fuzz=")?, value("seed=").unwrap_or(0)))
 }
 
+/// `stress=<minutes> seed=<n>` on the command line: a fork, thread and
+/// signal stress session instead of the phase tests (`cargo xtask
+/// stress`, Phase 3 acceptance item 4).
+pub fn requested_stress(cmdline: &str) -> Option<(u64, u64)> {
+    let value = |key: &str| {
+        cmdline
+            .split_ascii_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    Some((value("stress=")?, value("seed=").unwrap_or(0)))
+}
+
 /// Scenarios: boots that test one behaviour which ends the kernel, such as
 /// a double fault. Selected with `scenario=<name>` next to `test=<n>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1935,6 +1948,7 @@ fn phase3(t: &mut Runner) {
     phase3_threads(t);
     phase3_signals(t);
     phase3_acceptance2(t);
+    phase3_stress_short(t);
     phase3_shared_mappings(t);
     phase3_filesystem(t);
     phase3_descriptors(t);
@@ -2052,6 +2066,162 @@ fn phase3_acceptance2(t: &mut Runner) {
             "  acceptance2: {status:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}; nodes {nodes_before} -> {nodes_after}"
         );
     }
+}
+
+/// The stress program (fixtures/musl-dynamic/stress, a static musl
+/// build).
+const STRESS: &[u8] = b"/test/musl-stress";
+/// How many more bytes the kernel heap may hold live after a stress
+/// session than before it, once the kernel is warm: tables that fill once
+/// and then stay (the scheduler's last 1024 exit statuses, audit 2, A7.2;
+/// the capacity of its queues) can still move by a few KiB. From a cold
+/// boot they grow by about 150 KiB, so the long session runs a warm-up
+/// first. A leak of one small object per process or thread is far more:
+/// the 192 bytes of each new thread's first register frame, kept for
+/// good before ADR 0038, came to over 300 KiB in 20 seconds.
+const STRESS_HEAP_SLACK: u64 = 64 * 1024;
+
+/// How long a stress session may run past its own time before it counts
+/// as hung: its last steps (killing and reaping up to 16 children) take
+/// well under a second on Linux, and much longer under TCG.
+const STRESS_GRACE_S: u64 = 600;
+
+/// One run of the stress program for `seconds` from `seed`, in a
+/// compartment of its own (128 processes and threads, 256 MiB), whose
+/// directory is `/stress-<seed>`. Every minute (if `verbose`) it logs the
+/// free frames, the kernel heap's pages and live bytes, and the
+/// compartment's processes and memory. Passes if the program exits 0
+/// within its time and STRESS_GRACE_S, and afterwards every process,
+/// frame outside the kernel heap and compartment slot and frame is back,
+/// and the kernel heap holds no more than STRESS_HEAP_SLACK more live
+/// bytes than before. (The heap keeps the pages it grew into for its
+/// small blocks, so the free frame count itself ends as much lower as the
+/// heap's peak was higher; the live bytes show whether anything inside
+/// it was kept.)
+fn stress_session(seed: u64, seconds: u64, verbose: bool, check_heap: bool) -> bool {
+    use alloc::format;
+    use keel_core::compartment::Limits;
+    use keel_linux_abi::{compartment, fs, process};
+    let dir = format!("stress-{seed}");
+    let made = fs::with(|f| f.create_dir(keel_core::vfs::ROOT, dir.as_bytes(), 0o755));
+    let limits = Limits {
+        processes: 128,
+        memory_frames: 65_536,
+        ..Limits::UNLIMITED
+    };
+    let path = format!("/{dir}");
+    let (Ok(_), Ok(comp), Ok(file)) = (
+        made,
+        compartment::create(path.as_bytes(), limits),
+        fs::read_file(STRESS),
+    ) else {
+        kprintln!("stress: could not set up the compartment or read the program");
+        return false;
+    };
+    let outside_heap = frames_outside_heap;
+    let (frames, processes) = (outside_heap(), process::count());
+    let live = keel_hal::heap::live_bytes();
+    let seed_text = format!("{seed}");
+    let seconds_text = format!("{seconds}");
+    let args: [&[u8]; 3] = [STRESS, seed_text.as_bytes(), seconds_text.as_bytes()];
+    let spawned = keel_linux_abi::exec::load_in(comp.root(), &file, STRESS, &args, &[])
+        .ok()
+        .and_then(|loaded| process::spawn_in(&comp, "stress", &loaded).ok());
+    let Some(spawned) = spawned else {
+        kprintln!("stress: could not start the program");
+        return false;
+    };
+    let start = time::monotonic_nanos();
+    let limit = (seconds + STRESS_GRACE_S) * 1_000_000_000;
+    let mut next_report = start + 60_000_000_000;
+    let ended = loop {
+        if sched::join_timeout(spawned.thread, 1000) {
+            break true;
+        }
+        let now = time::monotonic_nanos();
+        if verbose && now >= next_report {
+            next_report = now + 60_000_000_000;
+            kprintln!(
+                "stress: {} min: {} free frames, heap {} pages holding {} live bytes, {} processes and threads in the compartment, {} frames charged to it",
+                (now - start) / 60_000_000_000,
+                memory::free_frames(),
+                keel_hal::heap::mapped_pages(),
+                keel_hal::heap::live_bytes(),
+                comp.processes(),
+                comp.memory().used()
+            );
+        }
+        if now - start > limit {
+            break false;
+        }
+    };
+    if !ended {
+        kprintln!(
+            "stress: seed {seed} did not end within {} s",
+            seconds + STRESS_GRACE_S
+        );
+        return false;
+    }
+    let status = sched::exit_status(spawned.thread);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let live_after = keel_hal::heap::live_bytes();
+    let ok = status == Some((0, None))
+        && frames_after == frames
+        && processes_after == processes
+        && comp.processes() == 0
+        && comp.memory().used() == 0
+        && (!check_heap || live_after <= live + STRESS_HEAP_SLACK);
+    kprintln!(
+        "stress: seed {seed}, {seconds} s: exit {status:?}; frames outside the heap {frames} -> {frames_after}; processes {processes} -> {processes_after}; compartment {} processes, {} frames left; kernel heap live bytes {live} -> {live_after}",
+        comp.processes(),
+        comp.memory().used()
+    );
+    ok
+}
+
+/// Phase 3 acceptance item 4, briefly: 20 seconds of the stress program
+/// (fixtures/musl-dynamic/stress) in every phase 3 boot. `cargo xtask
+/// stress` runs it for an hour.
+fn phase3_stress_short(t: &mut Runner) {
+    let ok = stress_session(20_261_126, 20, false, true);
+    t.check(
+        "stress.short",
+        ok,
+        "20 s of randomized fork, threads and signals (exits, crashes, SIGTERM and SIGKILL, stop and continue, exit_group from a thread, a grandchild, threads signalling each other on alternate stacks), every wait status as planned, in a compartment of its own; every process, frame and compartment slot back",
+    );
+}
+
+/// The stress boot (`cargo xtask stress`): Phase 3 acceptance item 4 is a
+/// 60-minute session that passes.
+pub fn run_stress(minutes: u64, seed: u64) -> bool {
+    let mut runner = Runner {
+        passed: 0,
+        failed: 0,
+    };
+    kprintln!("stress: {minutes} min from seed {seed}");
+    // A warm-up of 20 seconds (from another seed), checked like any
+    // session except for the heap: from a cold boot the kernel's tables
+    // that fill once and then stay grow by about 150 KiB. The session
+    // that counts starts from a warm kernel.
+    let warm = stress_session(seed.wrapping_add(1), 20, false, false);
+    let frames_before = memory::free_frames();
+    let ok = warm && stress_session(seed, minutes * 60, true, true);
+    kprintln!(
+        "stress: free frames {frames_before} -> {} (the kernel heap may keep pages it grew into)",
+        memory::free_frames()
+    );
+    runner.check(
+        "stress.fork_threads_signals",
+        ok,
+        "Phase 3 acceptance item 4: randomized fork, threads and signals for the whole session with no kernel panic, every wait status as planned, and every frame outside the kernel heap, process and compartment slot back",
+    );
+    kresult!(
+        "TEST SUMMARY passed={} failed={}",
+        runner.passed,
+        runner.failed
+    );
+    runner.failed == 0
 }
 
 /// P3-T7, shared file mappings (ADR 0021): user/tests/sharemap, which

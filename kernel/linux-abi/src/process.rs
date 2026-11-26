@@ -758,7 +758,12 @@ pub fn members(
 }
 
 /// The zombies of `compartment` that `pick` chooses: children that have
-/// exited and that their parent has not reaped. Linux keeps a zombie in
+/// exited and that their parent has not reaped. That includes a child
+/// between its last thread's exit and its parent's record of its status:
+/// `on_thread_exit` takes it out of the process table first, and until
+/// the record is made it would otherwise be nowhere. Linux has no such
+/// window (the task stays hashed until `release_task`, so kill(2) finds
+/// it throughout), which the stress test found. Linux keeps a zombie in
 /// its group and session until it is reaped (`release_task` ->
 /// `__exit_signal` -> `__unhash_process` detaches its PIDTYPE_PGID and
 /// PIDTYPE_SID links), so a group whose members have all exited still
@@ -773,7 +778,7 @@ pub fn zombies(
             .lock()
             .children
             .iter()
-            .filter(|c| c.status.is_some())
+            .filter(|c| c.status.is_some() || c.process.lock().threads.is_empty())
             .map(|c| c.process.clone())
             .collect();
         for z in exited {
@@ -828,7 +833,12 @@ pub fn kill_all_threads(target: &Arc<IrqMutex<Process>>, signal: i32) {
 /// code, or the last thread's; or the signal) goes to the parent's
 /// record, if the parent is still there.
 pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFault>) {
-    let Some(process) = PROCESSES.lock().remove(&thread.0) else {
+    // The thread leaves its process before it leaves the process table:
+    // the other way round, a process whose last thread was going was for
+    // a moment in neither, and kill(2) of it was ESRCH (found by the
+    // stress test, ADR 0038). This way it is always in the table, in its
+    // parent's list of zombies (no threads left), or reaped.
+    let Some(process) = PROCESSES.lock().get(&thread.0).cloned() else {
         return;
     };
     crate::futex::forget(thread);
@@ -846,6 +856,7 @@ pub fn on_thread_exit(thread: ThreadId, status: i64, fault: Option<sched::UserFa
         let others: Vec<u64> = p.threads.keys().copied().collect();
         (info, others, p.space.clone())
     };
+    PROCESSES.lock().remove(&thread.0);
     if let (Some(info), Some(space)) = (&info, &space)
         && info.clear_child_tid != 0
         && !others.is_empty()

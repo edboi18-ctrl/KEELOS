@@ -36,6 +36,10 @@ Commands:
                             Boot the in-guest system-call fuzzer for N
                             minutes (default 60); fails on a kernel panic
                             or a hung fuzz process
+  stress [--minutes N] [--seed S] [--kvm] [--accel NAME]
+                            Boot the fork, thread and signal stress test
+                            for N minutes (default 60); fails on a kernel
+                            panic, a failed check or a leaked frame
   fuzz-pe [--minutes N] [--seed S]
                             Fuzz the PE parser on the host for N minutes
                             (default 30); fails on a parser panic
@@ -163,6 +167,26 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
             qemu::fuzz(minutes, seed, &options)
+        }
+        "stress" => {
+            let options = run_options(&mut args)?;
+            let minutes = take_value(&mut args, "--minutes")?
+                .map(|v| v.parse::<u64>().map_err(|_| "--minutes needs a number"))
+                .transpose()?
+                .unwrap_or(60);
+            // Without --seed, one from the clock; it is printed, so the
+            // session can be repeated.
+            let seed = match take_value(&mut args, "--seed")? {
+                Some(v) => v.parse::<u64>().map_err(|_| "--seed needs a number")?,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            };
+            no_extra_args(&args)?;
+            if options.gdb {
+                return Err("--gdb is only for `cargo xtask run`".into());
+            }
+            qemu::stress(minutes, seed, &options)
         }
         "fuzz-pe" => {
             let minutes = take_value(&mut args, "--minutes")?
