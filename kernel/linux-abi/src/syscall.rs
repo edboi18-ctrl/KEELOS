@@ -796,6 +796,12 @@ fn user_strings(array: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
 /// not fit the stack, are E2BIG; a file that is not a regular file is
 /// EACCES; an unusable program ENOEXEC and an unusable interpreter
 /// ELIBBAD. Mode bits grant nothing (SR-6), so no execute bit is checked.
+///
+/// A file starting with `#!` is a script (`load_script`, ADR 0036): its
+/// interpreter runs instead, with argv rewritten, as many as five deep
+/// (`exec_binprm`: ELOOP beyond). The thread is still named after the
+/// file given, and AT_EXECFN is its path; /proc/<pid>/exe is the
+/// interpreter that finally runs.
 fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysResult {
     let path = user_path(path)?;
     let mut budget = crate::exec::ARG_LIMIT;
@@ -812,16 +818,42 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
             process.member.compartment().clone(),
         )
     };
-    let file = fs::with(|fs| {
-        let ino = fs.lookup(root, cwd, &path)?;
-        if fs.kind(ino)? != Kind::File {
-            return Err(Errno::EACCES);
+    // `bprm->filename`: the path as given, for the thread's name and
+    // AT_EXECFN whatever runs in the end.
+    let given = path.clone();
+    let mut path = path;
+    let mut depth = 0;
+    let file = loop {
+        // `exec_binprm`: at most five rewrites by an interpreter.
+        if depth > 5 {
+            return Err(Errno::ELOOP);
         }
-        fs.contents(ino)
-    })?;
+        let file = fs::with(|fs| {
+            let ino = fs.lookup(root, cwd, &path)?;
+            if fs.kind(ino)? != Kind::File {
+                return Err(Errno::EACCES);
+            }
+            fs.contents(ino)
+        })?;
+        let Some(line) = keel_core::script::interpreter(&file) else {
+            break file;
+        };
+        let (name, arg) = line?;
+        // argv[0] goes; the interpreter, its argument and the script's
+        // path (the name this level was opened by) come first.
+        let mut rewritten = alloc::vec![name.to_vec()];
+        rewritten.extend(arg.map(<[u8]>::to_vec));
+        rewritten.push(path.clone());
+        rewritten.extend(args.drain(..).skip(1));
+        let added = name.len() + arg.map_or(0, |a| a.len() + 1 + 8) + path.len() + 2 + 16;
+        budget = budget.checked_sub(added).ok_or(Errno::E2BIG)?;
+        args = rewritten;
+        path = name.to_vec();
+        depth += 1;
+    };
     let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
-    let loaded = crate::exec::load_in(root, &file, &path, &args, &env).map_err(|e| e.errno())?;
+    let loaded = crate::exec::load_in(root, &file, &given, &args, &env).map_err(|e| e.errno())?;
     // /proc/<pid>/exe: the program's path from the root. A relative path
     // is taken from the working directory; symbolic links in it are not
     // resolved, where Linux reports the file's own path (ADR 0024).
@@ -851,8 +883,8 @@ fn execve(p: &Arc<IrqMutex<Process>>, path: u64, argv: u64, envp: u64) -> SysRes
         if let Some(t) = process.threads.get_mut(&sched::current().0) {
             t.clear_child_tid = 0;
             // begin_new_exec: the thread is named after the file, as
-            // given (`kbasename(bprm->filename)`).
-            t.comm = process::comm_of(&path);
+            // given (`kbasename(bprm->filename)`), a script's own name.
+            t.comm = process::comm_of(&given);
         }
         process.exe = exe_path.clone();
         // begin_new_exec clears PF_FORKNOEXEC (setpgid's EACCES).

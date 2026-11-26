@@ -89,10 +89,12 @@ The rules are Linux v6.12's:
 ## Not yet covered
 
 - The 18 tests above, and what they need: chroot, mknod and FIFOs, and
-  /proc's process directories. Also chown, lchown and fchown, which
+  /proc's process directories. FIFOs came with ADR 0035 and `#!`
+  scripts with ADR 0036. The 13 mdev tests are excluded for good:
+  chroot is on the spec's never-implemented list, and device nodes are
+  manifest grants (SR-3). Also chown, lchown and fchown, which
   `cpio` and `tar` call (ENOSYS; no test depends on the result), and
   sysinfo.
-- `#!` in execve (binfmt_script): only shells run scripts today.
 - CLONE_VM without CLONE_VFORK or CLONE_THREAD (a process sharing its
   parent's memory without the wait).
 - IDs other than 0: setuid, setgid and the rest.

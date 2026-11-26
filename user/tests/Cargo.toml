@@ -152,6 +152,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "scriptprobe"
+test = false
+bench = false
+
+[[bin]]
 name = "fifoprobe"
 test = false
 bench = false

@@ -25,6 +25,7 @@ pub mod pipe;
 pub mod poll;
 pub mod procfs;
 pub mod rng;
+pub mod script;
 pub mod signal;
 pub mod tty;
 pub mod unix;

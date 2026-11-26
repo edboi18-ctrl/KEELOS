@@ -3,7 +3,10 @@
 # below, each with what Keel lacks. busybox.testsuite fails if one of
 # these does not pass, and reports tests that pass but are not here.
 #
-# Not yet on Keel: chroot(2), not implemented (mdev runs in a chroot):
+# Excluded by the spec, permanently: mdev runs in a chroot and makes
+# device nodes. chroot(2) is in the Linux-ABI surface policy's
+# never-implemented list (namespace and mount calls), and device nodes
+# are manifest grants (SR-3), so mknod of a device is EPERM (ADR 0035):
 #   mdev #maj,min and no explicit uid
 #   mdev $ENVVAR=regex match
 #   mdev add /block/sda

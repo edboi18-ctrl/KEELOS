@@ -8,7 +8,7 @@ Calls and Errors are from the `strace -f` trace; `-c` calls is the separate `str
 
 | # | System call | Calls | Errors | `-c` calls | Keel status | Test |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `execve` | 29 | 16 | 29 | partial (no `#!` scripts) | `exec.execve` |
+| 1 | `execve` | 29 | 16 | 29 | complete (ELF and `#!` scripts) | `exec.execve`, `exec.scripts` |
 | 2 | `arch_prctl` | 82 | 0 | 79 | partial | `syscalls.conformance` |
 | 3 | `set_tid_address` | 38 | 0 | 38 | partial | `syscalls.conformance` |
 | 4 | `brk` | 53 | 0 | 53 | partial | `syscalls.conformance` |
