@@ -24,6 +24,7 @@ pub mod paging;
 pub mod pipe;
 pub mod poll;
 pub mod procfs;
+pub mod profile;
 pub mod rng;
 pub mod script;
 pub mod signal;

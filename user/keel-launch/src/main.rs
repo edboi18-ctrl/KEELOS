@@ -195,6 +195,7 @@ fn launch(m: &Manifest, stdio: [i32; 3], err: i32) -> i32 {
     let l = m.limits;
     let limits = Limits {
         processes: l.processes,
+        profile: m.profile.id(),
         memory_bytes: l.memory_mb << 20,
         tmpfs_bytes: l.tmpfs_mb << 20,
         tmpfs_nodes: l.tmpfs_nodes,

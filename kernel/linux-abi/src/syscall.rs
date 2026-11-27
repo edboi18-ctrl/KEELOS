@@ -494,9 +494,72 @@ fn may_run_on_reserve(number: u64) -> bool {
     matches!(number, nr::CLOSE | nr::MUNMAP | nr::BRK | nr::GETPID)
 }
 
+/// ADR 0041: whether the caller's compartment's profile allows `number`
+/// with `a`. Only Linux calls are checked: the native calls are reached
+/// only through handles a compartment is never given (ADR 0040), and any
+/// other number is ENOSYS anyway.
+fn permitted(p: &Arc<IrqMutex<Process>>, number: u64, a: &[u64; 6]) -> Result<(), Errno> {
+    use keel_core::profile::Denied;
+    let profile = p.lock().member.compartment().profile();
+    let Err(denied) = profile.check(number, a) else {
+        return Ok(());
+    };
+    let errno = match denied {
+        Denied::Call => Errno::ENOSYS,
+        Denied::Operation => Errno::EINVAL,
+    };
+    let op = match number {
+        nr::CLONE | 157 => Some(a[0]),
+        nr::FCNTL => Some(a[1]),
+        28 => Some(a[2]),
+        _ => None,
+    };
+    note_denied(p, number, op, errno);
+    Err(errno)
+}
+
+/// How many refusals a compartment logs before it only counts them.
+const DENIALS_LOGGED: u64 = 8;
+
+/// Counts a refusal by the caller's compartment's profile and logs the
+/// first few of each compartment (SR-7: "returns an error and is
+/// logged"; rate-limited, as SR-11 asks of the audit log). `op` is the
+/// operation argument of a multiplexer call.
+fn note_denied(p: &Arc<IrqMutex<Process>>, number: u64, op: Option<u64>, errno: Errno) {
+    let (compartment, pid) = {
+        let process = p.lock();
+        (process.member.compartment().clone(), process.pid())
+    };
+    let before = compartment.note_denied();
+    if before < DENIALS_LOGGED {
+        let name = names::name(number).unwrap_or("unknown");
+        let (id, profile) = (compartment.id(), compartment.profile().name);
+        match op {
+            Some(op) => kprintln!(
+                "profile: compartment {id} ({profile}): pid {pid}: {name} ({number}) operation {op:#x} denied -> {errno:?}"
+            ),
+            None => kprintln!(
+                "profile: compartment {id} ({profile}): pid {pid}: {name} ({number}) denied -> {errno:?}"
+            ),
+        }
+    }
+    if before + 1 == DENIALS_LOGGED {
+        kprintln!(
+            "profile: compartment {}: further denials are counted, not logged",
+            compartment.id()
+        );
+    }
+}
+
 fn dispatch(call: &SyscallArgs) -> i64 {
     let a = call.args;
     let number = call.number;
+    if number < TABLE_SIZE
+        && let Some(p) = process::current()
+        && let Err(errno) = permitted(&p, number, &a)
+    {
+        return errno.to_return();
+    }
     let result: SysResult = match number {
         // exit ends the calling thread; exit_group the whole process.
         nr::EXIT => sched::exit_with((a[0] & 0xff) as i64),
@@ -1688,6 +1751,31 @@ fn ioctl(p: &Arc<IrqMutex<Process>>, fd: i32, request: u32, argument: u64) -> Sy
     const FIONREAD: u32 = 0x541B;
     /// SIOCOUTQ (TIOCOUTQ): a socket's bytes sent and not yet read.
     const SIOCOUTQ: u32 = 0x5411;
+    // ADR 0041: the request must be in the profile for this kind of
+    // object; otherwise ENOTTY, what an object answers a request it does
+    // not know.
+    {
+        use keel_core::profile::Class;
+        let class = match &object(p, fd, Rights::STAT)? {
+            Object::File(file) => {
+                let f = file.lock();
+                match f.kind {
+                    _ if f.tty.is_some() => Class::Terminal,
+                    Kind::File if f.proc.is_none() => Class::File,
+                    Kind::Directory if f.proc.is_none() => Class::Directory,
+                    _ => Class::Other,
+                }
+            }
+            Object::Pipe(_) => Class::Pipe,
+            Object::Socket(_) => Class::Socket,
+            _ => Class::Other,
+        };
+        let profile = p.lock().member.compartment().profile();
+        if !profile.allows_ioctl(class, request) {
+            note_denied(p, nr::IOCTL, Some(u64::from(request)), Errno::ENOTTY);
+            return Err(Errno::ENOTTY);
+        }
+    }
     let file = match object(p, fd, Rights::STAT)? {
         Object::File(file) => file,
         // `unix_ioctl`: SIOCINQ (FIONREAD) and SIOCOUTQ; others ENOTTY.

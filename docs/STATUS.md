@@ -226,6 +226,18 @@ runs `keel-launch MANIFEST` to run an application in a compartment of
 its own (`exec.launch`, `launch.manifest`, `launch.service`); the manifest parser is fuzzed on the
 host (`cargo xtask fuzz-manifest`, 30 minutes, no failure).
 
+P3-S3 (allowlist profiles) is done (ADR 0041). Each compartment has a
+profile, fixed with its limits:
+- `default`: the Wine trace's calls, and of `clone`, `fcntl`, `prctl`,
+  `madvise` and `ioctl` (per kind of object) only the traced operations;
+- `full`: every call Keel implements.
+
+Calls outside the profile are ENOSYS, operations EINVAL, ioctl requests
+ENOTTY. Each refusal is counted and the first few logged. The
+never-implemented calls are in no profile (host tests), and the 32-bit
+entry paths fault (`compartment.profiles`). A manifest gets `default`
+unless it asks for `full` (`launch.manifest`).
+
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and

@@ -428,6 +428,93 @@ pub fn clone_refused(flags: u64) -> i64 {
     call6(nr::CLONE, [flags, 0, 0, 0, 0, 0])
 }
 
+/// The never-implemented calls (spec section 7; keel_core::profile::NEVER),
+/// x86-64 numbers from Linux v6.12 `syscall_64.tbl`.
+pub const NEVER_IMPLEMENTED: &[u64] = &[
+    101, 310, 311, 312, 438, 425, 426, 427, 321, 323, 298, 272, 308, 165, 166, 155, 161, 428, 429,
+    430, 431, 432, 433, 442, 175, 313, 176, 246, 320, 169, 167, 172, 173, 250, 248, 249, 304, 303,
+    179, 443, 163, 103, 154,
+];
+
+/// One of [`NEVER_IMPLEMENTED`] with every argument 0, for testing that
+/// it is refused; any other number is not offered (-22 here). Keel only:
+/// on Linux some of these do things.
+pub fn never_implemented(number: u64) -> i64 {
+    if !NEVER_IMPLEMENTED.contains(&number) {
+        return -22;
+    }
+    call6(number, [0; 6])
+}
+
+/// clone(2)'s namespace flags (Linux v6.12 `include/uapi/linux/sched.h`):
+/// NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER, NEWPID, NEWNET.
+pub const CLONE_NEW: u64 =
+    0x0002_0000 | 0x0200_0000 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+
+/// clone(2) with namespace flags only, which Keel refuses before
+/// anything is made. Other flags are not offered (`i64::MIN` here).
+/// Without CLONE_VM the call would otherwise be a fork, so even if it
+/// were accepted the child's copy of this stack would be its own.
+pub fn clone_namespace(flags: u64) -> i64 {
+    if flags == 0 || flags & !CLONE_NEW != 0 {
+        return i64::MIN;
+    }
+    call6(nr::CLONE, [flags, 0, 0, 0, 0, 0])
+}
+
+/// clone(2) with SIGCHLD and no other flag: fork by another name (the
+/// child runs on its own copy of this stack, as after fork). The child's
+/// PID, 0 in the child, or -errno.
+pub fn clone_fork() -> i64 {
+    const SIGCHLD: u64 = 17;
+    call6(nr::CLONE, [SIGCHLD, 0, 0, 0, 0, 0])
+}
+
+/// `int 0x80`, the 32-bit system-call gate, asking for exit_group(0) by
+/// its 32-bit number. Never returns: on Linux with IA32 emulation the
+/// call ends the process with status 0; on Keel the gate is not open to
+/// user mode and the process gets SIGSEGV. Run it in a child.
+pub fn int80() {
+    // Reasoning: EAX holds the 32-bit call number, 252 = exit_group in
+    // Linux v6.12 `arch/x86/entry/syscalls/syscall_32.tbl`, and EBX its
+    // first argument (the status, 0), as the i386 ABI passes them
+    // (`entry_INT80_compat`). On Keel every IDT gate has DPL 0, and INT n
+    // from CPL 3 through a gate with DPL < CPL raises #GP (Intel SDM
+    // Vol. 3 section 7.12.1.1), which Keel turns into SIGSEGV, as Linux's
+    // exc_general_protection does. If the instruction ever returned, ud2
+    // raises #UD (SIGILL), so the caller can tell that apart.
+    // EBX is set inside the block: LLVM reserves RBX, so it cannot be an
+    // operand, and overwriting it is harmless because control never
+    // comes back to compiled code.
+    // SAFETY: no instruction here returns to Rust code: the process ends
+    // in the kernel, by SIGSEGV, or by SIGILL at ud2. No memory is
+    // touched.
+    unsafe {
+        core::arch::asm!(
+            "xor ebx, ebx",
+            "mov eax, 252",
+            "int 0x80",
+            "ud2",
+            options(noreturn, nostack)
+        )
+    }
+}
+
+/// `sysenter`, the other 32-bit entry. Never returns: on Keel it raises
+/// #GP (SIGSEGV) or, on AMD in long mode, #UD (SIGILL). Run it in a
+/// child.
+pub fn sysenter() {
+    // Reasoning: Intel's SDM Vol. 2B "SYSENTER" raises #GP(0) when
+    // IA32_SYSENTER_CS[15:2] is 0, which Keel sets at boot (hal entry.rs);
+    // AMD's APM Vol. 3 makes SYSENTER #UD in long mode. If it ever
+    // returned, ud2 raises #UD too, so only SIGSEGV is unambiguous on
+    // Intel; the caller accepts either signal, and fails if the process
+    // exits instead.
+    // SAFETY: as int80: control never comes back to Rust code, and no
+    // memory is touched.
+    unsafe { core::arch::asm!("sysenter", "ud2", options(noreturn, nostack)) }
+}
+
 /// futex(2) on `word`, a u32 this program owns. `timeout` is a relative
 /// timespec (seconds, nanoseconds) for FUTEX_WAIT.
 pub fn futex(
@@ -1840,11 +1927,18 @@ pub fn recvmsg_full(
 /// The first native call's number.
 pub const NATIVE_BASE: u64 = 0x1000_0000;
 
+/// The default allowlist profile's number (ADR 0041): the Wine trace.
+pub const PROFILE_DEFAULT: u32 = 0;
+/// The full profile's: every call Keel implements.
+pub const PROFILE_FULL: u32 = 1;
+
 /// A compartment's or factory's limits (ADR 0040): `u32::MAX` and
 /// `u64::MAX` are no limit.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub processes: u32,
+    /// The allowlist profile (ADR 0041): 0 the default, 1 full.
+    pub profile: u32,
     pub memory_bytes: u64,
     pub tmpfs_bytes: u64,
     pub tmpfs_nodes: u64,
@@ -1853,6 +1947,7 @@ pub struct Limits {
 impl Limits {
     pub const UNLIMITED: Limits = Limits {
         processes: u32::MAX,
+        profile: PROFILE_FULL,
         memory_bytes: u64::MAX,
         tmpfs_bytes: u64::MAX,
         tmpfs_nodes: u64::MAX,
@@ -1862,6 +1957,7 @@ impl Limits {
     pub fn bytes(&self) -> [u8; 40] {
         let mut b = [0u8; 40];
         b[0..4].copy_from_slice(&self.processes.to_le_bytes());
+        b[4..8].copy_from_slice(&self.profile.to_le_bytes());
         b[8..16].copy_from_slice(&self.memory_bytes.to_le_bytes());
         b[16..24].copy_from_slice(&self.tmpfs_bytes.to_le_bytes());
         b[24..32].copy_from_slice(&self.tmpfs_nodes.to_le_bytes());

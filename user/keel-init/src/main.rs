@@ -105,8 +105,11 @@ impl Shell {
 }
 
 /// The most a compartment keel-launch makes may have (ADR 0040).
+/// Its profile ceiling is the full one: a manifest names its own profile
+/// (the default unless it says otherwise, ADR 0041).
 const LAUNCH_CEILING: sys::Limits = sys::Limits {
     processes: 256,
+    profile: sys::PROFILE_FULL,
     memory_bytes: 1 << 30,
     tmpfs_bytes: 256 << 20,
     tmpfs_nodes: 65536,

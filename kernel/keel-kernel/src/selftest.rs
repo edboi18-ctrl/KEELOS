@@ -1906,6 +1906,7 @@ fn phase3(t: &mut Runner) {
     );
 
     phase3_side_by_side(t);
+    phase3_profiles(t);
 
     // P3-S4: a compartment's process limit. One slot: a second process
     // is refused with EAGAIN while the first lives, and admitted after.
@@ -2105,6 +2106,62 @@ fn phase3_side_by_side(t: &mut Runner) {
     );
     if !ok {
         kprintln!("  sidebyside: first {first:?}; second {second:?}");
+    }
+}
+
+/// P3-S3 (ADR 0041): allowlist profiles. `user/tests/profileprobe` runs
+/// in a compartment with the default profile and in one with the full
+/// profile. In both, the never-implemented calls are ENOSYS, namespace
+/// clone flags EINVAL, sockets other than AF_UNIX EAFNOSUPPORT, and the
+/// 32-bit entry paths end a child with a signal. Under the default
+/// profile, seven calls and operations outside it are refused (with
+/// ENOSYS, EINVAL or ENOTTY) that the full profile allows. Each refusal
+/// by a profile is counted in its compartment: the default compartment
+/// counts exactly those seven more.
+fn phase3_profiles(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{compartment, fs};
+    const PROBE: &[u8] = b"/test/profileprobe";
+    let made = fs::with(|f| {
+        let comp = f.lookup(ROOT, ROOT, b"/comp")?;
+        f.create_dir(comp, b"pd", 0o755)?;
+        f.create_dir(comp, b"pf", 0o755)
+    });
+    let with = |profile| Limits {
+        processes: 8,
+        profile,
+        ..Limits::UNLIMITED
+    };
+    let (Ok(_), Ok(d), Ok(f)) = (
+        made,
+        compartment::create(b"/comp/pd", with(&keel_core::profile::DEFAULT)),
+        compartment::create(b"/comp/pf", with(&keel_core::profile::FULL)),
+    ) else {
+        t.check(
+            "compartment.profiles",
+            false,
+            "creating /comp/pd and /comp/pf",
+        );
+        return;
+    };
+    let default = run_in(&d, PROBE, &[PROBE, b"default"]);
+    let full = run_in(&f, PROBE, &[PROBE, b"full"]);
+    let ok = default == Some((0, None))
+        && full == Some((0, None))
+        && f.denied() > 0
+        && d.denied() == f.denied() + 7;
+    t.check(
+        "compartment.profiles",
+        ok,
+        "the default profile (the Wine trace) refuses calls, fcntl, prctl and clone operations and ioctl requests outside it, which the full profile allows; in both, never-implemented calls are ENOSYS, namespace clone flags EINVAL, non-AF_UNIX sockets EAFNOSUPPORT and int 0x80 and sysenter a signal; every refusal is counted",
+    );
+    if !ok {
+        kprintln!(
+            "  profileprobe: default {default:?}, full {full:?}; denied: default {}, full {}",
+            d.denied(),
+            f.denied()
+        );
     }
 }
 
@@ -3316,13 +3373,19 @@ fn phase3_manifest_launch(t: &mut Runner) {
     const INIT: &[u8] = b"/sbin/keel-init";
     const GOOD: &[u8] = b"# launch.manifest\nname = \"probe\"\nexec = \"/prog\"\nargs = [\"child\", \"manifest\"]\nenv = [\"GREETING=hello\"]\ndevices = [\"null\"]\n\n[root]\nbase = \"/launch-test/app\"\n\n[limits]\nprocesses = 4\nmemory_mb = 64\n";
     const BAD: &[u8] = b"name = \"probe\"\nexec = \"/prog\"\n[root]\nbase = \"/launch-test/app\"\n[network]\nallowed = true\n";
+    // ADR 0041: the same program, asking for the full profile.
+    const FULL: &[u8] = b"name = \"probe\"\nexec = \"/prog\"\nargs = [\"child\", \"manifest-full\"]\nenv = [\"GREETING=hello\"]\ndevices = [\"null\"]\nprofile = \"full\"\n[root]\nbase = \"/launch-test/app\"\n";
     let made = fs::with(|f| {
         let top = f.create_dir(ROOT, b"launch-test", 0o755)?;
         let app = f.create_dir(top, b"app", 0o755)?;
         f.create_dir(app, b"dev", 0o755)?;
         let probe = f.lookup(ROOT, ROOT, b"/test/launchprobe")?;
         f.link(probe, app, b"prog")?;
-        for (name, text) in [(&b"good.toml"[..], GOOD), (b"bad.toml", BAD)] {
+        for (name, text) in [
+            (&b"good.toml"[..], GOOD),
+            (b"bad.toml", BAD),
+            (b"full.toml", FULL),
+        ] {
             let ino = f.create_file(top, name, 0o644)?;
             f.write(ino, 0, text)?;
         }
@@ -3346,6 +3409,7 @@ fn phase3_manifest_launch(t: &mut Runner) {
     let (frames, processes) = (outside_heap(), process::count());
     let good = run(&[INIT, b"--launch", b"/launch-test/good.toml"], true);
     let bad = run(&[INIT, b"--launch", b"/launch-test/bad.toml"], true);
+    let full = run(&[INIT, b"--launch", b"/launch-test/full.toml"], true);
     let unarmed = run(&[b"/sbin/keel-launch", b"/launch-test/good.toml"], false);
     sched::sleep_ms(50);
     let (frames_after, processes_after) = (outside_heap(), process::count());
@@ -3353,17 +3417,18 @@ fn phase3_manifest_launch(t: &mut Runner) {
         && warm == Some((43, None))
         && good == Some((43, None))
         && bad == Some((2, None))
+        && full == Some((43, None))
         && unarmed == Some((2, None))
         && processes_after == processes
         && frames_after == frames;
     t.check(
         "launch.manifest",
         ok,
-        "keel-init --launch runs keel-launch with a restricted factory; it reads the manifest and runs its program as PID 1 of a compartment rooted in its base, with its devices, arguments and environment, and passes its exit code back; a manifest asking for the network is refused before anything is made; without a factory keel-launch can make nothing; every frame and process back",
+        "keel-init --launch runs keel-launch with a restricted factory; it reads the manifest and runs its program as PID 1 of a compartment rooted in its base, with its devices, arguments and environment, and passes its exit code back; the default profile unless the manifest asks for the full one (ADR 0041); a manifest asking for the network is refused before anything is made; without a factory keel-launch can make nothing; every frame and process back",
     );
     if !ok {
         kprintln!(
-            "  launch: made {made:?}; warm {warm:?}, good {good:?}, bad {bad:?}, without a factory {unarmed:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+            "  launch: made {made:?}; warm {warm:?}, good {good:?}, bad {bad:?}, full profile {full:?}, without a factory {unarmed:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }
@@ -3722,6 +3787,7 @@ fn phase3_hostile_executables(t: &mut Runner) {
         memory_frames: 8192,
         tmpfs_bytes: 1 << 20,
         tmpfs_nodes: 64,
+        profile: &keel_core::profile::FULL,
     };
     let (Ok(_), Ok(c)) = (made, compartment::create(b"/comp/hostile", limits)) else {
         t.check(

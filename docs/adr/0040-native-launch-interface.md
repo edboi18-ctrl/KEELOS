@@ -62,7 +62,8 @@ field must be 0 (EINVAL otherwise, SR-10).
 | +5 | `compartment_kill(c, signal)` | Sends `signal` to every process in the compartment. Needs SIGNAL. |
 | +6 | `compartment_wait(c, usage*, flags)` | Fills `usage`: processes, memory bytes, tmpfs bytes and nodes, and PID 1's wait status (-1 while it runs). Without WNOHANG (1), it first waits until the compartment has no process left; a signal interrupts it (ERESTARTSYS). WNOHANG needs STAT, waiting needs WAIT. |
 
-`limits` is 40 bytes: processes (u32) and 4 reserved bytes, then memory
+`limits` is 40 bytes: processes (u32) and the allowlist profile's number
+(u32, ADR 0041; reserved until P3-S3), then memory
 bytes, tmpfs bytes and tmpfs nodes (u64 each), then 8 reserved bytes.
 `u64::MAX` (and `u32::MAX`) is no limit. Memory is rounded down to 4 KiB
 frames.
@@ -136,7 +137,7 @@ manifest is valid TOML meaning the same.
 | `args` | arguments after argv[0] | optional |
 | `env` | `KEY=VALUE` strings | optional |
 | `devices` | device grants, by name | optional; the five above |
-| `profile` | syscall and ioctl allowlist | only `"default"` until P3-S3 |
+| `profile` | syscall and ioctl allowlist (ADR 0041) | `"default"` (when left out) or `"full"` |
 | `[root] base` | the directory that becomes `/`, a path in keel-launch's tree | required |
 | `[root] prefix`, `writable` | layered image | refused until P3-S5 |
 | `[[grant]]` | a directory mounted inside | refused until P3-S5 (needs mounts) |
@@ -156,7 +157,6 @@ spec section 3, "Parser fuzzing on the host").
 
 - **Layered roots and mounted grants** (`prefix`, `writable`,
   `[[grant]]`): P3-S5.
-- **Allowlist profiles:** P3-S3.
 - **Audit records** of creation and grants: P3-S6. The calls are the
   points where they will go.
 - **Who may ask the service** is anyone in the system compartment, with

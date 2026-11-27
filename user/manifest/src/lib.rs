@@ -80,6 +80,25 @@ impl Limits {
     };
 }
 
+/// The compartment's allowlist profile (ADR 0041).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// The system calls Wine was observed to need (SR-7's default).
+    Default,
+    /// Every call Keel implements.
+    Full,
+}
+
+impl Profile {
+    /// Its number in the native interface's limits structure.
+    pub fn id(self) -> u32 {
+        match self {
+            Profile::Default => 0,
+            Profile::Full => 1,
+        }
+    }
+}
+
 /// A parse error: the line (from 1; 0 for the whole manifest) and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error {
@@ -106,6 +125,8 @@ pub struct Manifest {
     devices: [Option<Device>; 5],
     root: Option<Span>,
     pub limits: Limits,
+    /// `profile`, the default if not given.
+    pub profile: Profile,
 }
 
 impl Manifest {
@@ -396,9 +417,11 @@ impl<'a> Parser<'a> {
                 }
             }
             (Table::Top, b"profile", Value::Str(raw)) => {
-                if raw != b"default" {
-                    return Err(self.err("only the default profile exists until P3-S3"));
-                }
+                self.m.profile = match raw {
+                    b"default" => Profile::Default,
+                    b"full" => Profile::Full,
+                    _ => return Err(self.err("unknown profile (default, full)")),
+                };
             }
             (Table::Root, b"base", Value::Str(raw)) => {
                 let s = self.store(raw)?;
@@ -472,6 +495,7 @@ pub fn parse(text: &[u8]) -> Result<Manifest, Error> {
             devices: [None; 5],
             root: None,
             limits: Limits::DEFAULT,
+            profile: Profile::Default,
         },
         line: 0,
         seen: [(0, &[]); 48],
@@ -590,6 +614,10 @@ processes = 8
     fn the_minimum_and_the_defaults() {
         let m = parse(b"name = \"x\"\nexec = \"/x\"\n[root]\nbase = \"/r\"\n").unwrap();
         assert_eq!(m.limits, Limits::DEFAULT);
+        assert_eq!(m.profile, Profile::Default);
+        let full =
+            parse(b"name = \"x\"\nexec = \"/x\"\nprofile = \"full\"\n[root]\nbase = \"/r\"\n");
+        assert_eq!(full.map(|m| m.profile), Ok(Profile::Full));
         assert_eq!(m.args().count() + m.env().count() + m.devices().count(), 0);
     }
 
@@ -615,7 +643,7 @@ processes = 8
         fails(
             &with("name = \"x\"\nprofile = \"wine-gui\""),
             2,
-            "only the default profile exists until P3-S3",
+            "unknown profile (default, full)",
         );
         fails(
             &with("name = \"x\"\ndevices = [\"mem\"]"),

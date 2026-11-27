@@ -324,6 +324,15 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: false,
     },
+    // P3-S3 (ADR 0041): allowlist profiles, Keel's own.
+    TestProgram {
+        path: "test/profileprobe",
+        binary: "profileprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     // P3-S1: two compartments side by side (security acceptance P3 item 2).
     TestProgram {
         path: "test/sidebyside",

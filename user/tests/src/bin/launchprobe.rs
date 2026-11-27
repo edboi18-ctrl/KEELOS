@@ -110,7 +110,14 @@ fn child(mode: &[u8]) -> i32 {
         // Started by keel-launch from a manifest (`launch.manifest`): PID
         // 1, keel-launch's stdio, no factory, /dev/null granted and
         // /dev/zero not, the manifest's environment, nothing outside.
-        b"manifest" => {
+        // With `manifest-full`, from a manifest asking for the full
+        // profile (ADR 0041): getppid, outside the default profile, works
+        // only then.
+        b"manifest" | b"manifest-full" => {
+            let full = mode == b"manifest-full";
+            if (sys::getppid() == ENOSYS) == full {
+                return 64;
+            }
             let mut st = [0u8; 144];
             if sys::getpid() != 1
                 || sys::fstat(1, &mut st) != 0
@@ -224,6 +231,8 @@ fn make_root(dir: &Buf<128>, me: &CStr, dev: bool) -> i64 {
 fn checks(base: &Buf<128>, me: &CStr) -> i32 {
     let limits = Limits {
         processes: 16,
+        // Its children run calls the Wine trace has no need for.
+        profile: sys::PROFILE_FULL,
         memory_bytes: 64 << 20,
         tmpfs_bytes: 1 << 20,
         tmpfs_nodes: 64,
@@ -260,12 +269,31 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
         processes: 0,
         ..limits
     };
+    // ADR 0041: an unknown profile EINVAL; beneath a ceiling with the
+    // default profile, a full one EPERM.
+    let unknown = Limits {
+        profile: 2,
+        ..limits
+    };
+    let narrow = Limits {
+        profile: sys::PROFILE_DEFAULT,
+        ..limits
+    };
     if sys::factory_derive(derived, &more.bytes()) != EPERM
         || sys::factory_derive(derived, &reserved) != EINVAL
         || sys::factory_derive(derived, &none.bytes()) != EINVAL
+        || sys::factory_derive(derived, &unknown.bytes()) != EINVAL
     {
         return 3;
     }
+    let narrow_factory = sys::factory_derive(derived, &narrow.bytes());
+    if narrow_factory < 0
+        || sys::factory_derive(narrow_factory as i32, &limits.bytes()) != EPERM
+        || sys::compartment_create(narrow_factory as i32, -1, &limits.bytes()) != EPERM
+    {
+        return 3;
+    }
+    sys::close(narrow_factory as i32);
     // 4. compartment_create: above the ceiling EPERM; a file as root
     //    ENOTDIR; a root without ENUMERATE EBADF.
     let root_dir = path(base, b"/a");

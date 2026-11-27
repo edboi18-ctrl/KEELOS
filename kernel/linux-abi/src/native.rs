@@ -74,7 +74,12 @@ fn read_limits(address: u64) -> Result<Limits, Errno> {
     copy_from_user(&mut b, address).map_err(fault)?;
     let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
     let processes = u32::from_le_bytes(b[0..4].try_into().unwrap_or([0; 4]));
-    if b[4..8] != [0; 4] || b[32..40] != [0; 8] || processes == 0 {
+    // Bytes 4 to 7: the allowlist profile's number (ADR 0041), 0 the
+    // default. An unknown one is EINVAL, as any field out of range.
+    let profile =
+        keel_core::profile::by_id(u32::from_le_bytes(b[4..8].try_into().unwrap_or([0xff; 4])))
+            .ok_or(Errno::EINVAL)?;
+    if b[32..40] != [0; 8] || processes == 0 {
         return Err(Errno::EINVAL);
     }
     let unlimited_or = |v: u64, f: fn(u64) -> usize| if v == u64::MAX { usize::MAX } else { f(v) };
@@ -83,6 +88,7 @@ fn read_limits(address: u64) -> Result<Limits, Errno> {
         memory_frames: unlimited_or(u64_at(8), |v| (v / 4096) as usize),
         tmpfs_bytes: unlimited_or(u64_at(16), |v| v as usize),
         tmpfs_nodes: unlimited_or(u64_at(24), |v| v as usize),
+        profile,
     })
 }
 

@@ -15,7 +15,7 @@
 //! soft resource limit ... was reached").
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::errno::Errno;
 use crate::vfs::Ino;
@@ -39,6 +39,8 @@ pub struct Limits {
     pub tmpfs_bytes: usize,
     /// tmpfs nodes it has created.
     pub tmpfs_nodes: usize,
+    /// Its system-call and ioctl allowlists (ADR 0041).
+    pub profile: &'static crate::profile::Profile,
 }
 
 impl Limits {
@@ -48,6 +50,7 @@ impl Limits {
         memory_frames: usize::MAX,
         tmpfs_bytes: usize::MAX,
         tmpfs_nodes: usize::MAX,
+        profile: &crate::profile::FULL,
     };
 
     /// Whether every limit is at or below `ceiling`'s (a factory's, ADR
@@ -57,6 +60,7 @@ impl Limits {
             && self.memory_frames <= ceiling.memory_frames
             && self.tmpfs_bytes <= ceiling.tmpfs_bytes
             && self.tmpfs_nodes <= ceiling.tmpfs_nodes
+            && self.profile.within(ceiling.profile)
     }
 }
 
@@ -138,6 +142,8 @@ pub struct Compartment {
     /// The wait status of its PID 1 once that has ended, else -1 (ADR
     /// 0040: what `compartment_wait` reports to the launcher).
     lead_status: AtomicI64,
+    /// Calls and operations its profile has refused (ADR 0041).
+    denied: AtomicU64,
 }
 
 impl Compartment {
@@ -159,7 +165,19 @@ impl Compartment {
                 },
             ),
             lead_status: AtomicI64::new(-1),
+            denied: AtomicU64::new(0),
         }
+    }
+
+    /// Counts a refusal by its profile, and returns how many there have
+    /// been before this one.
+    pub fn note_denied(&self) -> u64 {
+        self.denied.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// How many calls and operations its profile has refused.
+    pub fn denied(&self) -> u64 {
+        self.denied.load(Ordering::Relaxed)
     }
 
     /// Records the wait status of its PID 1, which has ended.
@@ -184,6 +202,11 @@ impl Compartment {
 
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// Its allowlists (ADR 0041), fixed when it was made.
+    pub fn profile(&self) -> &'static crate::profile::Profile {
+        self.limits.profile
     }
 
     /// The user-memory budget its processes' address spaces charge.
@@ -278,6 +301,7 @@ mod tests {
             memory_frames: 1000,
             tmpfs_bytes: 4096,
             tmpfs_nodes: 10,
+            profile: &crate::profile::DEFAULT,
         };
         assert!(ceiling.fits_within(&ceiling));
         assert!(ceiling.fits_within(&Limits::UNLIMITED));
@@ -297,6 +321,11 @@ mod tests {
             },
             Limits {
                 tmpfs_nodes: 11,
+                ..ceiling
+            },
+            // A profile beyond the ceiling's (ADR 0041).
+            Limits {
+                profile: &crate::profile::FULL,
                 ..ceiling
             },
         ] {

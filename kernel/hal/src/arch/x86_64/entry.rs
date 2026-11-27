@@ -406,6 +406,9 @@ unsafe extern "C" {
 const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_FMASK: u32 = 0xC000_0084;
+/// IA32_SYSENTER_CS (174h; Intel SDM Vol. 4 Table 2-2, Linux v6.12
+/// `msr-index.h` MSR_IA32_SYSENTER_CS).
+const IA32_SYSENTER_CS: u32 = 0x174;
 /// EFER.SCE (bit 0): enables SYSCALL/SYSRET.
 const EFER_SCE: u64 = 1 << 0;
 /// Flags cleared on SYSCALL: TF (8), IF (9), DF (10), IOPL (12-13),
@@ -436,6 +439,19 @@ pub fn init(kernel_cr3: u64) {
         let efer = cpu::rdmsr(cpu::IA32_EFER);
         cpu::wrmsr(cpu::IA32_EFER, efer | EFER_SCE);
     }
+    // The 32-bit entry paths are never implemented (spec section 7). Keel
+    // has no INT 0x80 gate for ring 3 (every IDT gate has DPL 0, so INT n
+    // from user mode is #GP: SDM Vol. 3 section 7.12.1.1), and no 32-bit
+    // code segment (gdt.rs), so neither int 0x80 nor a compatibility-mode
+    // SYSCALL can reach the kernel. SYSENTER is the one left: Intel's
+    // SDM Vol. 2B "SYSENTER" raises #GP(0) when IA32_SYSENTER_CS[15:2]
+    // is 0 (AMD raises #UD for it in long mode, APM Vol. 3). Firmware may
+    // leave a value there, so clear it rather than rely on the reset
+    // value. A CPU without the MSR has no SYSENTER either, so a refused
+    // write is fine.
+    // SAFETY: writing 0 only disables SYSENTER; wrmsr_safe turns a #GP
+    // for a missing MSR into `false`.
+    let _ = unsafe { cpu::wrmsr_safe(IA32_SYSENTER_CS, 0) };
 }
 
 /// Records the thread that is about to run: its kernel-view CR3, user-view
