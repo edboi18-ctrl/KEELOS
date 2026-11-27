@@ -531,10 +531,44 @@ fn monitor_snapshot(port: u16) -> Vec<String> {
 
 fn print_tail(lines: &[String]) {
     let start = lines.len().saturating_sub(TAIL_LINES);
+    // A failed test's own lines may be far above the tail; CI keeps only
+    // this output, so print them first.
+    let details = failure_details(&lines[..start]);
+    if !details.is_empty() {
+        println!("xtask: failed tests above the tail, with their details:");
+        for line in &details {
+            println!("  | {line}");
+        }
+    }
     println!("xtask: last {} serial lines:", lines.len() - start);
     for line in &lines[start..] {
         println!("  | {line}");
     }
+}
+
+/// Each `TEST <name> FAIL ...` line in `lines`, with the indented detail
+/// lines the self-test prints right after it (at most
+/// `DETAIL_LINES_PER_FAILURE` of them).
+fn failure_details(lines: &[String]) -> Vec<String> {
+    const DETAIL_LINES_PER_FAILURE: usize = 20;
+    let mut out = Vec::new();
+    let mut taking = 0;
+    for line in lines {
+        let is_fail = line
+            .strip_prefix("TEST ")
+            .and_then(|rest| rest.split(' ').nth(1))
+            == Some("FAIL");
+        if is_fail {
+            out.push(line.clone());
+            taking = DETAIL_LINES_PER_FAILURE;
+        } else if taking > 0 && line.starts_with("  ") {
+            out.push(line.clone());
+            taking -= 1;
+        } else {
+            taking = 0;
+        }
+    }
+    out
 }
 
 /// Boots one phase's self-tests, or one of its scenarios, headless and
@@ -1154,6 +1188,27 @@ pub fn test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_details_are_the_fail_lines_and_their_indented_details() {
+        let lines: Vec<String> = [
+            "TEST a PASS fine",
+            "  not a detail of a failure",
+            "TEST b FAIL broken",
+            "  b: status 3",
+            "  b: more",
+            "other output",
+            "  not b's any more",
+            "TEST SUMMARY passed=1 failed=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            failure_details(&lines),
+            ["TEST b FAIL broken", "  b: status 3", "  b: more"]
+        );
+    }
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
