@@ -324,6 +324,15 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: false,
     },
+    // P3-S1: two compartments side by side (security acceptance P3 item 2).
+    TestProgram {
+        path: "test/sidebyside",
+        binary: "sidebyside",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     TestProgram {
         path: "test/fifoprobe",
         binary: "fifoprobe",

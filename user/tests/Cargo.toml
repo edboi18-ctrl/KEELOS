@@ -215,3 +215,8 @@ bench = false
 name = "threadprobe"
 test = false
 bench = false
+
+[[bin]]
+name = "sidebyside"
+test = false
+bench = false

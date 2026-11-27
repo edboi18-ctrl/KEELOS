@@ -1,6 +1,7 @@
 # ADR 0014: Compartments
 
-Status: accepted (Phase 3, P3-S1 and the first part of P3-S4). Extends
+Status: accepted (Phase 3, P3-S1 and the first part of P3-S4; P3-S1
+complete). Extends
 ADR 0012 (path authority) and ADR 0011 (resource limits).
 
 ## Context
@@ -93,20 +94,26 @@ compartment to set that root.
    compartments today. Programs will ask for them through `keel-launch`
    and a manifest (P3-S2).
 
-## Not yet covered
+## Covered since, with the features they confine
 
-These parts of P3-S1 arrive with the features they confine, each built
-per compartment from the start:
+The rest of P3-S1 arrived with the features it confines, each built per
+compartment from the start (closed in the P3-S1 closing pass):
 
-- Unix-socket names (P3-T11).
-- IPC names: futex keys for shared memory (P3-T5), `memfd`.
-- The procfs view (P3-T9).
-- Signals and `kill` (P3-T6). A PID names a process only inside its own
-  compartment.
-- `rename` (P3-T8). It must keep every working directory beneath its
-  root, or a moved directory would let relative lookups escape. A process
-  can only name directories under its own root, so only the system
-  compartment could move one out.
+- **Unix-socket names** (ADRs 0027 and 0028). Abstract names live in a
+  table keyed by compartment, type and name, so two compartments can bind
+  the same abstract name and neither can reach the other's. Path names
+  are nodes in the tree, so they resolve beneath the root like any path.
+- **IPC names.** Futex waiters are keyed by (address space, address)
+  (ADR 0019), and no address space is shared across compartments.
+  `memfd` names are labels only, never looked up. Keel has no System V
+  IPC and no POSIX message queues: those calls are ENOSYS.
+- **The procfs view** (ADRs 0024 and 0037). `/proc` lists only the
+  caller's compartment's PIDs, and `/proc/<pid>` exists only for them.
+- **Signals and `kill`** (ADRs 0019, 0020 and 0030). A PID, a process
+  group and `kill(-1)` name processes only inside the caller's
+  compartment (ESRCH otherwise).
+- **`rename`** (ADR 0022, decision 6). A relative lookup from a working
+  directory that has been moved out of the root names nothing.
 
 ## Evidence
 
@@ -126,6 +133,27 @@ per compartment from the start:
     compartment's directory and nowhere else.
   - With the system root given to every process again, all three runs
     fail at their first check (exit 2).
+- `compartment.side_by_side` (phase 3; security acceptance P3 item 2):
+  `user/tests/sidebyside` runs in compartments A and B at the same time,
+  twice: first A holds 3 children and B 1, then the other way round, so
+  each direction is checked while the other compartment holds what is
+  looked for. The kernel lets both start, sets them going together, and
+  lets them finish only when both have checked. Each run checks:
+  - **Processes:** `/proc` lists exactly its own PIDs; `kill` (signal 0
+    and SIGKILL) of each PID only the other has is ESRCH; at the end its
+    own children are all still alive.
+  - **Files:** the other's marker cannot be named by any of four routes.
+  - **Sockets:** both bind the same abstract name; connecting to the
+    other's abstract stream name and sending to its abstract datagram
+    name are ECONNREFUSED, and its socket path is ENOENT, while its own
+    names work; at the end no connection or datagram has arrived from
+    the other.
+  - Both process counts return to 0.
+  - Mutations, each caught by this test:
+    - abstract names in one table for all compartments;
+    - the compartment check dropped from the process list (`/proc`);
+    - the compartment check dropped from the PID lookup (`kill`);
+    - every compartment rooted at `/`.
 - `compartment.pid_space`: the PIDs compprobe checks (1, 1, then 2), and
   both counts back at 0 after the processes exit.
 - `compartment.process_limit`: in a one-process compartment, a second

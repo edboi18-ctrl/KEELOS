@@ -1905,6 +1905,8 @@ fn phase3(t: &mut Runner) {
         "each compartment numbers its processes from 1 (getpid), and its count returns to 0 when they exit",
     );
 
+    phase3_side_by_side(t);
+
     // P3-S4: a compartment's process limit. One slot: a second process
     // is refused with EAGAIN while the first lives, and admitted after.
     const NAP: &[u8] = b"/test/nap";
@@ -1986,6 +1988,123 @@ fn phase3(t: &mut Runner) {
     );
     if status != Some((0, None)) {
         kprintln!("  threadprobe: {status:?}");
+    }
+}
+
+/// P3-S1, security acceptance P3 item 2: two compartments running at the
+/// same time cannot see each other's processes, files or sockets.
+/// `user/tests/sidebyside` runs in A and B together, twice: first A holds
+/// 3 children and B 1, then the other way round, so each direction is
+/// checked while the other compartment holds the PIDs, files and names
+/// looked for. The kernel lets both start (`/ready-NAME`), sets them going
+/// (`/go`), and when both have checked (`/checked-NAME`) lets them finish
+/// (`/stop`). Each compartment's process count returns to 0.
+/// One side-by-side round: started, checked, each probe's status, and
+/// the processes left in the two compartments.
+type Round = (
+    bool,
+    bool,
+    alloc::vec::Vec<Option<(i64, Option<sched::UserFault>)>>,
+    u32,
+);
+
+fn phase3_side_by_side(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{compartment, fs, process};
+    const PROBE: &[u8] = b"/test/sidebyside";
+
+    // Waits up to 60 s for every one of `paths`, giving up at once if a
+    // probe has ended (it failed before getting there).
+    let all = |paths: &[&[u8]], threads: &[sched::ThreadId]| {
+        (0..6000).any(|_| {
+            let found = paths.iter().all(|p| fs::lookup(p).is_ok());
+            if !found {
+                sched::sleep_ms(10);
+            }
+            found || threads.iter().any(|t| sched::exit_status(*t).is_some())
+        }) && paths.iter().all(|p| fs::lookup(p).is_ok())
+    };
+    let place = |dirs: [&[u8]; 2], name: &[u8]| {
+        fs::with(|f| {
+            for dir in dirs {
+                let d = f.lookup(ROOT, ROOT, dir)?;
+                f.create_file(d, name, 0o644)?;
+            }
+            Ok(())
+        })
+        .is_ok()
+    };
+    let round = |names: [&[u8]; 2], children: [&[u8]; 2]| {
+        let mut roots = [[0u8; 16]; 2];
+        let mut comps = alloc::vec::Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            roots[i][..6].copy_from_slice(b"/comp/");
+            roots[i][6..6 + name.len()].copy_from_slice(name);
+            let root = &roots[i][..6 + name.len()];
+            let made = fs::with(|f| {
+                let comp = f.lookup(ROOT, ROOT, b"/comp")?;
+                f.create_dir(comp, name, 0o755)
+            });
+            let limits = Limits {
+                processes: 8,
+                ..Limits::UNLIMITED
+            };
+            comps.push(made.and_then(|_| compartment::create(root, limits)).ok()?);
+        }
+        let root = |i: usize| &roots[i][..6 + names[i].len()];
+        let mut threads = alloc::vec::Vec::new();
+        for i in 0..2 {
+            let file = fs::read_file(PROBE).ok()?;
+            let args: [&[u8]; 5] = [PROBE, names[i], names[1 - i], children[i], b"4"];
+            let loaded = keel_linux_abi::exec::load_in(comps[i].root(), &file, PROBE, &args, &[]);
+            let spawned = loaded
+                .ok()
+                .and_then(|l| process::spawn_in(&comps[i], "sidebyside", &l).ok());
+            threads.push(spawned?.thread);
+        }
+        let path = |i: usize, file: &[u8]| {
+            let mut p = alloc::vec::Vec::from(root(i));
+            p.push(b'/');
+            p.extend_from_slice(file);
+            p.extend_from_slice(names[i]);
+            p
+        };
+        let (ready, checked) = (
+            [path(0, b"ready-"), path(1, b"ready-")],
+            [path(0, b"checked-"), path(1, b"checked-")],
+        );
+        let started = all(&[&ready[0], &ready[1]], &threads) && place([root(0), root(1)], b"go");
+        let done = started && all(&[&checked[0], &checked[1]], &threads);
+        // Let them finish whatever happened; each gives up on its own
+        // after 60 s of waiting.
+        place([root(0), root(1)], b"stop");
+        let status: alloc::vec::Vec<_> = threads
+            .into_iter()
+            .map(|th| {
+                join(th);
+                sched::exit_status(th)
+            })
+            .collect();
+        sched::sleep_ms(50);
+        Some((
+            started,
+            done,
+            status,
+            comps[0].processes() + comps[1].processes(),
+        ))
+    };
+    let first = round([b"sa", b"sb"], [b"3", b"1"]);
+    let second = round([b"ta", b"tb"], [b"1", b"3"]);
+    let good = |r: &Option<Round>| matches!(r, Some((true, true, s, 0)) if s.iter().all(|s| *s == Some((0, None))));
+    let ok = good(&first) && good(&second);
+    t.check(
+        "compartment.side_by_side",
+        ok,
+        "two compartments running at once cannot see each other's processes (/proc, kill), files (every route) or sockets (abstract stream and datagram names, socket paths), in both directions; nothing from one arrives in the other",
+    );
+    if !ok {
+        kprintln!("  sidebyside: first {first:?}; second {second:?}");
     }
 }
 
