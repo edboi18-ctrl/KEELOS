@@ -1908,6 +1908,7 @@ fn phase3(t: &mut Runner) {
     phase3_side_by_side(t);
     phase3_profiles(t);
     phase3_under_load(t);
+    phase3_tracing(t);
 
     // P3-S4: a compartment's process limit. One slot: a second process
     // is refused with EAGAIN while the first lives, and admitted after.
@@ -2293,6 +2294,49 @@ fn phase3_under_load(t: &mut Runner) {
             "  under load: full {full}; B quiet {quiet:?}, loaded {loaded:?}; system {system:?}; shell {shell:?} in {shell_ms} ms; hog {hog:?}; {spinning} left spinning; emptied {emptied}, memory {} frames; frames outside the heap {frames} -> {frames_after}",
             a.memory().used()
         );
+    }
+}
+
+/// P3-S9 (ADR 0043): debug tracing, in this test build only. With
+/// `trace=syscalls` for PID 1, `nap 10` run as PID 1 of a new compartment
+/// is traced (its poll and exit_group at least); with the filter on
+/// PID 99, nothing is. Its lines go to the kernel log, where xtask finds
+/// them too.
+fn phase3_tracing(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::trace::SYSCALLS;
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{compartment, fs, trace};
+    const NAP: &[u8] = b"/test/nap";
+    let made = fs::with(|f| {
+        let comp = f.lookup(ROOT, ROOT, b"/comp")?;
+        f.create_dir(comp, b"tr", 0o755)
+    });
+    let limits = Limits {
+        processes: 2,
+        ..Limits::UNLIMITED
+    };
+    let run = |pid_filter| {
+        let c = compartment::create(b"/comp/tr", limits).ok()?;
+        let before = trace::lines();
+        trace::set(SYSCALLS, pid_filter);
+        let status = run_in(&c, NAP, &[NAP, b"10"]);
+        trace::set(0, 0);
+        Some((status, trace::lines() - before))
+    };
+    let (traced, filtered) = match made {
+        Ok(_) => (run(1), run(99)),
+        Err(_) => (None, None),
+    };
+    let ok = matches!(traced, Some((Some((0, None)), n)) if n >= 2)
+        && filtered == Some((Some((0, None)), 0));
+    t.check(
+        "trace.syscalls",
+        ok,
+        "debug tracing (test builds only, SR-21): trace=syscalls logs a program's calls with their arguments and results, and trace.pid filters them",
+    );
+    if !ok {
+        kprintln!("  tracing: PID 1 {traced:?}, PID 99 {filtered:?}");
     }
 }
 

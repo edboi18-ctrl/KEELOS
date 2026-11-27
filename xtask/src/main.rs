@@ -28,12 +28,16 @@ Usage: cargo xtask <command> [options]
 
 Commands:
   build                     Build the kernel and initramfs; populate target/esp
-  run   [--gdb] [--kvm] [--accel NAME]
+  run   [--gdb] [--kvm] [--accel NAME] [--trace 'trace=WHAT[,WHAT] [trace.pid=N]']
                             Build, then boot in QEMU with serial on stdio
+                            (--trace: a kernel built with debug tracing;
+                            WHAT is syscalls, faults, signals or sched)
   test  [--phase N [--scenario NAME]] [--kvm] [--accel NAME] [--timeout SECONDS]
                             Build, boot headless, run the in-guest tests
                             (--scenario: only that boot of the phase, or
-                            `main` for the phase's main boot alone)
+                            `main` for the phase's main boot alone, or
+                            `release` with phase 3 for SR-21's checks of
+                            the release kernel)
   fuzz  [--minutes N] [--seed S] [--kvm] [--accel NAME]
                             Boot the in-guest system-call fuzzer for N
                             minutes (default 60); fails on a kernel panic
@@ -135,8 +139,23 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
         }
         "run" => {
             let options = run_options(&mut args)?;
+            // Debug tracing (ADR 0043): a kernel built with it, and only
+            // trace words on its command line.
+            let trace = take_value(&mut args, "--trace")?;
             no_extra_args(&args)?;
-            qemu::run(&options)
+            let trace = match trace {
+                Some(words) => {
+                    if !words
+                        .split_ascii_whitespace()
+                        .all(|w| w.starts_with("trace=") || w.starts_with("trace.pid="))
+                    {
+                        return Err("--trace takes only trace= and trace.pid= words".into());
+                    }
+                    Some(&*Box::leak(words.into_boxed_str()))
+                }
+                None => None,
+            };
+            qemu::run(&options, trace)
         }
         "test" => {
             let options = run_options(&mut args)?;

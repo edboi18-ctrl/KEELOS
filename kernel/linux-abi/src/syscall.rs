@@ -446,6 +446,25 @@ pub fn set_slow_log(on: bool) {
 /// The system-call entry point.
 pub fn handle(call: &SyscallArgs) -> i64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "debug-tracing")]
+    {
+        // exit and exit_group do not return, so they are traced first.
+        if matches!(call.number, nr::EXIT | nr::EXIT_GROUP)
+            && let Some(p) = process::current()
+        {
+            crate::trace::syscall(&p, call.number, &call.args, None);
+        }
+        let result = handle_untraced(call);
+        if let Some(p) = process::current() {
+            crate::trace::syscall(&p, call.number, &call.args, Some(result));
+        }
+        result
+    }
+    #[cfg(not(feature = "debug-tracing"))]
+    handle_untraced(call)
+}
+
+fn handle_untraced(call: &SyscallArgs) -> i64 {
     if !SLOW_LOG.load(Ordering::Relaxed) {
         return dispatch(call);
     }

@@ -23,6 +23,26 @@ pub enum BootMode {
     /// Run the fork, thread and signal stress program for `minutes` from
     /// `seed` (Phase 3 acceptance item 4), then exit QEMU.
     Stress { minutes: u64, seed: u64 },
+    /// A normal boot of a kernel built with debug tracing, these `trace=`
+    /// words on its command line (`cargo xtask run --trace`, ADR 0043).
+    Traced(&'static str),
+    /// The release kernel with this command line. Only for checking that
+    /// it ignores test and trace options (SR-21, ADR 0043).
+    ReleaseWith(&'static str),
+}
+
+impl BootMode {
+    /// The kernel's Cargo features for this boot. A release (normal)
+    /// kernel has none: no self-tests and no tracing (SR-21).
+    pub fn kernel_features(self) -> &'static [&'static str] {
+        match self {
+            BootMode::Normal | BootMode::ReleaseWith(_) => &[],
+            BootMode::Traced(_) => &["debug-tracing"],
+            BootMode::Test(..) | BootMode::Fuzz { .. } | BootMode::Stress { .. } => {
+                &["selftest", "debug-tracing"]
+            }
+        }
+    }
 }
 
 /// The files of a finished build, in the order they sit on the boot volume.
@@ -69,17 +89,21 @@ fn target_flags(root: &Path) -> Vec<String> {
     flags
 }
 
-/// Compiles the kernel and returns the path of the ELF file.
-fn build_kernel(root: &Path) -> Result<PathBuf> {
+/// Compiles the kernel with `features` and returns the path of the ELF
+/// file.
+pub fn build_kernel(root: &Path, features: &[&str]) -> Result<PathBuf> {
     // 0x1f separates CARGO_ENCODED_RUSTFLAGS entries (Cargo book,
     // "Environment variables").
-    util::run(
-        Command::new(util::cargo())
-            .current_dir(root)
-            .args(["build", "--release", "--locked", "--package", "keel-kernel"])
-            .args(["--target", KERNEL_TARGET])
-            .env("CARGO_ENCODED_RUSTFLAGS", target_flags(root).join("\x1f")),
-    )?;
+    let mut command = Command::new(util::cargo());
+    command
+        .current_dir(root)
+        .args(["build", "--release", "--locked", "--package", "keel-kernel"])
+        .args(["--target", KERNEL_TARGET])
+        .env("CARGO_ENCODED_RUSTFLAGS", target_flags(root).join("\x1f"));
+    if !features.is_empty() {
+        command.args(["--features", &features.join(",")]);
+    }
+    util::run(&mut command)?;
     Ok(root
         .join("target")
         .join(KERNEL_TARGET)
@@ -820,6 +844,9 @@ pub fn limine_conf(kernel: &[u8], initramfs: &[u8], mode: BootMode) -> String {
     ));
     match mode {
         BootMode::Normal => {}
+        BootMode::Traced(words) | BootMode::ReleaseWith(words) => {
+            conf.push_str(&format!("    cmdline: {words}\n"))
+        }
         BootMode::Test(phase, None) => conf.push_str(&format!("    cmdline: test={phase}\n")),
         BootMode::Fuzz { minutes, seed } => {
             conf.push_str(&format!("    cmdline: test=1 fuzz={minutes} seed={seed}\n"))
@@ -874,7 +901,7 @@ pub fn enroll_config(efi: &mut [u8], conf: &[u8]) -> Result<()> {
 pub fn build_tree(mode: BootMode) -> Result<BootTree> {
     let root = util::workspace_root();
     let limine = limine::ensure()?;
-    let kernel = util::read(&build_kernel(&root)?)?;
+    let kernel = util::read(&build_kernel(&root, mode.kernel_features())?)?;
 
     let mut archive = cpio::Archive::default();
     archive.add_tree(&root.join("initramfs"))?;

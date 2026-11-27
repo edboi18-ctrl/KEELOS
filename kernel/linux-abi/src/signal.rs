@@ -239,6 +239,8 @@ fn restart(frame: &mut TrapFrame, handler: Option<u64>) {
 /// it is interrupted, so it takes it on its way back to user mode
 /// (`complete_signal`, `wants_signal`).
 pub fn send_to_process(target: &Arc<IrqMutex<Process>>, info: SigInfo) {
+    #[cfg(feature = "debug-tracing")]
+    crate::trace::signal(target, &info);
     let signal = info.signo;
     if signal == SIGKILL {
         process::kill_all_threads(target, SIGKILL);
@@ -460,6 +462,8 @@ fn on_fault(frame: &mut TrapFrame, fault: Fault) -> bool {
         // Spurious SIMD exception: back to the program, as Linux.
         return true;
     };
+    #[cfg(feature = "debug-tracing")]
+    crate::trace::fault(&p, fault.vector, frame.rip, &info);
     let me = sched::current().0;
     {
         let mut process = p.lock();

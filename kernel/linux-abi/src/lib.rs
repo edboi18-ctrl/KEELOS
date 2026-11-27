@@ -47,5 +47,8 @@ pub mod sleep;
 pub mod socket;
 #[cfg(target_os = "none")]
 pub mod syscall;
+/// Debug tracing, only in `debug-tracing` builds (SR-21, ADR 0043).
+#[cfg(all(target_os = "none", feature = "debug-tracing"))]
+pub mod trace;
 #[cfg(target_os = "none")]
 pub mod tty;

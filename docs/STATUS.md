@@ -238,6 +238,14 @@ never-implemented calls are in no profile (host tests), and the 32-bit
 entry paths fault (`compartment.profiles`). A manifest gets `default`
 unless it asks for `full` (`launch.manifest`).
 
+P3-S9 (release builds, ADR 0043) is done. The self-tests and their
+command-line options are in kernels built with the `selftest` feature,
+and the new `trace=syscalls|faults|signals|sched` and `trace.pid=`
+options only in kernels built with `debug-tracing` (SR-21). A release
+kernel has neither: its binary holds none of their code
+(`sr21.release_kernel`), and booted with every such option it ignores
+each, saying so (`sr21.release_ignores_options`).
+
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and

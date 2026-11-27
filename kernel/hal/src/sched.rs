@@ -292,6 +292,8 @@ pub fn spawn_user(
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
     sched.make_ready(id);
+    drop(guard);
+    trace_thread("made", id, name, None);
     Ok(ThreadId(id))
 }
 
@@ -369,6 +371,8 @@ pub fn spawn_user_copy(
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
     sched.make_ready(id);
+    drop(guard);
+    trace_thread("made", id, name, None);
     Ok(ThreadId(id))
 }
 
@@ -399,6 +403,8 @@ pub fn spawn(name: &'static str, entry: fn()) -> Result<ThreadId, SchedError> {
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
     sched.make_ready(id);
+    drop(guard);
+    trace_thread("made", id, name, None);
     Ok(ThreadId(id))
 }
 
@@ -811,9 +817,42 @@ pub fn exit() -> ! {
     exit_with(0)
 }
 
+/// `trace=sched` (ADR 0043): threads made and ended are logged. Only in
+/// `debug-tracing` builds (SR-21).
+#[cfg(feature = "debug-tracing")]
+static TRACE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "debug-tracing")]
+pub fn set_trace(on: bool) {
+    TRACE.store(on, Ordering::Relaxed);
+}
+
+/// Logs a thread made or ended, if `trace=sched` is on. Call with no
+/// lock held.
+#[cfg(feature = "debug-tracing")]
+fn trace_thread(what: &str, id: u64, name: &str, status: Option<i64>) {
+    if TRACE.load(Ordering::Relaxed) {
+        match status {
+            Some(status) => {
+                crate::kprintln!("trace: sched: thread {id} ({name}) {what}, status {status}")
+            }
+            None => crate::kprintln!("trace: sched: thread {id} ({name}) {what}"),
+        }
+    }
+}
+
+#[cfg(not(feature = "debug-tracing"))]
+fn trace_thread(_: &str, _: u64, _: &str, _: Option<i64>) {}
+
 /// Ends the running thread with an exit status.
 pub fn exit_with(status: i64) -> ! {
     let id = current().0;
+    trace_thread(
+        "ended",
+        id,
+        thread_name(ThreadId(id)).unwrap_or("?"),
+        Some(status),
+    );
     let fault = FAULTS.lock().remove(&id);
     let hook = *EXIT_HOOK.lock();
     if let Some(hook) = hook {

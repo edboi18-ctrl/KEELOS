@@ -29,6 +29,7 @@ pub mod profile;
 pub mod rng;
 pub mod script;
 pub mod signal;
+pub mod trace;
 pub mod tty;
 pub mod unix;
 pub mod vfs;

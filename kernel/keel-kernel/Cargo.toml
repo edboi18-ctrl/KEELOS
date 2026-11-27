@@ -10,6 +10,14 @@ name = "keel-kernel"
 test = false
 bench = false
 
+[features]
+# The self-tests and their command-line options (test=, fuzz=, stress=,
+# scenario=), and the KASLR addresses test boots print. Test builds only
+# (SR-21, ADR 0043). The self-tests check tracing, so they bring it.
+selftest = ["debug-tracing"]
+# Debug tracing (trace=, trace.pid=). Never in a release build.
+debug-tracing = ["keel-linux-abi/debug-tracing", "keel-hal/debug-tracing"]
+
 [dependencies]
 keel-hal = { path = "../hal" }
 keel-core = { path = "../core" }

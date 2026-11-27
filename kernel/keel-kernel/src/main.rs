@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+/// The self-tests: test builds only (SR-21, ADR 0043).
+#[cfg(feature = "selftest")]
 mod selftest;
 
 use core::panic::PanicInfo;
@@ -106,10 +108,7 @@ extern "C" fn kmain() -> ! {
             );
             // As with the kernel base: test boots only (audit 2, A5).
             let cmdline = boot::cmdline();
-            if selftest::requested_phase(cmdline).is_some()
-                || selftest::requested_fuzz(cmdline).is_some()
-                || selftest::requested_stress(cmdline).is_some()
-            {
+            if test_boot(cmdline) {
                 let [heap, mmio, stacks] = paging::region_bases();
                 kresult!("boot: regions heap {heap:#018x} mmio {mmio:#018x} stacks {stacks:#018x}");
             }
@@ -213,6 +212,22 @@ extern "C" fn kmain_on_boot_stack() -> ! {
         kprintln!("serial: no COM1 input");
     }
 
+    #[cfg(feature = "debug-tracing")]
+    keel_linux_abi::trace::configure(boot::cmdline());
+    note_ignored_options(boot::cmdline());
+    #[cfg(feature = "selftest")]
+    run_test_boot();
+
+    // P3-T13 (ADR 0032): a normal boot runs /sbin/keel-init, which keeps
+    // a shell on the console. This thread waits for it; the scheduler runs
+    // everything else meanwhile.
+    run_init()
+}
+
+/// A test boot (`test=`, `fuzz=`, `stress=`): runs it and exits QEMU.
+/// Returns for a normal boot.
+#[cfg(feature = "selftest")]
+fn run_test_boot() {
     if let Some((minutes, seed)) = selftest::requested_fuzz(boot::cmdline()) {
         TEST_MODE.store(true, Ordering::Relaxed);
         let passed = selftest::run_fuzz(minutes, seed);
@@ -241,10 +256,39 @@ extern "C" fn kmain_on_boot_stack() -> ! {
             ExitCode::Failure
         });
     }
+}
 
-    // P3-T13 (ADR 0032): a normal boot runs /sbin/keel-init, which keeps
-    // a shell on the console. This thread waits for it; the scheduler runs
-    // everything else meanwhile.
+/// Whether the command line asks for a test boot. Never in a kernel
+/// built without the self-tests (SR-21).
+#[cfg(feature = "selftest")]
+fn test_boot(cmdline: &str) -> bool {
+    selftest::requested_phase(cmdline).is_some()
+        || selftest::requested_fuzz(cmdline).is_some()
+        || selftest::requested_stress(cmdline).is_some()
+}
+
+#[cfg(not(feature = "selftest"))]
+fn test_boot(_: &str) -> bool {
+    false
+}
+
+/// Command-line words this build has no use for because the code behind
+/// them is not in it (SR-21): each is logged and ignored.
+fn note_ignored_options(cmdline: &str) {
+    const TEST_WORDS: [&str; 5] = ["test=", "fuzz=", "stress=", "scenario=", "seed="];
+    const TRACE_WORDS: [&str; 2] = ["trace=", "trace.pid="];
+    for word in cmdline.split_ascii_whitespace() {
+        if !cfg!(feature = "selftest") && TEST_WORDS.iter().any(|w| word.starts_with(w)) {
+            kprintln!("boot: {word} ignored: this kernel was built without the self-tests");
+        }
+        if !cfg!(feature = "debug-tracing") && TRACE_WORDS.iter().any(|w| word.starts_with(w)) {
+            kprintln!("boot: {word} ignored: this kernel was built without debug-tracing");
+        }
+    }
+}
+
+/// Starts /sbin/keel-init and waits for it; halts when it ends.
+fn run_init() -> ! {
     match start_init() {
         Ok(spawned) => {
             kprintln!("Keel: started {} (PID {})", INIT_DISPLAY, spawned.pid);
@@ -309,10 +353,7 @@ fn report_boot_info(serial_ok: bool, fb_size: Option<(usize, usize)>) {
     // which is trusted only as far as the boot chain is (audit finding 2);
     // whoever can edit it can also replace the kernel.
     let cmdline = boot::cmdline();
-    if selftest::requested_phase(cmdline).is_some()
-        || selftest::requested_fuzz(cmdline).is_some()
-        || selftest::requested_stress(cmdline).is_some()
-    {
+    if test_boot(cmdline) {
         match boot::hhdm_offset() {
             Some(offset) => kresult!("boot: HHDM offset {offset:#018x}"),
             None => kprintln!("boot: no HHDM response"),
@@ -361,6 +402,7 @@ fn panic(info: &PanicInfo) -> ! {
     if PANICKING.swap(true, Ordering::AcqRel) {
         // A fault or panic while panicking. Formatting or the framebuffer
         // may be what failed, so write one fixed line and stop.
+        #[cfg(feature = "selftest")]
         if TEST_MODE.load(Ordering::Relaxed) {
             selftest::judge_nested_panic();
         }
@@ -370,6 +412,7 @@ fn panic(info: &PanicInfo) -> ! {
         }
         halt_forever();
     }
+    #[cfg(feature = "selftest")]
     if TEST_MODE.load(Ordering::Relaxed) {
         // A scenario that ends in a deliberate fatal exception judges the
         // outcome here and exits QEMU itself.

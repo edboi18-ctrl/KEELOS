@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Debug tracing (`trace=` on the command line). Never in a release build
+# (SR-21, ADR 0043).
+debug-tracing = ["keel-hal/debug-tracing"]
+
 [dependencies]
 keel-core = { path = "../core" }
 

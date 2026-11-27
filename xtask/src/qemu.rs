@@ -225,8 +225,8 @@ fn base_command(disk: BootDisk, options: &RunOptions, results: Option<&Path>) ->
 }
 
 /// `cargo xtask run`: build, then boot interactively with serial on stdio.
-pub fn run(options: &RunOptions) -> Result<()> {
-    let esp = build::build(BootMode::Normal)?;
+pub fn run(options: &RunOptions, trace: Option<&'static str>) -> Result<()> {
+    let esp = build::build(trace.map_or(BootMode::Normal, BootMode::Traced))?;
     let mut command = base_command(BootDisk::Directory(&esp), options, None)?;
     command.arg("-no-shutdown");
     if options.gdb {
@@ -866,6 +866,116 @@ fn test_tampered_boot(options: &RunOptions, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
+/// Strings only the code gated by the `selftest` and `debug-tracing`
+/// features holds (SR-21, ADR 0043): each must be in a test kernel, so it
+/// still names gated code, and none may be in a release kernel.
+pub const GATED_MARKERS: [&str; 3] = [
+    "TEST SUMMARY passed=",
+    "trace: on (",
+    "trace: sched: thread",
+];
+
+/// The command-line words the SR-21 boot gives the release kernel: every
+/// test and trace option.
+const RELEASE_IGNORES: &str =
+    "test=3 scenario=conformance fuzz=1 stress=1 seed=5 trace=syscalls,sched trace.pid=1";
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
+/// SR-21's check of the binaries: the markers in `test`, none in
+/// `release`.
+pub fn gating_verdict(release: &[u8], test: &[u8]) -> std::result::Result<(), String> {
+    for marker in GATED_MARKERS {
+        if !contains(test, marker) {
+            return Err(format!(
+                "the test kernel lacks {marker:?}: the marker no longer names gated code"
+            ));
+        }
+        if contains(release, marker) {
+            return Err(format!("the release kernel contains {marker:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// SR-21's check of a release boot given `words`: it reaches the shell,
+/// says each word is ignored, and runs no test, traces nothing and prints
+/// no kernel address.
+pub fn release_boot_verdict(lines: &[String], words: &str) -> std::result::Result<(), String> {
+    if !lines
+        .iter()
+        .any(|l| l.starts_with("keel-init: starting /bin/keel-shell"))
+    {
+        return Err("the release kernel did not reach the shell".into());
+    }
+    for word in words.split_ascii_whitespace() {
+        let said = format!("boot: {word} ignored: ");
+        if !lines.iter().any(|l| l.starts_with(&said)) {
+            return Err(format!("no line says {word} was ignored"));
+        }
+    }
+    if let Some(line) = lines.iter().find(|l| {
+        l.starts_with("TEST ")
+            || l.starts_with("trace:")
+            || l.starts_with("boot: HHDM offset")
+            || l.starts_with("boot: kernel at virt")
+            || l.starts_with("boot: regions heap")
+    }) {
+        return Err(format!("the release kernel acted on an option: {line:?}"));
+    }
+    Ok(())
+}
+
+/// SR-21 (P3-S9, ADR 0043): a release kernel has no self-tests and no
+/// tracing. Its binary holds none of the gated code's strings, and booted
+/// with every test and trace option on its command line it ignores each,
+/// saying so, and boots to the shell.
+fn test_release_gating(options: &RunOptions, timeout: Duration) -> Result<()> {
+    let root = util::workspace_root();
+    let tree = build::build_tree(BootMode::ReleaseWith(RELEASE_IGNORES))?;
+    let release = tree
+        .files
+        .iter()
+        .find(|(path, _)| *path == build::KERNEL_PATH)
+        .map(|(_, data)| data.clone())
+        .ok_or("no kernel in the tree")?;
+    let test = util::read(&build::build_kernel(
+        &root,
+        BootMode::Test(3, None).kernel_features(),
+    )?)?;
+    match gating_verdict(&release, &test) {
+        Ok(()) => println!(
+            "  TEST sr21.release_kernel PASS the release kernel holds none of the self-tests' or tracing's code ({} markers checked, each present in a test kernel)",
+            GATED_MARKERS.len()
+        ),
+        Err(reason) => return Err(format!("TEST sr21.release_kernel FAIL {reason}").into()),
+    }
+    let esp = root.join("target").join("esp-release-with");
+    if esp.exists() {
+        std::fs::remove_dir_all(&esp)?;
+    }
+    for (path, data) in &tree.files {
+        util::write(&esp.join(path), data)?;
+    }
+    let capture = boot_headless(BootDisk::Directory(&esp), options, timeout, |line| {
+        line.starts_with("keel-init: starting /bin/keel-shell") || line.contains(PANIC_BANNER)
+    })?;
+    match release_boot_verdict(&capture.lines, RELEASE_IGNORES) {
+        Ok(()) => println!(
+            "  TEST sr21.release_ignores_options PASS booted with every test and trace option, the release kernel ignores each, says so, and boots to the shell"
+        ),
+        Err(reason) => {
+            print_tail(&capture.lines);
+            return Err(format!("TEST sr21.release_ignores_options FAIL {reason}").into());
+        }
+    }
+    Ok(())
+}
+
 /// Boots a raw disk image headless and succeeds once a serial line starts
 /// with `marker`. Fails on a kernel panic, on QEMU exiting first, or after
 /// the default timeout.
@@ -1147,6 +1257,15 @@ pub fn test(
         println!("xtask: phase {} main boot PASSED", phase.number);
         return Ok(());
     }
+    // `--phase 3 --scenario release`: SR-21's checks of the release
+    // kernel alone (ADR 0043).
+    if let (Some("release"), [phase]) = (only_scenario, selected.as_slice())
+        && phase.number == 3
+    {
+        test_release_gating(options, timeout)?;
+        println!("xtask: phase 3 release checks PASSED");
+        return Ok(());
+    }
     if let (Some(name), [phase]) = (only_scenario, selected.as_slice()) {
         let scenario = phase
             .scenarios
@@ -1172,6 +1291,9 @@ pub fn test(
         }
         if phase.number == 0 {
             test_tampered_boot(options, timeout)?;
+        }
+        if phase.number == 3 {
+            test_release_gating(options, timeout)?;
         }
         if phase.complete {
             println!("xtask: phase {} PASSED", phase.number);
@@ -1278,6 +1400,52 @@ mod tests {
         // A panic banner on the console still fails the run.
         let panic = lines("*** KEEL KERNEL PANIC ***");
         assert!(verdict(P0, &lines(GOOD), &panic, Some(33)).is_err());
+    }
+
+    #[test]
+    fn gating_needs_every_marker_in_the_test_kernel_and_none_in_release() {
+        let test = GATED_MARKERS.join(" ").into_bytes();
+        assert_eq!(gating_verdict(b"plain kernel", &test), Ok(()));
+        assert!(
+            gating_verdict(&test, &test)
+                .unwrap_err()
+                .contains("release kernel contains")
+        );
+        assert!(
+            gating_verdict(b"plain", b"TEST SUMMARY passed=")
+                .unwrap_err()
+                .contains("lacks")
+        );
+    }
+
+    #[test]
+    fn a_release_boot_must_ignore_every_word_and_reach_the_shell() {
+        let words = "test=3 trace=syscalls";
+        let good = lines(
+            "boot: test=3 ignored: no self-tests\nboot: trace=syscalls ignored: no tracing\nkeel-init: starting /bin/keel-shell",
+        );
+        assert_eq!(release_boot_verdict(&good, words), Ok(()));
+        let silent = lines("boot: test=3 ignored: x\nkeel-init: starting /bin/keel-shell");
+        assert!(
+            release_boot_verdict(&silent, words)
+                .unwrap_err()
+                .contains("trace=syscalls")
+        );
+        let mut acted = good.clone();
+        acted.push("TEST exec.x PASS".into());
+        assert!(
+            release_boot_verdict(&acted, words)
+                .unwrap_err()
+                .contains("acted")
+        );
+        let mut traced = good.clone();
+        traced.push("trace: c0 pid 1 tid 3: write(1)".into());
+        assert!(release_boot_verdict(&traced, words).is_err());
+        assert!(
+            release_boot_verdict(&good[..2], words)
+                .unwrap_err()
+                .contains("shell")
+        );
     }
 
     #[test]

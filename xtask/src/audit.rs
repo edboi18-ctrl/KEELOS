@@ -775,6 +775,30 @@ pub fn audit(offline: bool) -> Result<()> {
             }),
         ),
         (
+            // The self-tests and tracing are only in test builds (ADR
+            // 0043), so they are linted with those features on.
+            "lint (kernel, test build)",
+            Box::new(|| {
+                cargo_step(
+                    &root,
+                    &[
+                        "clippy",
+                        "--locked",
+                        "--release",
+                        "--package",
+                        "keel-kernel",
+                        "--target",
+                        "x86_64-unknown-none",
+                        "--features",
+                        "selftest,debug-tracing",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                )
+            }),
+        ),
+        (
             "lint (user programs)",
             Box::new(|| {
                 cargo_step(
