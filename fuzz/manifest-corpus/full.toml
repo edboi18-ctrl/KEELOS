@@ -1,0 +1,24 @@
+# A full manifest.
+name = "hello-1.0"
+exec = "/bin/hello"
+args = ["a b", "c\"d", ""]
+env  = ["PATH=/bin", "X=1=2"]
+devices = ["null", "zero", "urandom", "tty", "ptmx"]
+profile = "default"
+
+[root]
+base = "/apps/hello"
+
+[display]
+allowed = false
+max_surfaces = 32
+
+[network]
+allowed = false
+
+[limits]
+memory_mb = 128
+processes = 8
+handles = 256
+tmpfs_mb = 16
+tmpfs_nodes = 100

@@ -1,0 +1,4 @@
+name = "x"
+exec = "/x"
+[root]
+base = "/r"

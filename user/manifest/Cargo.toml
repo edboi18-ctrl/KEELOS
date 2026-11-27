@@ -1,0 +1,14 @@
+[package]
+name = "keel-manifest"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Compartment manifests (P3-S2, ADR 0040): parsed by keel-launch, no_std and
+# without allocation; also built on the host for its tests and for
+# `cargo xtask fuzz-manifest`.
+[dependencies]
+
+[lints]
+workspace = true

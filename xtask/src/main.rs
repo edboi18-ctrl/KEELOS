@@ -9,6 +9,7 @@ mod conformance;
 mod cpio;
 mod dist;
 mod fetch;
+mod fuzzmanifest;
 mod fuzzpe;
 mod limine;
 mod qemu;
@@ -44,6 +45,10 @@ Commands:
   linux-test [--check]      Run the conformance programs under Linux and
                             record their output in user/tests/reference
                             (--check: compare with it instead)
+  fuzz-manifest [--minutes N] [--seed S]
+                            Fuzz the compartment-manifest parser on the
+                            host for N minutes (default 30); fails on a
+                            panic or an invalid manifest accepted
   fuzz-pe [--minutes N] [--seed S]
                             Fuzz the PE parser on the host for N minutes
                             (default 30); fails on a parser panic
@@ -196,6 +201,20 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
                 return Err("--gdb is only for `cargo xtask run`".into());
             }
             qemu::stress(minutes, seed, &options)
+        }
+        "fuzz-manifest" => {
+            let minutes = take_value(&mut args, "--minutes")?
+                .map(|v| v.parse::<u64>().map_err(|_| "--minutes needs a number"))
+                .transpose()?
+                .unwrap_or(30);
+            let seed = match take_value(&mut args, "--seed")? {
+                Some(v) => v.parse::<u64>().map_err(|_| "--seed needs a number")?,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            };
+            no_extra_args(&args)?;
+            fuzzmanifest::fuzz_manifest(minutes, seed)
         }
         "fuzz-pe" => {
             let minutes = take_value(&mut args, "--minutes")?

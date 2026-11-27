@@ -1972,6 +1972,7 @@ fn phase3(t: &mut Runner) {
     phase3_scripts(t);
     phase3_procdirs(t);
     phase3_launch(t);
+    phase3_manifest_launch(t);
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
@@ -3176,6 +3177,73 @@ fn phase3_launch(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  launchprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-S2 (ADR 0040): keel-launch from a manifest, as a normal boot would
+/// run it: `/sbin/keel-init --launch MANIFEST`, keel-init given the root
+/// factory on fd 3, derives a restricted one for keel-launch. The
+/// manifest runs launchprobe's `manifest` mode in a compartment rooted
+/// at `/launch-test/app`, with /dev/null granted and an environment; its
+/// exit code (43) comes back through keel-launch and keel-init. A
+/// manifest asking for the network is refused before anything is made
+/// (status 2), and keel-launch with no factory cannot create anything
+/// (status 2). Every node, frame and process comes back.
+fn phase3_manifest_launch(t: &mut Runner) {
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{fs, process};
+    const INIT: &[u8] = b"/sbin/keel-init";
+    const GOOD: &[u8] = b"# launch.manifest\nname = \"probe\"\nexec = \"/prog\"\nargs = [\"child\", \"manifest\"]\nenv = [\"GREETING=hello\"]\ndevices = [\"null\"]\n\n[root]\nbase = \"/launch-test/app\"\n\n[limits]\nprocesses = 4\nmemory_mb = 64\n";
+    const BAD: &[u8] = b"name = \"probe\"\nexec = \"/prog\"\n[root]\nbase = \"/launch-test/app\"\n[network]\nallowed = true\n";
+    let made = fs::with(|f| {
+        let top = f.create_dir(ROOT, b"launch-test", 0o755)?;
+        let app = f.create_dir(top, b"app", 0o755)?;
+        f.create_dir(app, b"dev", 0o755)?;
+        let probe = f.lookup(ROOT, ROOT, b"/test/launchprobe")?;
+        f.link(probe, app, b"prog")?;
+        for (name, text) in [(&b"good.toml"[..], GOOD), (b"bad.toml", BAD)] {
+            let ino = f.create_file(top, name, 0o644)?;
+            f.write(ino, 0, text)?;
+        }
+        Ok(())
+    });
+    let run = |args: &[&[u8]], factory: bool| {
+        let file = fs::read_file(args[0]).ok()?;
+        let loaded = keel_linux_abi::exec::load(&file, args[0], args, &[]).ok()?;
+        let spawned = if factory {
+            process::spawn_with_fd3("launch", &loaded, keel_linux_abi::native::root_factory())
+        } else {
+            process::spawn("launch", &loaded)
+        }
+        .ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    };
+    let outside_heap = frames_outside_heap;
+    let warm = run(&[INIT, b"--launch", b"/launch-test/good.toml"], true);
+    sched::sleep_ms(50);
+    let (frames, processes) = (outside_heap(), process::count());
+    let good = run(&[INIT, b"--launch", b"/launch-test/good.toml"], true);
+    let bad = run(&[INIT, b"--launch", b"/launch-test/bad.toml"], true);
+    let unarmed = run(&[b"/sbin/keel-launch", b"/launch-test/good.toml"], false);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = made.is_ok()
+        && warm == Some((43, None))
+        && good == Some((43, None))
+        && bad == Some((2, None))
+        && unarmed == Some((2, None))
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "launch.manifest",
+        ok,
+        "keel-init --launch runs keel-launch with a restricted factory; it reads the manifest and runs its program as PID 1 of a compartment rooted in its base, with its devices, arguments and environment, and passes its exit code back; a manifest asking for the network is refused before anything is made; without a factory keel-launch can make nothing; every frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  launch: made {made:?}; warm {warm:?}, good {good:?}, bad {bad:?}, without a factory {unarmed:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

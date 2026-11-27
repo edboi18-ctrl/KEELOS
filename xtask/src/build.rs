@@ -677,6 +677,7 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
 pub const SYSTEM_PROGRAMS: &[(&str, &str)] = &[
     ("sbin/keel-init", "keel-init"),
     ("bin/keel-shell", "keel-shell"),
+    ("sbin/keel-launch", "keel-launch"),
 ];
 
 /// Compiles the system programs as the user tests are (static, non-PIE,

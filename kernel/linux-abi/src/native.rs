@@ -183,7 +183,8 @@ fn compartment_create(p: &ProcessRef, fd: i32, root: i32, limits: u64) -> SysRes
 }
 
 /// `compartment_grant_device(c, device)`: `/dev/<name>` in the
-/// compartment's tree. `/dev` must exist (ENOENT); ptmx also makes
+/// compartment's tree; already that device, nothing changes; something
+/// else there, EEXIST. `/dev` must exist (ENOENT); ptmx also makes
 /// `/dev/pts` if it is not there. Needs GRANT.
 fn grant_device(p: &ProcessRef, fd: i32, code: u64) -> SysResult {
     let c = compartment(p, fd, Rights::GRANT)?;
@@ -201,7 +202,19 @@ fn grant_device(p: &ProcessRef, fd: i32, code: u64) -> SysResult {
         if fs.kind(dev)? != Kind::Directory {
             return Err(Errno::ENOTDIR);
         }
-        fs.create_device(dev, name, device)?;
+        // Granting a device that is already there is no change: a node of
+        // that device can only have come from an earlier grant, since a
+        // compartment cannot make device nodes (ADR 0035), and the tree
+        // outlives the compartment, so an application launched again
+        // finds its grants. Anything else under the name is EEXIST.
+        match fs.lookup(root, dev, name) {
+            Ok(ino) if fs.kind(ino)? == Kind::Device(device) => {}
+            Ok(_) => return Err(Errno::EEXIST),
+            Err(Errno::ENOENT) => {
+                fs.create_device(dev, name, device)?;
+            }
+            Err(e) => return Err(e),
+        }
         if device == Device::Ptmx {
             match fs.create_dir(dev, b"pts", 0o755) {
                 Ok(_) | Err(Errno::EEXIST) => {}

@@ -8,6 +8,13 @@
 //! another, after a second if the last one lasted less than that, so a
 //! shell that cannot start does not make it spin.
 //!
+//! `keel-init --launch MANIFEST` instead runs `/sbin/keel-launch
+//! MANIFEST` and exits with its status (P3-S2, ADR 0040). The kernel gives
+//! keel-init the compartment factory on fd 3, close-on-exec; keel-launch
+//! gets a factory derived from it with [`LAUNCH_CEILING`], restricted to
+//! CREATE and STAT so it cannot be copied on, as its fd 3. Nothing else
+//! keel-init runs has one.
+//!
 //! `keel-init --once` runs one shell and exits with its status (the
 //! shell's exit code, or 128 plus the signal that ended it), for the
 //! kernel's self-tests. `--shell PATH [ARG ...]`, last, runs PATH with
@@ -87,6 +94,71 @@ impl Shell {
     fn path(&self) -> &[u8] {
         let (start, len) = self.spans[0];
         &self.buf[start..start + len]
+    }
+}
+
+/// The most a compartment keel-launch makes may have (ADR 0040).
+const LAUNCH_CEILING: sys::Limits = sys::Limits {
+    processes: 256,
+    memory_bytes: 1 << 30,
+    tmpfs_bytes: 256 << 20,
+    tmpfs_nodes: 65536,
+};
+/// Rights (keel_core::handle::Rights): STAT and CREATE.
+const STAT_AND_CREATE: u64 = (1 << 4) | (1 << 6);
+
+/// `--launch MANIFEST`: keel-launch with a restricted factory on fd 3;
+/// its status as a shell reports it.
+fn launch(manifest: &[u8]) -> i32 {
+    let mut path = [0u8; 512];
+    if manifest.len() >= path.len() || manifest.contains(&0) {
+        say(&[b"manifest path too long\n"]);
+        return 2;
+    }
+    path[..manifest.len()].copy_from_slice(manifest);
+    let pid = sys::fork();
+    if pid == 0 {
+        // The derived factory, then this process's own (fd 3) closed, so
+        // the restricted copy takes the lowest free descriptor: 3.
+        let derived = sys::factory_derive(3, &LAUNCH_CEILING.bytes());
+        if derived < 0 {
+            let mut d = [0u8; 20];
+            say(&[
+                b"no factory to give: error ",
+                decimal(derived, &mut d),
+                b"\n",
+            ]);
+            keel_rt::exit(2);
+        }
+        sys::close(3);
+        let restricted = sys::native_restrict(derived as i32, STAT_AND_CREATE);
+        sys::close(derived as i32);
+        if restricted != 3 {
+            say(&[b"could not place the factory on fd 3\n"]);
+            keel_rt::exit(2);
+        }
+        let arg = CStr::from_bytes_until_nul(&path[..=manifest.len()]).unwrap_or(c"");
+        let e = sys::execve(c"/sbin/keel-launch", Some(&[c"keel-launch", arg]), &ENV);
+        let mut d = [0u8; 20];
+        say(&[
+            b"cannot run /sbin/keel-launch: error ",
+            decimal(e, &mut d),
+            b"\n",
+        ]);
+        keel_rt::exit(127);
+    }
+    if pid < 0 {
+        return 2;
+    }
+    loop {
+        let mut raw = 0;
+        let got = sys::wait4(pid as i32, &mut raw, 0);
+        if got == pid {
+            return shell_status(raw);
+        }
+        if got != EINTR {
+            return 2;
+        }
     }
 }
 
@@ -187,13 +259,23 @@ fn start_shell(shell: &Shell) -> i64 {
 }
 
 fn main(startup: &Startup) -> i32 {
+    let mut args = startup.args().skip(1);
+    if args.next() == Some(b"--launch") {
+        return match (args.next(), args.next()) {
+            (Some(manifest), None) => launch(manifest),
+            _ => {
+                say(&[b"usage: keel-init --launch MANIFEST\n"]);
+                2
+            }
+        };
+    }
     let once = startup
         .args()
         .skip(1)
         .take_while(|a| *a != b"--shell")
         .any(|a| a == b"--once");
     let Some(command) = Shell::from_args(startup) else {
-        say(&[b"usage: keel-init [--once] [--shell PATH [ARG ...]]\n"]);
+        say(&[b"usage: keel-init [--once] [--shell PATH [ARG ...]] | --launch MANIFEST\n"]);
         return 2;
     };
     loop {

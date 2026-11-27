@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+keel-manifest = { path = "../user/manifest" }
 sha2 = "0.11.1"
 blake2 = "0.11.0"
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }

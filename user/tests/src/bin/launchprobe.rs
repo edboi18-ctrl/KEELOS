@@ -107,6 +107,28 @@ fn child(mode: &[u8]) -> i32 {
             sys::write(1, b"child: confined\n");
             42
         }
+        // Started by keel-launch from a manifest (`launch.manifest`): PID
+        // 1, keel-launch's stdio, no factory, /dev/null granted and
+        // /dev/zero not, the manifest's environment, nothing outside.
+        b"manifest" => {
+            let mut st = [0u8; 144];
+            if sys::getpid() != 1
+                || sys::fstat(1, &mut st) != 0
+                || sys::fstat(FACTORY, &mut st) != EBADF
+            {
+                return 61;
+            }
+            if sys::open(c"/dev/null", sys::O_RDWR, 0) < 0
+                || sys::open(c"/dev/zero", sys::O_RDONLY, 0) != ENOENT
+                || sys::open(c"/test/launchprobe", sys::O_RDONLY, 0) != ENOENT
+            {
+                return 62;
+            }
+            if !ENV_SEEN.load(core::sync::atomic::Ordering::Relaxed) {
+                return 63;
+            }
+            43
+        }
         // Waits to be killed.
         b"sleep" => loop {
             let ts = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -208,11 +230,22 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
         return 4;
     }
     let c = c as i32;
-    // 5. grant_device: /dev/null appears; twice EEXIST; unknown EINVAL.
+    // 5. grant_device: /dev/null appears; granted again, nothing changes;
+    //    a file where a device would go EEXIST; unknown EINVAL.
     let mut st = [0u8; 144];
+    let zero = sys::open(
+        path(&root_dir, b"/dev/zero").c(),
+        sys::O_WRONLY | sys::O_CREAT,
+        0o644,
+    );
+    if zero < 0 {
+        return 5;
+    }
+    sys::close(zero as i32);
     if sys::compartment_grant_device(c, 1) != 0
         || sys::stat(path(&root_dir, b"/dev/null").c(), &mut st) != 0
-        || sys::compartment_grant_device(c, 1) != EEXIST
+        || sys::compartment_grant_device(c, 1) != 0
+        || sys::compartment_grant_device(c, 2) != EEXIST
         || sys::compartment_grant_device(c, 9) != EINVAL
     {
         return 5;
@@ -325,7 +358,14 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
     0
 }
 
+/// Whether GREETING=hello was in the environment (the manifest mode).
+static ENV_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn main(startup: &Startup) -> i32 {
+    ENV_SEEN.store(
+        startup.env().any(|e| e == b"GREETING=hello"),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let mut args = startup.args();
     let _ = args.next();
     if args.next() == Some(b"child") {
@@ -343,6 +383,7 @@ fn main(startup: &Startup) -> i32 {
         sys::unlink(path(&d, b"/prog").c());
         if dev {
             sys::unlink(path(&d, b"/dev/null").c());
+            sys::unlink(path(&d, b"/dev/zero").c());
             sys::rmdir(path(&d, b"/dev").c());
         }
         sys::rmdir(path(&d, b"").c());

@@ -57,7 +57,7 @@ field must be 0 (EINVAL otherwise, SR-10).
 | +0 | `restrict(fd, rights)` | A new descriptor for the same object with `rights & mask`. SR-1: duplicating may remove rights, never add. Any handle with DUPLICATE. |
 | +1 | `factory_derive(factory, limits*)` | A new factory whose ceiling is `limits`, which must fit beneath the old one's (EPERM). Needs CREATE. |
 | +2 | `compartment_create(factory, rootfd, limits*)` | A new, empty compartment whose root is the directory `rootfd` names, with `limits` (EPERM above the factory's ceiling, EINVAL for a zero process limit). Needs CREATE on the factory, and ENUMERATE on `rootfd`, a directory (ENOTDIR). |
-| +3 | `compartment_grant_device(c, device)` | Makes `/dev/<name>` in the compartment's tree. The devices: null 1, zero 2, urandom 3, tty 4, ptmx 5 (with `/dev/pts`). `/dev` must exist (ENOENT). An existing name is EEXIST, an unknown device EINVAL. Needs GRANT. |
+| +3 | `compartment_grant_device(c, device)` | Makes `/dev/<name>` in the compartment's tree. The devices: null 1, zero 2, urandom 3, tty 4, ptmx 5 (with `/dev/pts`). `/dev` must exist (ENOENT). If the name is already that device, nothing changes: the tree outlives the compartment, so an application launched again finds its grants, and only a grant can have made such a node (a compartment cannot make devices, ADR 0035). Anything else there is EEXIST, an unknown device EINVAL. Needs GRANT. |
 | +4 | `compartment_spawn(c, path*, argv**, envp**, stdio*)` | Starts the program at `path`, looked up beneath the compartment's root, as a process in it, the first one PID 1. It gets fds 0 to 2 from `stdio` (three of the caller's descriptors, each needing DUPLICATE; -1 leaves it closed) and nothing else. A factory or compartment handle may not be given (EPERM). Returns the PID. Needs CREATE. |
 | +5 | `compartment_kill(c, signal)` | Sends `signal` to every process in the compartment. Needs SIGNAL. |
 | +6 | `compartment_wait(c, usage*, flags)` | Fills `usage`: processes, memory bytes, tmpfs bytes and nodes, and PID 1's wait status (-1 while it runs). Without WNOHANG (1), it first waits until the compartment has no process left; a signal interrupts it (ERESTARTSYS). WNOHANG needs STAT, waiting needs WAIT. |
@@ -94,10 +94,20 @@ with the manifest's arguments and environment and keel-launch's own fds
 0 to 2, and waits. It exits with PID 1's exit code, or 128 plus the
 signal that ended it.
 
-The format is the spec's: a TOML subset. Comments (`#`), `key = value`,
-tables (`[root]`), and array tables (`[[grant]]`). Values are strings
-(`"..."` with `\\`, `\"` and `\n`), decimal integers, `true`/`false` and
-arrays of strings.
+The format is the spec's: a subset of TOML 1.0.0, whose every accepted
+manifest is valid TOML meaning the same.
+- **Kept:**
+  - comments (`#`) and `key = value` lines with bare keys;
+  - tables (`[root]`, each once) and array tables (`[[grant]]`);
+  - basic strings with the escapes `\\`, `\"`, `\n` and `\t`;
+  - decimal integers up to 2^63 - 1, without sign or leading zeros;
+  - `true` and `false`;
+  - arrays of strings on one line.
+- **Refused though valid TOML:** the other escapes, literal and
+  multi-line strings, other numbers and dates, arrays over several lines
+  or with a trailing comma, inline tables, and quoted or dotted keys.
+- **Control characters** other than tab are refused anywhere, as TOML
+  refuses them.
 
 | Key | Meaning | Now |
 | --- | --- | --- |
@@ -152,8 +162,9 @@ spec section 3, "Parser fuzzing on the host").
   4. compartment_create: above the ceiling EPERM, a file as root
      ENOTDIR (before the right is checked), a root without ENUMERATE
      EBADF;
-  5. grant_device: the node appears, twice EEXIST, unknown EINVAL, and
-     no `/dev` ENOENT;
+  5. grant_device: the node appears, granted again nothing changes, a
+     file where it would go EEXIST, unknown EINVAL, and no `/dev`
+     ENOENT;
   6. spawn: a missing program ENOENT, a factory as stdio EPERM, the
      first process PID 1;
   7. inside, PID 1 has only the stdio it was given, no factory, sees
@@ -176,3 +187,32 @@ spec section 3, "Parser fuzzing on the host").
   - **ending:** PID 1's status not kept (7); kill doing nothing (the
     probe never ends); wait not waiting (7);
   - **checks:** reserved bytes not checked (3).
+- **`launch.manifest` (phase 3):** the kernel runs `/sbin/keel-init
+  --launch /launch-test/good.toml` with the root factory on fd 3.
+  - **The good manifest:** launchprobe's `manifest` mode, with an
+    argument list, an environment, `/dev/null` granted and four
+    processes allowed. As PID 1 it checks that it has keel-launch's stdio
+    and no factory, `/dev/null` and not `/dev/zero`, the manifest's
+    environment, and nothing outside its tree. Its exit code (43) comes
+    back through keel-launch and keel-init, twice, with every frame and
+    process back.
+  - **A manifest asking for the network** is refused at its line 6
+    before anything is made (status 2).
+  - **keel-launch without a factory** can make nothing (EBADF, status 2).
+- **The parser:** 6 unit tests cover a full manifest, the minimum and
+  its defaults, and 30 refusals each with its line, including control
+  characters, an integer past 2^63 - 1, and comments inside strings.
+  `cargo xtask fuzz-manifest --minutes 30 --seed 20261127`:
+  43,480,000 mutated manifests, 954,418 accepted, no panic, and every
+  accepted one valid by the parser's own rules.
+- **Mutations for keel-launch and the parser,** 6, all caught:
+  - a repeated grant EEXIST again (the second launch fails);
+  - keel-launch not granting the devices (the program sees no
+    `/dev/null`), dropping the environment, or ignoring the limits (the
+    factory refuses: EPERM);
+  - keel-launch not waiting (no status to give back);
+  - the parser allowing `network = true` (the bad manifest runs).
+- **Not tested:** that keel-init restricts the factory it gives
+  keel-launch. A process cannot read another's rights, and keel-launch
+  itself never copies or hands on its factory (spawn refuses one as
+  stdio). It is checked by reading `launch` in keel-init.
