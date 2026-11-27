@@ -457,6 +457,24 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
     {
         return 10;
     }
+    // 11. restrict on a file (ADR 0044's one check Linux has no simple
+    //     test for: Keel cannot reopen /proc/self/fd/N read-only): without
+    //     WRITE, F_ADD_SEALS on a sealable memfd is EPERM; the original
+    //     descriptor, with WRITE, adds the seal.
+    const READ: u64 = 1;
+    const F_ADD_SEALS: u32 = 1033;
+    const F_SEAL_SHRINK: u64 = 2;
+    let memfd = sys::memfd_create(c"sealable", 2);
+    let read_only = sys::native_restrict(memfd as i32, READ | STAT | DUPLICATE);
+    if memfd < 0
+        || read_only < 0
+        || sys::fcntl(read_only as i32, F_ADD_SEALS, F_SEAL_SHRINK) != EPERM
+        || sys::fcntl(memfd as i32, F_ADD_SEALS, F_SEAL_SHRINK) != 0
+    {
+        return 11;
+    }
+    sys::close(read_only as i32);
+    sys::close(memfd as i32);
     0
 }
 
@@ -492,7 +510,7 @@ fn main(startup: &Startup) -> i32 {
     }
     sys::rmdir(base.c());
     if result == 0 {
-        sys::write(1, b"launchprobe: 10 checks passed\n");
+        sys::write(1, b"launchprobe: 11 checks passed\n");
     }
     result
 }

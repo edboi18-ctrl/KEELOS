@@ -348,6 +348,15 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: false,
     },
+    // P3-S7 (ADR 0044): memfd sealing, as Linux.
+    TestProgram {
+        path: "test/sealprobe",
+        binary: "sealprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: true,
+    },
     // P3-S4 (ADR 0042): one compartment under load, another responsive.
     TestProgram {
         path: "test/loadprobe",

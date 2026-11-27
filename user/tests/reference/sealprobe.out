@@ -1,0 +1,32 @@
+exit 0
+ok a memfd without MFD_ALLOW_SEALING has F_SEAL_SEAL
+ok so a seal cannot be added
+ok nor no seal
+ok with MFD_ALLOW_SEALING, no seals
+ok adding no seal
+ok an undefined bit is EINVAL
+ok the seals unchanged
+ok room for 8192 bytes
+ok F_SEAL_SHRINK
+ok truncating down is EPERM
+ok to the same size is fine
+ok growing is fine
+ok F_SEAL_GROW and F_SEAL_SEAL
+ok the seals add up
+ok growing is EPERM
+ok no more seals
+ok F_SEAL_GROW on 6000 bytes
+ok a write inside the file
+ok a write across the end stops at the page boundary
+ok from 0, it stops at 4096
+ok one with no boundary past its start is EPERM
+ok at the end, EPERM
+ok writing nothing past the end
+ok O_APPEND
+ok an appending write is EPERM
+ok the size still 6000
+ok a pipe has no seals
+ok nor can its write end take one
+ok nor a directory
+ok a read-only descriptor cannot add a seal
+sealprobe: 30 checks passed

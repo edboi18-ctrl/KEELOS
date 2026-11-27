@@ -230,3 +230,8 @@ bench = false
 name = "loadprobe"
 test = false
 bench = false
+
+[[bin]]
+name = "sealprobe"
+test = false
+bench = false

@@ -157,7 +157,28 @@ struct Node {
     atime: Timespec,
     mtime: Timespec,
     ctime: Timespec,
+    /// A file's seals (`fcntl(2)` F_ADD_SEALS, ADR 0044). Every node
+    /// starts with F_SEAL_SEAL, as every tmpfs inode does on Linux
+    /// (`shmem_get_inode`); only a memfd made with MFD_ALLOW_SEALING
+    /// starts with none.
+    seals: u32,
 }
+
+/// `include/uapi/linux/fcntl.h`: no more seals may be added.
+pub const F_SEAL_SEAL: u32 = 0x1;
+/// The file may not shrink.
+pub const F_SEAL_SHRINK: u32 = 0x2;
+/// The file may not grow.
+pub const F_SEAL_GROW: u32 = 0x4;
+/// Every seal Linux v6.12 defines (`mm/memfd.c` F_ALL_SEALS): also
+/// F_SEAL_WRITE (0x8), F_SEAL_FUTURE_WRITE (0x10) and F_SEAL_EXEC (0x20).
+const LINUX_SEALS: u32 = 0x3f;
+/// The seals Keel implements (P3-S7). The others are refused (EINVAL)
+/// rather than accepted and not enforced (SR-10).
+const KEEL_SEALS: u32 = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW;
+
+/// The page size Linux's writes are split at, for F_SEAL_GROW.
+const SEAL_PAGE: usize = 4096;
 
 /// What a node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,6 +363,7 @@ impl Node {
             atime: now,
             mtime: now,
             ctime: now,
+            seals: F_SEAL_SEAL,
         }
     }
 }
@@ -1194,7 +1216,29 @@ impl Fs {
         quota: Option<&Arc<Quota>>,
     ) -> Result<usize, Errno> {
         let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-        let end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
+        // Writing nothing changes nothing, not even the size
+        // (`generic_perform_write` copies no piece).
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let mut end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
+        // F_SEAL_GROW (ADR 0044). Linux writes a file a page at a time
+        // (`generic_perform_write`), and `shmem_write_begin` refuses each
+        // page-sized piece that would end past the size with EPERM. So a
+        // write that crosses the end stops at the last page boundary at
+        // or below the size, and is EPERM if that is not past its start.
+        if let Ok(node) = self.node(ino)
+            && node.seals & F_SEAL_GROW != 0
+            && let Contents::File(file) = &node.contents
+            && end > file.len()
+        {
+            let boundary = file.len() & !(SEAL_PAGE - 1);
+            if boundary <= start {
+                return Err(Errno::EPERM);
+            }
+            end = boundary;
+        }
+        let data = &data[..end - start];
         self.resize(ino, end, quota, |file| {
             file[start..end].copy_from_slice(data);
         })?;
@@ -1249,6 +1293,13 @@ impl Fs {
         };
         let old = file.len();
         let new = if grow_only { old.max(len) } else { len };
+        // `shmem_setattr`: a truncate the seals forbid is EPERM.
+        if !grow_only
+            && ((new < old && node.seals & F_SEAL_SHRINK != 0)
+                || (new > old && node.seals & F_SEAL_GROW != 0))
+        {
+            return Err(Errno::EPERM);
+        }
         let growth = new.saturating_sub(old);
         if bytes_used
             .checked_add(growth)
@@ -1289,6 +1340,51 @@ impl Fs {
             payer.bytes.uncharge(given_back);
         }
         self.bytes_used = bytes_used - old + new;
+        Ok(())
+    }
+
+    /// A file's seals (F_GET_SEALS). EINVAL for anything but a file, as
+    /// Linux answers for a file that is not tmpfs (`memfd_get_seals`).
+    pub fn seals(&self, ino: Ino) -> Result<u32, Errno> {
+        let node = self.node(ino)?;
+        match node.contents {
+            Contents::File(_) => Ok(node.seals),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// Adds `seals` to a file (F_ADD_SEALS), in `memfd_add_seals`'s
+    /// order: bits Linux does not define EINVAL; anything but a file
+    /// EINVAL; F_SEAL_SEAL already set EPERM. The caller checks first that
+    /// the descriptor is open for writing (EPERM). Seals Linux defines and
+    /// Keel does not implement (F_SEAL_WRITE, F_SEAL_FUTURE_WRITE,
+    /// F_SEAL_EXEC) are EINVAL too: refused, not accepted unenforced.
+    pub fn add_seals(&mut self, ino: Ino, seals: u32) -> Result<(), Errno> {
+        if seals & !LINUX_SEALS != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let node = self.node_mut(ino)?;
+        if !matches!(node.contents, Contents::File(_)) {
+            return Err(Errno::EINVAL);
+        }
+        if node.seals & F_SEAL_SEAL != 0 {
+            return Err(Errno::EPERM);
+        }
+        if seals & !KEEL_SEALS != 0 {
+            return Err(Errno::EINVAL);
+        }
+        node.seals |= seals;
+        Ok(())
+    }
+
+    /// Makes a file sealable (memfd_create with MFD_ALLOW_SEALING): no
+    /// seals at all, not even F_SEAL_SEAL.
+    pub fn allow_sealing(&mut self, ino: Ino) -> Result<(), Errno> {
+        let node = self.node_mut(ino)?;
+        if !matches!(node.contents, Contents::File(_)) {
+            return Err(Errno::EINVAL);
+        }
+        node.seals = 0;
         Ok(())
     }
 
@@ -1425,6 +1521,80 @@ mod tests {
         let dev = fs.create_dir(ROOT, b"dev", 0o755).unwrap();
         fs.create_device(dev, b"null", Device::Null).unwrap();
         fs
+    }
+
+    /// A sealable file of `size` bytes, sealed with `seals` (ADR 0044).
+    fn sealed(size: u64, seals: u32) -> (Fs, Ino) {
+        let mut fs = Fs::new(1 << 20);
+        let f = fs.create_file(ROOT, b"m", 0o644).unwrap();
+        fs.allow_sealing(f).unwrap();
+        fs.set_len(f, size).unwrap();
+        fs.add_seals(f, seals).unwrap();
+        (fs, f)
+    }
+
+    fn size(fs: &Fs, f: Ino) -> u64 {
+        fs.stat(f).unwrap().size
+    }
+
+    #[test]
+    fn seals_are_linux_s() {
+        // Every file starts with F_SEAL_SEAL; a sealable one with none.
+        let mut fs = Fs::new(1 << 20);
+        let plain = fs.create_file(ROOT, b"p", 0o644).unwrap();
+        assert_eq!(fs.seals(plain), Ok(F_SEAL_SEAL));
+        assert_eq!(fs.add_seals(plain, F_SEAL_SHRINK), Err(Errno::EPERM));
+        assert_eq!(fs.add_seals(plain, 0), Err(Errno::EPERM));
+        fs.allow_sealing(plain).unwrap();
+        assert_eq!(fs.seals(plain), Ok(0));
+        assert_eq!(fs.add_seals(plain, 0), Ok(()));
+        // Unknown bits, then seals Keel does not implement: EINVAL.
+        assert_eq!(fs.add_seals(plain, 0x40), Err(Errno::EINVAL));
+        for unimplemented in [0x8, 0x10, 0x20] {
+            assert_eq!(fs.add_seals(plain, unimplemented), Err(Errno::EINVAL));
+        }
+        assert_eq!(fs.seals(plain), Ok(0));
+        // Seals add up; F_SEAL_SEAL ends adding.
+        fs.add_seals(plain, F_SEAL_SHRINK).unwrap();
+        fs.add_seals(plain, F_SEAL_GROW | F_SEAL_SEAL).unwrap();
+        assert_eq!(
+            fs.seals(plain),
+            Ok(F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL)
+        );
+        assert_eq!(fs.add_seals(plain, 0), Err(Errno::EPERM));
+        // Only files have seals.
+        assert_eq!(fs.seals(ROOT), Err(Errno::EINVAL));
+        assert_eq!(fs.add_seals(ROOT, 0), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn shrink_and_grow_seals_refuse_truncation() {
+        let (mut fs, f) = sealed(8192, F_SEAL_SHRINK);
+        assert_eq!(fs.set_len(f, 4096), Err(Errno::EPERM));
+        assert_eq!(fs.set_len(f, 8192), Ok(()));
+        assert_eq!(fs.set_len(f, 16384), Ok(()));
+        let (mut fs, f) = sealed(8192, F_SEAL_GROW);
+        assert_eq!(fs.set_len(f, 8193), Err(Errno::EPERM));
+        assert_eq!(fs.set_len(f, 4096), Ok(()));
+        assert_eq!(size(&fs, f), 4096);
+    }
+
+    #[test]
+    fn a_grow_seal_stops_a_write_at_the_last_page_boundary() {
+        // As measured on Linux 6.18 (a 6000-byte memfd with F_SEAL_GROW).
+        let (mut fs, f) = sealed(6000, F_SEAL_GROW);
+        let data = [7u8; 8000];
+        assert_eq!(fs.write(f, 3000, &data[..2000]), Ok(2000));
+        assert_eq!(fs.write(f, 3000, &data[..4000]), Ok(1096));
+        assert_eq!(fs.write(f, 5000, &data[..2000]), Err(Errno::EPERM));
+        assert_eq!(fs.write(f, 6000, &data[..10]), Err(Errno::EPERM));
+        assert_eq!(fs.write(f, 0, &data), Ok(4096));
+        assert_eq!(fs.write(f, 9000, &[]), Ok(0));
+        assert_eq!(size(&fs, f), 6000);
+        // 100 bytes: no page boundary past 95, so EPERM.
+        let (mut fs, f) = sealed(100, F_SEAL_GROW);
+        assert_eq!(fs.write(f, 95, &data[..10]), Err(Errno::EPERM));
+        assert_eq!(fs.write(f, 90, &data[..10]), Ok(10));
     }
 
     #[test]

@@ -322,17 +322,20 @@ pub fn eventfd2(p: &ProcessRef, initval: u32, flags: u64) -> SysResult {
 /// reading and writing, in no directory: it lives while a descriptor or a
 /// mapping holds it, and grows, shrinks and maps as any tmpfs file,
 /// charged to the caller's compartment.
-/// - flags other than MFD_CLOEXEC (1) and MFD_EXEC (0x10) EINVAL: sealing
-///   (MFD_ALLOW_SEALING 2, MFD_NOEXEC_SEAL 8) and huge pages (MFD_HUGETLB
-///   4) are not supported (ADR 0025); MFD_EXEC with MFD_NOEXEC_SEAL is
-///   EINVAL on Linux too;
+/// - MFD_ALLOW_SEALING (2) makes it sealable: it starts with no seals,
+///   where every other file has F_SEAL_SEAL (ADR 0044);
+/// - other flags than those, MFD_CLOEXEC (1) and MFD_EXEC (0x10) EINVAL:
+///   MFD_NOEXEC_SEAL (8) needs F_SEAL_EXEC, which Keel does not
+///   implement, and huge pages (MFD_HUGETLB 4) are not supported (ADR
+///   0025); MFD_EXEC with MFD_NOEXEC_SEAL is EINVAL on Linux too;
 /// - a name longer than 249 bytes (NAME_MAX less "memfd:") EINVAL; an
 ///   unreadable one EFAULT.
 pub fn memfd_create(p: &ProcessRef, name: u64, flags: u64) -> SysResult {
     const MFD_CLOEXEC: u64 = 1;
+    const MFD_ALLOW_SEALING: u64 = 2;
     const MFD_EXEC: u64 = 0x10;
     const MFD_NAME_MAX_LEN: usize = 255 - 6;
-    if flags & !(MFD_CLOEXEC | MFD_EXEC) != 0 {
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC) != 0 {
         return Err(Errno::EINVAL);
     }
     // strnlen_user(uname, MFD_NAME_MAX_LEN + 1): EINVAL past the limit.
@@ -343,7 +346,13 @@ pub fn memfd_create(p: &ProcessRef, name: u64, flags: u64) -> SysResult {
             e
         }
     })?;
-    let node = crate::fs::with(|fs| fs.create_detached(Vec::new(), 0o777))?;
+    let node = crate::fs::with(|fs| {
+        let node = fs.create_detached(Vec::new(), 0o777)?;
+        if flags & MFD_ALLOW_SEALING != 0 {
+            fs.allow_sealing(node)?;
+        }
+        Ok(node)
+    })?;
     let open = crate::process::OpenFile {
         node,
         kind: keel_core::vfs::Kind::File,

@@ -1909,6 +1909,7 @@ fn phase3(t: &mut Runner) {
     phase3_profiles(t);
     phase3_under_load(t);
     phase3_tracing(t);
+    phase3_seals(t);
 
     // P3-S4: a compartment's process limit. One slot: a second process
     // is refused with EAGAIN while the first lives, and admitted after.
@@ -2337,6 +2338,35 @@ fn phase3_tracing(t: &mut Runner) {
     );
     if !ok {
         kprintln!("  tracing: PID 1 {traced:?}, PID 99 {filtered:?}");
+    }
+}
+
+/// P3-S7 (ADR 0044): memfd sealing as on Linux (`user/tests/sealprobe`,
+/// which passes under Linux too): F_ADD_SEALS and F_GET_SEALS, and
+/// F_SEAL_SHRINK, F_SEAL_GROW and F_SEAL_SEAL enforced on truncation and
+/// writes. Every node, frame and process back.
+fn phase3_seals(t: &mut Runner) {
+    use keel_linux_abi::{fs, process};
+    const PROGRAM: &[u8] = b"/test/sealprobe";
+    let nodes = || fs::with(|f| Ok(f.node_count())).unwrap_or(0);
+    let (frames, processes, nodes_before) = (frames_outside_heap(), process::count(), nodes());
+    let status = run_test_program(PROGRAM, &[PROGRAM]);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after, nodes_after) =
+        (frames_outside_heap(), process::count(), nodes());
+    let ok = status == Some((0, None))
+        && nodes_after == nodes_before
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "exec.seals",
+        ok,
+        "memfd sealing as on Linux: MFD_ALLOW_SEALING, F_ADD_SEALS and F_GET_SEALS with their refusals, F_SEAL_SHRINK and F_SEAL_GROW on truncation, writes cut at the page boundary under F_SEAL_GROW, F_SEAL_SEAL; every node, frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  sealprobe: {status:?}; nodes {nodes_before} -> {nodes_after}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
     }
 }
 

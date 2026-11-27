@@ -91,9 +91,9 @@ wait.
    with O_LARGEFILE. It lives while a descriptor or a mapping pins it, and
    reads, writes, grows, shrinks and maps as any tmpfs file, charged to
    the caller's compartment.
-   - **Flags:** MFD_CLOEXEC and MFD_EXEC. Sealing (MFD_ALLOW_SEALING,
-     MFD_NOEXEC_SEAL) and huge pages (MFD_HUGETLB) are EINVAL: not
-     supported. MFD_EXEC with MFD_NOEXEC_SEAL is EINVAL on Linux too.
+   - **Flags:** MFD_CLOEXEC and MFD_EXEC, and since ADR 0044
+     MFD_ALLOW_SEALING. MFD_NOEXEC_SEAL and huge pages (MFD_HUGETLB) are
+     EINVAL: not supported. MFD_EXEC with MFD_NOEXEC_SEAL is EINVAL on Linux too.
    - **The name** may be at most 249 bytes (NAME_MAX less "memfd:"),
      else EINVAL; an unreadable one EFAULT.
 5. **poll, ppoll, select and pselect6** (`fs/select.c`) share one wait:
@@ -168,9 +168,10 @@ wait.
 - **Pipe and eventfd times.** stat reports the current time for all
   three; Linux keeps the pipe's creation and last read and write times,
   and the boot time for the anonymous inode. Pipes are owned by uid 0.
-- **memfd:** sealing (F_ADD_SEALS, F_GET_SEALS, MFD_ALLOW_SEALING,
-  MFD_NOEXEC_SEAL), huge pages, and the `memfd:` name in `/proc/self/fd`
-  (which Keel does not have).
+- **memfd:** MFD_NOEXEC_SEAL and the write and exec seals, huge pages,
+  and the `memfd:` name in `/proc/self/fd` (which Keel does not have).
+  MFD_ALLOW_SEALING, F_ADD_SEALS, F_GET_SEALS and the shrink, grow and
+  seal seals came with ADR 0044.
 - **select's table size** follows the highest descriptor open now; Linux's
   table never shrinks, so Linux keeps the size for the highest ever open.
 - **Record locks on pipes** are EINVAL; Linux allows them (on the pipe's

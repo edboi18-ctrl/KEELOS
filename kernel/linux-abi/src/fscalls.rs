@@ -866,6 +866,38 @@ const O_DIRECT: u64 = 0o40000;
 const O_NOATIME: u64 = 0o1000000;
 const SETFL_MASK: u64 = crate::abi::O_APPEND | crate::abi::O_NONBLOCK | O_DIRECT | O_NOATIME;
 
+/// F_ADD_SEALS and F_GET_SEALS, for memfd sealing (P3-S7, ADR 0044):
+/// F_LINUX_SPECIFIC_BASE (1024) plus 9 and 10, in
+/// `include/uapi/linux/fcntl.h`.
+const F_ADD_SEALS: u32 = 1033;
+const F_GET_SEALS: u32 = 1034;
+
+/// `memfd_fcntl` (`mm/memfd.c`): the seals of the file `fd` names, or
+/// `seals` added to them. Adding needs a descriptor open for writing
+/// (EPERM, `memfd_add_seals`' first check); then the rules are the
+/// filesystem's (`Fs::add_seals`). Anything but a tmpfs file, which on
+/// Keel is anything but a regular file, is EINVAL: pipes, sockets,
+/// directories, devices and procfs files.
+fn seals(p: &ProcessRef, fd: i32, cmd: u32, seals: u32) -> SysResult {
+    let writable = p.lock().handles.check(fd, Rights::WRITE).is_ok();
+    let node = match object(p, fd, Rights::NONE)? {
+        Object::File(open) => {
+            let f = open.lock();
+            (f.proc.is_none() && f.tty.is_none()).then_some(f.node)
+        }
+        _ => None,
+    };
+    if cmd == F_ADD_SEALS && !writable {
+        return Err(Errno::EPERM);
+    }
+    let node = node.ok_or(Errno::EINVAL)?;
+    if cmd == F_ADD_SEALS {
+        crate::fs::with(|fs| fs.add_seals(node, seals)).map(|()| 0)
+    } else {
+        crate::fs::with(|fs| fs.seals(node)).map(u64::from)
+    }
+}
+
 /// fcntl(2) beyond F_GETFD and F_SETFD:
 /// - F_DUPFD, F_DUPFD_CLOEXEC (`f_dupfd`): the lowest free descriptor at
 ///   or above `arg` (as an int); at or past the limit EINVAL;
@@ -873,7 +905,8 @@ const SETFL_MASK: u64 = crate::abi::O_APPEND | crate::abi::O_NONBLOCK | O_DIRECT
 ///   O_DIRECT and O_NOATIME from `arg` and ignores the rest (`setfl`;
 ///   tmpfs allows O_DIRECT, `shmem_file_open`'s FMODE_CAN_ODIRECT, and
 ///   root may set O_NOATIME);
-/// - F_GETLK, F_SETLK, F_SETLKW: POSIX record locks (`fs/locks.c`).
+/// - F_GETLK, F_SETLK, F_SETLKW: POSIX record locks (`fs/locks.c`);
+/// - F_ADD_SEALS, F_GET_SEALS: a memfd's seals (ADR 0044).
 pub fn fcntl_more(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
@@ -907,6 +940,7 @@ pub fn fcntl_more(p: &ProcessRef, fd: i32, cmd: u32, arg: u64) -> SysResult {
             Ok(0)
         }
         F_GETLK | F_SETLK | F_SETLKW => record_lock(p, fd, cmd, arg),
+        F_ADD_SEALS | F_GET_SEALS => seals(p, fd, cmd, arg as u32),
         _ => {
             // Still checks the descriptor first, as Linux's fdget does.
             p.lock().handles.rights(fd)?;

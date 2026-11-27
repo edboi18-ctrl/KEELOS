@@ -238,6 +238,13 @@ never-implemented calls are in no profile (host tests), and the 32-bit
 entry paths fault (`compartment.profiles`). A manifest gets `default`
 unless it asks for `full` (`launch.manifest`).
 
+P3-S7 (memfd sealing, ADR 0044) is done: MFD_ALLOW_SEALING, F_ADD_SEALS
+and F_GET_SEALS, with F_SEAL_SHRINK, F_SEAL_GROW and F_SEAL_SEAL
+enforced as Linux v6.12 does, a write past the end under F_SEAL_GROW
+cut at a page boundary as Linux cuts it (`exec.seals`, and
+`user/tests/sealprobe` matching Linux in the conformance boot). The
+write and exec seals are refused, not accepted unenforced.
+
 P3-S9 (release builds, ADR 0043) is done. The self-tests and their
 command-line options are in kernels built with the `selftest` feature,
 and the new `trace=syscalls|faults|signals|sched` and `trace.pid=`
