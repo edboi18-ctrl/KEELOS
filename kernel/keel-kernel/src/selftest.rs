@@ -2228,15 +2228,21 @@ fn phase3_under_load(t: &mut Runner) {
             keel_linux_abi::exec::load_in(a.root(), &file, PROBE, &[PROBE, b"bomb"], &[]).ok()
         })
         .and_then(|loaded| process::spawn_in(&a, "bomb", &loaded).ok());
-    // Until A is full: its limit reached, the children spinning.
-    let full = bomb.is_some()
-        && (0..1000).any(|_| {
-            let at_limit = a.processes() == A_PROCESSES;
+    // Until A is full: its 16 children spinning, and its PID 1 either
+    // still touching memory (17 processes) or already ended at its
+    // memory limit (16). With KVM the hog reaches its limit within a few
+    // milliseconds of the last fork, so 17 may never be seen.
+    let full = bomb.as_ref().is_some_and(|s| {
+        (0..1000).any(|_| {
+            let n = a.processes();
+            let at_limit = n == A_PROCESSES
+                || (n == A_PROCESSES - 1 && sched::exit_status(s.thread).is_some());
             if !at_limit {
                 sched::sleep_ms(10);
             }
             at_limit
-        });
+        })
+    });
     let loaded = run_in(&b, PROBE, &[PROBE, b"respond", RESPONSIVE_MS]);
     // The system compartment (keel-init's, and its shell's) as well: A's
     // threads must not count against it either.
