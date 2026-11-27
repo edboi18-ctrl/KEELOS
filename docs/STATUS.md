@@ -220,9 +220,10 @@ Phase 3 acceptance progress (the task rows above stop at P3-S4; ADRs
 
 Security work: P3-S2 (the native launch interface, `keel-launch` and
 manifests) is done (ADR 0040): seven native calls behind a factory
-handle that only keel-init gets; `keel-init --launch MANIFEST` runs an
-application from its manifest in a compartment of its own
-(`exec.launch`, `launch.manifest`); the manifest parser is fuzzed on the
+handle that only keel-init gets; keel-init starts the launch service
+(`keel-launch --serve`) with a restricted one, and a user at the shell
+runs `keel-launch MANIFEST` to run an application in a compartment of
+its own (`exec.launch`, `launch.manifest`, `launch.service`); the manifest parser is fuzzed on the
 host (`cargo xtask fuzz-manifest`, 30 minutes, no failure).
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)

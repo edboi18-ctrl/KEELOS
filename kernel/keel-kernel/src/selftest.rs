@@ -1973,6 +1973,7 @@ fn phase3(t: &mut Runner) {
     phase3_procdirs(t);
     phase3_launch(t);
     phase3_manifest_launch(t);
+    phase3_launch_service(t);
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
@@ -3244,6 +3245,66 @@ fn phase3_manifest_launch(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  launch: made {made:?}; warm {warm:?}, good {good:?}, bad {bad:?}, without a factory {unarmed:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-S2 (ADR 0040): the launch service. `keel-init --once
+/// --launch-service --shell PROGRAM ...` starts `keel-launch --serve`
+/// (the listener and a restricted factory), runs PROGRAM as its shell,
+/// then stops the service. With `keel-launch /launch-test/good.toml` as
+/// the shell, the client asks the service, which runs the manifest
+/// (status 43 comes back); with the bad manifest, 2; with a relative
+/// path, the client makes it absolute from its working directory. With
+/// launchprobe's `nofactory` mode as the shell, no descriptor it has is
+/// a factory (44); with its `viaservice` mode, the program's output comes
+/// through the client's own standard output, a pipe (45). Every frame
+/// and process comes back.
+fn phase3_launch_service(t: &mut Runner) {
+    use keel_linux_abi::process;
+    const INIT: &[u8] = b"/sbin/keel-init";
+    const LAUNCH: &[u8] = b"/sbin/keel-launch";
+    let run = |args: &[&[u8]]| {
+        let file = keel_linux_abi::fs::read_file(INIT).ok()?;
+        let mut argv: alloc::vec::Vec<&[u8]> =
+            alloc::vec![INIT, b"--once", b"--launch-service", b"--shell"];
+        argv.extend_from_slice(args);
+        let loaded = keel_linux_abi::exec::load(&file, INIT, &argv, &[]).ok()?;
+        let spawned =
+            process::spawn_with_fd3("keel-init", &loaded, keel_linux_abi::native::root_factory())
+                .ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    };
+    let outside_heap = frames_outside_heap;
+    let warm = run(&[LAUNCH, b"/launch-test/good.toml"]);
+    sched::sleep_ms(50);
+    let (frames, processes) = (outside_heap(), process::count());
+    let good = run(&[LAUNCH, b"/launch-test/good.toml"]);
+    let bad = run(&[LAUNCH, b"/launch-test/bad.toml"]);
+    // Relative: the client makes it absolute from its working directory,
+    // keel-init's `/`.
+    let relative = run(&[LAUNCH, b"launch-test/good.toml"]);
+    let shell = run(&[b"/test/launchprobe", b"child", b"nofactory"]);
+    let piped = run(&[b"/test/launchprobe", b"child", b"viaservice"]);
+    sched::sleep_ms(50);
+    let (frames_after, processes_after) = (outside_heap(), process::count());
+    let ok = warm == Some((43, None))
+        && good == Some((43, None))
+        && bad == Some((2, None))
+        && relative == Some((43, None))
+        && shell == Some((44, None))
+        && piped == Some((45, None))
+        && processes_after == processes
+        && frames_after == frames;
+    t.check(
+        "launch.service",
+        ok,
+        "keel-init starts the launch service with a restricted factory; keel-launch MANIFEST, run as its shell with no factory, asks the service over its socket with its stdio, and the manifest's program runs in a compartment and its status comes back; a bad manifest is refused with 2; the shell has no factory; the service is stopped, every frame and process back",
+    );
+    if !ok {
+        kprintln!(
+            "  launch service: warm {warm:?}, good {good:?}, bad {bad:?}, relative {relative:?}, shell {shell:?}, piped {piped:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
         );
     }
 }

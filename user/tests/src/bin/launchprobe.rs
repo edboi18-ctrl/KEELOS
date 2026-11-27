@@ -127,7 +127,64 @@ fn child(mode: &[u8]) -> i32 {
             if !ENV_SEEN.load(core::sync::atomic::Ordering::Relaxed) {
                 return 63;
             }
+            sys::write(1, b"manifest: hello\n");
             43
+        }
+        // Run as keel-init's shell while the launch service runs
+        // (`launch.service`): it has no factory on fd 3 or anywhere else
+        // that it could use.
+        b"nofactory" => {
+            let mut st = [0u8; 144];
+            let limits = Limits::UNLIMITED.bytes();
+            if sys::fstat(FACTORY, &mut st) != EBADF {
+                return 71;
+            }
+            for fd in 0..64 {
+                if sys::compartment_create(fd, 0, &limits) != EBADF {
+                    return 72;
+                }
+            }
+            44
+        }
+        // Run as keel-init's shell with the launch service: runs the
+        // client, `keel-launch /launch-test/good.toml`, with its standard
+        // output on a pipe. The program in the compartment writes there,
+        // through the client's descriptor the service was given (45).
+        b"viaservice" => {
+            let mut out = [-1i32; 2];
+            if sys::pipe2(&mut out, None) != 0 {
+                return 81;
+            }
+            let pid = sys::fork();
+            if pid == 0 {
+                sys::dup2(out[1], 1);
+                sys::close(out[0]);
+                sys::close(out[1]);
+                sys::execve(
+                    c"/sbin/keel-launch",
+                    Some(&[c"keel-launch", c"/launch-test/good.toml"]),
+                    &[],
+                );
+                keel_rt::exit(82);
+            }
+            sys::close(out[1]);
+            let mut line = [0u8; 64];
+            let mut got = 0;
+            loop {
+                let n = sys::read(out[0], &mut line[got..]);
+                if n <= 0 {
+                    break;
+                }
+                got += n as usize;
+            }
+            let mut status = 0;
+            if sys::wait4(pid as i32, &mut status, 0) != pid || (status >> 8) & 0xff != 43 {
+                return 83;
+            }
+            if line[..got] != *b"manifest: hello\n" {
+                return 84;
+            }
+            45
         }
         // Waits to be killed.
         b"sleep" => loop {

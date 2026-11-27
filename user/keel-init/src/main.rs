@@ -8,16 +8,23 @@
 //! another, after a second if the last one lasted less than that, so a
 //! shell that cannot start does not make it spin.
 //!
-//! `keel-init --launch MANIFEST` instead runs `/sbin/keel-launch
-//! MANIFEST` and exits with its status (P3-S2, ADR 0040). The kernel gives
-//! keel-init the compartment factory on fd 3, close-on-exec; keel-launch
-//! gets a factory derived from it with [`LAUNCH_CEILING`], restricted to
-//! CREATE and STAT so it cannot be copied on, as its fd 3. Nothing else
-//! keel-init runs has one.
+//! The launch service (P3-S2, ADR 0040): the kernel gives keel-init the
+//! compartment factory on fd 3, close-on-exec. Before the shell, keel-init
+//! binds `/run/keel-launch.sock` and starts `keel-launch --serve` with the
+//! listener on fd 4 and a factory derived from its own beneath
+//! [`LAUNCH_CEILING`], restricted to CREATE and STAT so it cannot be
+//! copied on, as its fd 3. A user at the shell runs `keel-launch
+//! MANIFEST`, which asks the service. Nothing else keel-init runs has a
+//! factory. If the service ends, keel-init starts it again.
+//!
+//! `keel-init --launch MANIFEST` instead runs `keel-launch --direct
+//! MANIFEST` with such a factory, and exits with its status.
 //!
 //! `keel-init --once` runs one shell and exits with its status (the
 //! shell's exit code, or 128 plus the signal that ended it), for the
-//! kernel's self-tests. `--shell PATH [ARG ...]`, last, runs PATH with
+//! kernel's self-tests; without the launch service unless
+//! `--launch-service` is given, which is stopped (SIGTERM) before it
+//! exits. `--shell PATH [ARG ...]`, last, runs PATH with
 //! those arguments instead (argv[0] is PATH), such as
 //! `--shell /bin/busybox sh` for BusyBox's shell.
 //!
@@ -107,8 +114,66 @@ const LAUNCH_CEILING: sys::Limits = sys::Limits {
 /// Rights (keel_core::handle::Rights): STAT and CREATE.
 const STAT_AND_CREATE: u64 = (1 << 4) | (1 << 6);
 
-/// `--launch MANIFEST`: keel-launch with a restricted factory on fd 3;
-/// its status as a shell reports it.
+/// Where the launch service listens (keel-launch's `SOCKET`).
+const LAUNCH_SOCKET: &CStr = c"/run/keel-launch.sock";
+const AF_UNIX: i32 = 1;
+const SOCK_STREAM: u32 = 1;
+const SOCK_CLOEXEC: u32 = 0o2000000;
+const SIGTERM: i32 = 15;
+/// fcntl(2) F_SETFD.
+const F_SETFD: u32 = 2;
+
+/// Starts `/sbin/keel-launch` with `argv` and a factory on fd 3, derived
+/// from keel-init's beneath [`LAUNCH_CEILING`] and restricted to CREATE
+/// and STAT; with `listener`, if given, as its fd 4. Its PID.
+fn start_launcher(argv: &[&CStr], listener: Option<i32>) -> i64 {
+    let pid = sys::fork();
+    if pid != 0 {
+        return pid;
+    }
+    // The listener on fd 4 first (it may already be there, close-on-exec),
+    // then the derived factory, then this process's own (fd 3) closed, so
+    // the restricted copy takes the lowest free descriptor: 3.
+    if let Some(s) = listener {
+        let placed = if s == 4 {
+            sys::fcntl(4, F_SETFD, 0)
+        } else {
+            sys::dup2(s, 4)
+        };
+        if placed < 0 {
+            say(&[b"could not place the listener on fd 4\n"]);
+            keel_rt::exit(2);
+        }
+    }
+    let derived = sys::factory_derive(3, &LAUNCH_CEILING.bytes());
+    if derived < 0 {
+        let mut d = [0u8; 20];
+        say(&[
+            b"no factory to give: error ",
+            decimal(derived, &mut d),
+            b"\n",
+        ]);
+        keel_rt::exit(2);
+    }
+    sys::close(3);
+    let restricted = sys::native_restrict(derived as i32, STAT_AND_CREATE);
+    sys::close(derived as i32);
+    if restricted != 3 {
+        say(&[b"could not place the factory on fd 3\n"]);
+        keel_rt::exit(2);
+    }
+    let e = sys::execve(c"/sbin/keel-launch", Some(argv), &ENV);
+    let mut d = [0u8; 20];
+    say(&[
+        b"cannot run /sbin/keel-launch: error ",
+        decimal(e, &mut d),
+        b"\n",
+    ]);
+    keel_rt::exit(127);
+}
+
+/// `--launch MANIFEST`: `keel-launch --direct MANIFEST`; its status as a
+/// shell reports it.
 fn launch(manifest: &[u8]) -> i32 {
     let mut path = [0u8; 512];
     if manifest.len() >= path.len() || manifest.contains(&0) {
@@ -116,37 +181,8 @@ fn launch(manifest: &[u8]) -> i32 {
         return 2;
     }
     path[..manifest.len()].copy_from_slice(manifest);
-    let pid = sys::fork();
-    if pid == 0 {
-        // The derived factory, then this process's own (fd 3) closed, so
-        // the restricted copy takes the lowest free descriptor: 3.
-        let derived = sys::factory_derive(3, &LAUNCH_CEILING.bytes());
-        if derived < 0 {
-            let mut d = [0u8; 20];
-            say(&[
-                b"no factory to give: error ",
-                decimal(derived, &mut d),
-                b"\n",
-            ]);
-            keel_rt::exit(2);
-        }
-        sys::close(3);
-        let restricted = sys::native_restrict(derived as i32, STAT_AND_CREATE);
-        sys::close(derived as i32);
-        if restricted != 3 {
-            say(&[b"could not place the factory on fd 3\n"]);
-            keel_rt::exit(2);
-        }
-        let arg = CStr::from_bytes_until_nul(&path[..=manifest.len()]).unwrap_or(c"");
-        let e = sys::execve(c"/sbin/keel-launch", Some(&[c"keel-launch", arg]), &ENV);
-        let mut d = [0u8; 20];
-        say(&[
-            b"cannot run /sbin/keel-launch: error ",
-            decimal(e, &mut d),
-            b"\n",
-        ]);
-        keel_rt::exit(127);
-    }
+    let arg = CStr::from_bytes_until_nul(&path[..=manifest.len()]).unwrap_or(c"");
+    let pid = start_launcher(&[c"keel-launch", c"--direct", arg], None);
     if pid < 0 {
         return 2;
     }
@@ -160,6 +196,31 @@ fn launch(manifest: &[u8]) -> i32 {
             return 2;
         }
     }
+}
+
+/// The launch service (ADR 0040): binds [`LAUNCH_SOCKET`] (a stale one
+/// from an earlier run removed first), then starts `keel-launch --serve`
+/// with the listener, so it is ready before anything can ask. Its PID, or
+/// None if it could not start.
+fn start_service() -> Option<i64> {
+    sys::mkdir(c"/run", 0o755);
+    sys::unlink(LAUNCH_SOCKET);
+    let s = sys::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    let mut addr = [0u8; 110];
+    addr[..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+    let path = LAUNCH_SOCKET.to_bytes_with_nul();
+    addr[2..2 + path.len()].copy_from_slice(path);
+    if s < 0 || sys::bind(s as i32, &addr[..2 + path.len()]) != 0 || sys::listen(s as i32, 16) != 0
+    {
+        say(&[b"the launch service cannot listen\n"]);
+        if s >= 0 {
+            sys::close(s as i32);
+        }
+        return None;
+    }
+    let pid = start_launcher(&[c"keel-launch", c"--serve"], Some(s as i32));
+    sys::close(s as i32);
+    (pid > 0).then_some(pid)
 }
 
 const ENV: [&CStr; 3] = [
@@ -269,15 +330,22 @@ fn main(startup: &Startup) -> i32 {
             }
         };
     }
-    let once = startup
-        .args()
-        .skip(1)
-        .take_while(|a| *a != b"--shell")
-        .any(|a| a == b"--once");
+    let flag = |name: &[u8]| {
+        startup
+            .args()
+            .skip(1)
+            .take_while(|a| *a != b"--shell")
+            .any(|a| a == name)
+    };
+    let once = flag(b"--once");
     let Some(command) = Shell::from_args(startup) else {
-        say(&[b"usage: keel-init [--once] [--shell PATH [ARG ...]] | --launch MANIFEST\n"]);
+        say(&[b"usage: keel-init [--once [--launch-service]] [--shell PATH [ARG ...]] | --launch MANIFEST\n"]);
         return 2;
     };
+    // The launch service: always in a normal boot; with --once only if
+    // asked (the self-tests).
+    let with_service = !once || flag(b"--launch-service");
+    let mut service = if with_service { start_service() } else { None };
     loop {
         let started = now_ms();
         let shell = start_shell(&command);
@@ -289,9 +357,8 @@ fn main(startup: &Startup) -> i32 {
             }
         }
         // Reap whatever ends (an orphan given to init too, on Linux) until
-        // the shell does.
+        // the shell does; start the service again if it ends.
         let mut status = 0;
-        // Ends at the shell's exit, or when no child is left.
         if shell > 0 {
             loop {
                 let mut raw = 0;
@@ -300,12 +367,22 @@ fn main(startup: &Startup) -> i32 {
                     status = shell_status(raw);
                     break;
                 }
+                if service == Some(pid) {
+                    say(&[b"the launch service ended; starting it again\n"]);
+                    service = start_service();
+                    continue;
+                }
                 if pid == ECHILD || (pid < 0 && pid != EINTR) {
                     break;
                 }
             }
         }
         if once {
+            if let Some(pid) = service {
+                sys::kill(pid as i32, SIGTERM);
+                let mut raw = 0;
+                while sys::wait4(pid as i32, &mut raw, 0) == EINTR {}
+            }
             return status;
         }
         let mut d = [0u8; 20];

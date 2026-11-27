@@ -81,6 +81,12 @@ reserved bytes, written as 0.
   restricted to CREATE and STAT, so it cannot be copied on. It is given
   as fd 3 of `keel-launch` alone: what keel-init runs otherwise (the
   shell) inherits nothing, since the original is close-on-exec.
+- **The launch service:** in a normal boot, before the shell, keel-init
+  binds `/run/keel-launch.sock` and starts `keel-launch --serve` with the
+  listener on fd 4 and such a factory on fd 3, so the service is ready
+  before anything can ask it. keel-init starts it again if it ends. A
+  user at the shell runs `keel-launch MANIFEST`, the client, which has
+  no factory and needs none.
 - **Compartments:** a compartment's processes get only the three stdio
   descriptors they were spawned with. Nothing in a compartment can name
   a factory: fork copies only what the process has, SCM_RIGHTS needs
@@ -88,11 +94,25 @@ reserved bytes, written as 0.
 
 ### Manifests and keel-launch
 
-`keel-launch MANIFEST` reads the manifest, checks it, creates the
-compartment with the factory on fd 3, grants its devices, spawns `exec`
-with the manifest's arguments and environment and keel-launch's own fds
-0 to 2, and waits. It exits with PID 1's exit code, or 128 plus the
-signal that ended it.
+A launch reads the manifest, checks it, creates the compartment with
+the factory on fd 3, grants its devices, spawns `exec` with the
+manifest's arguments and environment and the requester's fds 0 to 2,
+and waits. Its status is PID 1's exit code, or 128 plus the signal that
+ended it; 2 for a bad manifest or a refused step, which is named on the
+requester's standard error. keel-launch runs in three ways:
+- **`keel-launch MANIFEST`, the client:** connects to the service's
+  socket, sends the manifest's path (made absolute from its working
+  directory) with its own fds 0 to 2 as SCM_RIGHTS, closes its side for
+  writing, and exits with the 4-byte status the service sends back.
+- **`keel-launch --serve`, the service:** a worker (a forked child) per
+  connection, reaped by the kernel (SIGCHLD ignored), takes exactly
+  three descriptors and an absolute path, launches with them, and sends
+  the status. The socket is in the system tree only, so only the system
+  compartment can ask: what keel-init and the shell run there could
+  already read every file a manifest names, and every compartment it
+  makes is held beneath the service's ceiling.
+- **`keel-launch --direct MANIFEST`:** launches with its own fds 0 to 2
+  and a factory on fd 3, for `keel-init --launch MANIFEST`.
 
 The format is the spec's: a subset of TOML 1.0.0, whose every accepted
 manifest is valid TOML meaning the same.
@@ -139,10 +159,8 @@ spec section 3, "Parser fuzzing on the host").
 - **Allowlist profiles:** P3-S3.
 - **Audit records** of creation and grants: P3-S6. The calls are the
   points where they will go.
-- **How a user at the shell asks for a launch.** keel-launch can be run
-  only by keel-init now (`keel-init --launch MANIFEST`), since only
-  keel-init has a factory to give. A launch service the shell could ask
-  is left open.
+- **Who may ask the service** is anyone in the system compartment, with
+  no per-user policy: Keel has no users yet (SR-6).
 - **CPU share** (SR-8): no limit yet.
 - **A per-compartment handle cap:** each process has Keel's fixed table
   of 1024. `[limits] handles` is checked (3 to 1024) but not yet
@@ -212,6 +230,27 @@ spec section 3, "Parser fuzzing on the host").
     factory refuses: EPERM);
   - keel-launch not waiting (no status to give back);
   - the parser allowing `network = true` (the bad manifest runs).
+- **`launch.service` (phase 3):** the kernel runs `keel-init --once
+  --launch-service --shell PROGRAM ...` with the root factory, so
+  keel-init starts the service and stops it (SIGTERM) when its "shell"
+  ends. Twice, every frame and process back:
+  - with the client `keel-launch /launch-test/good.toml` as the shell,
+    the program runs in its compartment and 43 comes back; the bad
+    manifest gives 2; a relative path, made absolute from the client's
+    working directory, gives 43;
+  - with launchprobe's `nofactory` mode as the shell, none of its first
+    64 descriptors is a factory (44);
+  - with its `viaservice` mode, the client runs with standard output on
+    a pipe, and the program's line arrives through that pipe, so the
+    service gave the program the client's own descriptor (45).
+- **Mutations of the service,** 6, all caught (what failed):
+  - the worker giving the program its own stdio (the line does not
+    arrive through the client's pipe);
+  - the client sending no descriptors (every launch 2);
+  - a relative path sent as it is (that launch 2);
+  - no service started (every client 2);
+  - the service not stopped (keel-init never ends);
+  - the kernel's root factory not close-on-exec (the shell holds one).
 - **Not tested:** that keel-init restricts the factory it gives
   keel-launch. A process cannot read another's rights, and keel-launch
   itself never copies or hands on its factory (spawn refuses one as
