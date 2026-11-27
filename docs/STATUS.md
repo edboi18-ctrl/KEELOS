@@ -219,7 +219,7 @@ Phase 3 acceptance progress (the task rows above stop at P3-S4; ADRs
   programs whose output depended on where they ran.
 
 Security work: P3-S2 (the native launch interface, `keel-launch` and
-manifests) is done (ADR 0040): seven native calls behind a factory
+manifests) is done (ADR 0040): seven native calls (eight with ADR 0045's `audit_open`) behind a factory
 handle that only keel-init gets; keel-init starts the launch service
 (`keel-launch --serve`) with a restricted one, and a user at the shell
 runs `keel-launch MANIFEST` to run an application in a compartment of
@@ -237,6 +237,14 @@ ENOTTY. Each refusal is counted and the first few logged. The
 never-implemented calls are in no profile (host tests), and the 32-bit
 entry paths fault (`compartment.profiles`). A manifest gets `default`
 unless it asks for `full` (`launch.manifest`).
+
+P3-S6 (the audit log, ADR 0045) is done: compartment creations, device
+grants and denied operations (profile refusals and native calls above
+a ceiling, rate-limited per compartment: 32, then 1 a second, the
+suppressed ones counted and reported) are kept in a kernel log of
+1,024 records. Only the root factory, which keel-init alone holds, can
+open it (`audit_open`), and read(2) gives whole lines (`audit.log`,
+`exec.launch` check 12). Refusals no longer go to the console.
 
 P3-S7 (memfd sealing, ADR 0044) is done: MFD_ALLOW_SEALING, F_ADD_SEALS
 and F_GET_SEALS, with F_SEAL_SHRINK, F_SEAL_GROW and F_SEAL_SEAL

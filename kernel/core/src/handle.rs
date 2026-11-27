@@ -53,9 +53,12 @@ impl Rights {
     pub const WAIT: Rights = Rights(1 << 13);
     /// Add grants to a compartment (P3-S2, ADR 0040).
     pub const GRANT: Rights = Rights(1 << 14);
+    /// On a factory: open the audit log (ADR 0045). Only the root factory
+    /// has it.
+    pub const AUDIT: Rights = Rights(1 << 15);
 
     /// Every right there is.
-    pub const ALL: Rights = Rights((1 << 15) - 1);
+    pub const ALL: Rights = Rights((1 << 16) - 1);
 
     /// The rights whose bits are set in `bits`; None if any bit names no
     /// right (fail closed, SR-10).

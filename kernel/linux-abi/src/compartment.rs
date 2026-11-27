@@ -40,5 +40,13 @@ pub fn create_at(root: keel_core::vfs::Ino, limits: Limits) -> Result<Arc<Compar
     let id = NEXT_ID
         .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
         .map_err(|_| Errno::EAGAIN)?;
+    // SR-11 (ADR 0045): every creation is in the audit log, with who made
+    // it: the calling process, or the kernel for its own tests.
+    crate::audit::record(keel_core::audit::Event::Created {
+        compartment: id,
+        by: crate::audit::actor(crate::process::current().as_ref()),
+        profile: limits.profile.name,
+        processes: limits.processes,
+    });
     Ok(Arc::new(Compartment::new(id, root, limits)))
 }

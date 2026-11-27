@@ -87,6 +87,8 @@ pub enum Object {
     Factory(Arc<crate::native::Factory>),
     /// A compartment its creator holds (P3-S2, ADR 0040).
     Compartment(Arc<crate::native::CompartmentHandle>),
+    /// An open audit log (P3-S6, ADR 0045).
+    Audit(Arc<crate::audit::AuditReader>),
 }
 
 /// Rights given to an open regular file or device, by access mode. Reading

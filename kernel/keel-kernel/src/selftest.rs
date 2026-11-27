@@ -2166,6 +2166,48 @@ fn phase3_profiles(t: &mut Runner) {
             f.denied()
         );
     }
+    // SR-11 (ADR 0045): each compartment's creation is in the audit log,
+    // made by the kernel, and every refusal is accounted for: recorded,
+    // reported as suppressed by a later record, or still pending. With
+    // more refusals than the burst, some were suppressed.
+    let audited = |c: &keel_core::compartment::Compartment| {
+        use keel_core::audit::{Actor, Event};
+        let records = keel_linux_abi::audit::records_for(c.id());
+        let created = records.iter().any(|r| {
+            matches!(
+                r.event,
+                Event::Created {
+                    by: Actor::Kernel,
+                    ..
+                }
+            )
+        });
+        let (recorded, reported) = records
+            .iter()
+            .fold((0u64, 0u64), |(n, s), r| match r.event {
+                Event::Denied { suppressed, .. } => (n + 1, s + suppressed),
+                _ => (n, s),
+            });
+        let pending = c.audit_limiter().pending();
+        (
+            created
+                && recorded >= keel_core::audit::BURST
+                && recorded + reported + pending == c.denied()
+                && reported + pending > 0,
+            (created, recorded, reported, pending, c.denied()),
+        )
+    };
+    let ((d_ok, d_counts), (f_ok, f_counts)) = (audited(&d), audited(&f));
+    t.check(
+        "audit.log",
+        d_ok && f_ok,
+        "the audit log holds each compartment's creation and its profile's refusals, rate-limited (a burst, then a steady rate), every refusal recorded or counted as suppressed",
+    );
+    if !(d_ok && f_ok) {
+        kprintln!(
+            "  audit: default {d_counts:?}, full {f_counts:?} (created, recorded, reported, pending, denied)"
+        );
+    }
 }
 
 /// P3-S4, security acceptance P3 item 3 (ADR 0042): a fork bomb and a

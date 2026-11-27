@@ -639,7 +639,7 @@ pub fn poll_mask(object: &Object) -> Option<u16> {
         Object::Epoll(ep) => crate::epoll::poll_mask(ep),
         Object::Socket(s) => s.poll(),
         // Never ready for anything (ADR 0040).
-        Object::Factory(_) | Object::Compartment(_) => 0,
+        Object::Factory(_) | Object::Compartment(_) | Object::Audit(_) => 0,
         Object::File(_) => return None,
     })
 }
@@ -677,9 +677,11 @@ pub fn stat_bytes(object: &Object) -> Option<[u8; 144]> {
         Object::Pipe(end) => (end.ino, S_IFIFO | 0o600, PIPEFS_DEV),
         // An epoll instance is the same anonymous inode.
         // Factory and compartment handles too (ADR 0040).
-        Object::EventFd(_) | Object::Epoll(_) | Object::Factory(_) | Object::Compartment(_) => {
-            (ANON_INODE_INO, 0o600, ANON_INODE_DEV)
-        }
+        Object::EventFd(_)
+        | Object::Epoll(_)
+        | Object::Factory(_)
+        | Object::Compartment(_)
+        | Object::Audit(_) => (ANON_INODE_INO, 0o600, ANON_INODE_DEV),
         // A socket's own inode on sockfs, S_IFSOCK | 0777 (`sock_alloc`).
         Object::Socket(s) => (s.ino, keel_core::vfs::S_IFSOCK | 0o777, SOCKFS_DEV),
         Object::File(_) => return None,
@@ -705,9 +707,11 @@ pub fn statfs_magic(object: &Object) -> Option<u64> {
         // A FIFO is on tmpfs: the file path answers.
         Object::Pipe(end) if end.fifo.is_some() => None,
         Object::Pipe(_) => Some(0x5049_5045),
-        Object::EventFd(_) | Object::Epoll(_) | Object::Factory(_) | Object::Compartment(_) => {
-            Some(0x0904_1934)
-        }
+        Object::EventFd(_)
+        | Object::Epoll(_)
+        | Object::Factory(_)
+        | Object::Compartment(_)
+        | Object::Audit(_) => Some(0x0904_1934),
         // SOCKFS_MAGIC.
         Object::Socket(_) => Some(0x534F_434B),
         Object::File(_) => None,
@@ -721,7 +725,7 @@ pub fn status(object: &Object) -> Option<&IrqMutex<u64>> {
         Object::EventFd(file) => Some(&file.status),
         Object::Epoll(ep) => Some(&ep.status),
         Object::Socket(s) => Some(&s.status),
-        Object::File(_) | Object::Factory(_) | Object::Compartment(_) => None,
+        Object::File(_) | Object::Factory(_) | Object::Compartment(_) | Object::Audit(_) => None,
     }
 }
 

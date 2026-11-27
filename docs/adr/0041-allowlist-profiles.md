@@ -143,12 +143,10 @@ So a program sees an older or smaller kernel, not a new kind of failure.
 ### Logging
 
 - Every refusal is counted in its compartment (`Compartment::denied`).
-- The first 8 of each compartment are logged on the kernel log: the
-  compartment, the profile, the PID, the call, the operation and the
-  error.
-- After those, a compartment's refusals are counted but no longer
-  logged, so a program cannot flood the log.
-- P3-S6 moves this to the audit log (SR-11).
+- Since P3-S6 each is recorded in the audit log (ADR 0045), rate-limited
+  per compartment, rather than on the kernel log: the compartment, the
+  PID, the call, the operation and the error. (Until then the first 8
+  of each compartment went to the kernel log.)
 
 ### The 32-bit entry paths
 

@@ -2053,6 +2053,12 @@ pub fn compartment_kill(c: i32, signal: i32) -> i64 {
     call3(NATIVE_BASE + 5, c as u32 as u64, signal as u32 as u64, 0)
 }
 
+/// `audit_open(factory)` (ADR 0045): a descriptor of the audit log, read
+/// with read(2). Needs the AUDIT right, which only the root factory has.
+pub fn audit_open(factory: i32) -> i64 {
+    call3(NATIVE_BASE + 7, factory as u32 as u64, 0, 0)
+}
+
 /// `compartment_wait(c, usage*, flags)`: flags 1 is WNOHANG.
 pub fn compartment_wait(c: i32, flags: u64) -> Result<Usage, i64> {
     let mut b = [0u8; 40];

@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod audit;
 pub mod compartment;
 pub mod cpio;
 pub mod cpuvuln;

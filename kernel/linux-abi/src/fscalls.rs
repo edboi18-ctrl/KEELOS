@@ -224,7 +224,9 @@ pub fn lseek(p: &ProcessRef, fd: i32, offset: i64, whence: u32) -> SysResult {
         // `socket_file_ops` has no llseek: ESPIPE.
         Object::Socket(_) => return Err(Errno::ESPIPE),
         // Not files (ADR 0040).
-        Object::Factory(_) | Object::Compartment(_) => return Err(Errno::ESPIPE),
+        Object::Factory(_) | Object::Compartment(_) | Object::Audit(_) => {
+            return Err(Errno::ESPIPE);
+        }
         Object::File(_) => {}
     }
     let open = file(p, fd, Rights::SEEK)?;

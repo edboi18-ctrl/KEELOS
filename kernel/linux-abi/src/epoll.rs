@@ -87,7 +87,7 @@ fn can_poll(object: &Object) -> Result<(), Errno> {
         Object::File(_) => Err(Errno::EPERM),
         // A factory or compartment handle has nothing to wait for (ADR
         // 0040), as a regular file has nothing.
-        Object::Factory(_) | Object::Compartment(_) => Err(Errno::EPERM),
+        Object::Factory(_) | Object::Compartment(_) | Object::Audit(_) => Err(Errno::EPERM),
     }
 }
 
@@ -100,6 +100,7 @@ fn identity(object: &Object) -> usize {
         Object::Socket(a) => Arc::as_ptr(a) as *const () as usize,
         Object::Factory(a) => Arc::as_ptr(a) as *const () as usize,
         Object::Compartment(a) => Arc::as_ptr(a) as *const () as usize,
+        Object::Audit(a) => Arc::as_ptr(a) as *const () as usize,
     }
 }
 
@@ -109,7 +110,9 @@ fn downgrade(object: &Object) -> Option<Target> {
         Object::Pipe(a) => Target::Pipe(Arc::downgrade(a)),
         Object::EventFd(a) => Target::EventFd(Arc::downgrade(a)),
         Object::Socket(a) => Target::Socket(Arc::downgrade(a)),
-        Object::Epoll(_) | Object::Factory(_) | Object::Compartment(_) => return None,
+        Object::Epoll(_) | Object::Factory(_) | Object::Compartment(_) | Object::Audit(_) => {
+            return None;
+        }
     })
 }
 
@@ -134,7 +137,9 @@ fn wakes_of(object: &Object) -> Wakes {
             let tty = file.lock().tty.clone();
             tty.map_or(Wakes::new(), |t| t.wakes())
         }
-        Object::Epoll(_) | Object::Factory(_) | Object::Compartment(_) => Wakes::new(),
+        Object::Epoll(_) | Object::Factory(_) | Object::Compartment(_) | Object::Audit(_) => {
+            Wakes::new()
+        }
         Object::Socket(s) => s.wakes(),
     }
 }

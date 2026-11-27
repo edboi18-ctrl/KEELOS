@@ -24,6 +24,9 @@ pub mod fs;
 #[cfg(target_os = "none")]
 pub mod fscalls;
 
+/// The audit log (P3-S6, ADR 0045).
+#[cfg(target_os = "none")]
+pub mod audit;
 #[cfg(target_os = "none")]
 pub mod futex;
 /// Process groups and sessions (ADR 0030).

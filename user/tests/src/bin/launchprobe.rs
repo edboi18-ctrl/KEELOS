@@ -68,6 +68,10 @@ impl<const N: usize> Buf<N> {
         self.put(&digits[at..])
     }
 
+    fn bytes(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
     fn c(&mut self) -> &CStr {
         self.data[self.len] = 0;
         CStr::from_bytes_until_nul(&self.data[..=self.len]).unwrap_or(c"")
@@ -255,7 +259,7 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
         handles: 0,
     };
     // 1. No such call past the last; a handle that is no factory EBADF.
-    if sys::native_raw(7, 0, 0, 0) != ENOSYS
+    if sys::native_raw(8, 0, 0, 0) != ENOSYS
         || sys::compartment_create(0, 0, &limits.bytes()) != EBADF
     {
         return 1;
@@ -475,6 +479,57 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
     }
     sys::close(read_only as i32);
     sys::close(memfd as i32);
+    // 12. The audit log (ADR 0045): only the root factory opens it, not
+    //     a restricted copy or a derived factory; read gives whole lines,
+    //     EINVAL for a buffer too small; spawn will not give it to a
+    //     compartment (EPERM); it holds this program's own
+    //     creations, grants and refusals above a ceiling (checks 3 to 9).
+    if sys::audit_open(only_create as i32) != EBADF || sys::audit_open(derived) != EBADF {
+        return 12;
+    }
+    let log = sys::audit_open(FACTORY);
+    if log < 0 {
+        return 12;
+    }
+    let log = log as i32;
+    let mut tiny = [0u8; 8];
+    if sys::read(log, &mut tiny) != EINVAL
+        || sys::write(log, b"x") != EBADF
+        || sys::compartment_spawn(c, c"/prog", &argv, &[], [-1, log, 2]) != EPERM
+    {
+        return 12;
+    }
+    let mut me = Buf::<32>::new();
+    me.put(b" by=c0:").num(sys::getpid() as u64);
+    let mut deny = Buf::<64>::new();
+    deny.put(b"deny c=0 pid=").num(sys::getpid() as u64);
+    let (mut created, mut granted, mut refused) = (false, false, false);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = sys::read(log, &mut chunk);
+        if n < 0 {
+            return 12;
+        }
+        if n == 0 {
+            break;
+        }
+        for line in chunk[..n as usize].split(|&b| b == b'\n') {
+            let has = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+            if has(b" create c=") && line.ends_with(me.bytes()) {
+                created = true;
+            }
+            if has(b" grant c=") && has(b"device=null") && line.ends_with(me.bytes()) {
+                granted = true;
+            }
+            if has(deny.bytes()) && has(b" compartment_create(") && has(b"errno=1") {
+                refused = true;
+            }
+        }
+    }
+    if !(created && granted && refused) {
+        return 12;
+    }
+    sys::close(log);
     0
 }
 
@@ -510,7 +565,7 @@ fn main(startup: &Startup) -> i32 {
     }
     sys::rmdir(base.c());
     if result == 0 {
-        sys::write(1, b"launchprobe: 11 checks passed\n");
+        sys::write(1, b"launchprobe: 12 checks passed\n");
     }
     result
 }

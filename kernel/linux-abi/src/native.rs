@@ -22,7 +22,7 @@ type ProcessRef = Arc<IrqMutex<Process>>;
 /// the x32 bit (0x4000_0000), which Keel refuses.
 pub const BASE: u64 = 0x1000_0000;
 /// How many native calls there are.
-pub const COUNT: u64 = 7;
+pub const COUNT: u64 = 8;
 
 /// A compartment factory: creates compartments whose limits fit beneath
 /// its ceiling.
@@ -60,7 +60,9 @@ pub fn root_factory() -> Handle<Object> {
         object: Object::Factory(Arc::new(Factory {
             ceiling: Limits::UNLIMITED,
         })),
-        rights: FACTORY_RIGHTS,
+        // Only this factory can open the audit log (ADR 0045): a derived
+        // one gets FACTORY_RIGHTS, and restrict removes rights only.
+        rights: FACTORY_RIGHTS.union(Rights::AUDIT),
         close_on_exec: true,
     }
 }
@@ -136,6 +138,7 @@ pub fn dispatch(p: &ProcessRef, n: u64, a: &[u64; 6]) -> SysResult {
         4 => spawn(p, fd(0), a[1], a[2], a[3], a[4]),
         5 => kill(p, fd(0), a[1]),
         6 => wait(p, fd(0), a[1], a[2]),
+        7 => audit_open(p, fd(0)),
         _ => Err(Errno::ENOSYS),
     }
 }
@@ -157,7 +160,7 @@ fn factory_derive(p: &ProcessRef, fd: i32, limits: u64) -> SysResult {
     let parent = factory(p, fd, Rights::CREATE)?;
     let ceiling = read_limits(limits)?;
     if !ceiling.fits_within(&parent.ceiling) {
-        return Err(Errno::EPERM);
+        return Err(denied(p, "factory_derive", 1));
     }
     insert(
         p,
@@ -173,7 +176,7 @@ fn compartment_create(p: &ProcessRef, fd: i32, root: i32, limits: u64) -> SysRes
     let factory = factory(p, fd, Rights::CREATE)?;
     let limits = read_limits(limits)?;
     if !limits.fits_within(&factory.ceiling) {
-        return Err(Errno::EPERM);
+        return Err(denied(p, "compartment_create", 2));
     }
     // The type first (ENOTDIR), then the right (EBADF), as `directory`
     // in fscalls checks a directory handle (`iterate_dir`'s order).
@@ -235,8 +238,38 @@ fn grant_device(p: &ProcessRef, fd: i32, code: u64) -> SysResult {
                 Err(e) => return Err(e),
             }
         }
-        Ok(0)
-    })
+        Ok(())
+    })?;
+    // SR-11: every grant is in the audit log (ADR 0045).
+    crate::audit::record(keel_core::audit::Event::Granted {
+        compartment: c.id(),
+        by: crate::audit::actor(Some(p)),
+        device: core::str::from_utf8(name).unwrap_or("?"),
+    });
+    Ok(0)
+}
+
+/// A native call above its factory's ceiling: EPERM, and a denial in the
+/// audit log for the caller's compartment (ADR 0045).
+fn denied(p: &ProcessRef, what: &'static str, n: u64) -> Errno {
+    let (compartment, pid) = {
+        let process = p.lock();
+        (process.member.compartment().clone(), process.pid())
+    };
+    crate::audit::denied(&compartment, pid, what, BASE + n, None, Errno::EPERM);
+    Errno::EPERM
+}
+
+/// `audit_open(factory)`: an audit handle (ADR 0045), read with read(2),
+/// from the oldest record the log keeps. Needs AUDIT, which only the root
+/// factory has.
+fn audit_open(p: &ProcessRef, fd: i32) -> SysResult {
+    factory(p, fd, Rights::AUDIT)?;
+    insert(
+        p,
+        Object::Audit(Arc::new(crate::audit::AuditReader::new())),
+        Rights::READ.union(Rights::STAT).union(Rights::DUPLICATE),
+    )
 }
 
 /// `compartment_spawn(c, path*, argv**, envp**, stdio*)`: the program at
@@ -266,7 +299,10 @@ fn spawn(p: &ProcessRef, fd: i32, path: u64, argv: u64, envp: u64, stdio: u64) -
                 rights,
             )
         };
-        if matches!(object, Object::Factory(_) | Object::Compartment(_)) {
+        if matches!(
+            object,
+            Object::Factory(_) | Object::Compartment(_) | Object::Audit(_)
+        ) {
             return Err(Errno::EPERM);
         }
         handles.place(

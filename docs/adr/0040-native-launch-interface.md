@@ -46,7 +46,7 @@ as Linux gives for anon_inode files.
 
 ### The calls
 
-Seven calls, numbered from `0x1000_0000`. That is far above Linux's
+Eight calls (seven, and since ADR 0045 `audit_open`), numbered from `0x1000_0000`. That is far above Linux's
 x86-64 numbers (below 512) and below the x32 bit (`0x4000_0000`), which
 Keel refuses. The arguments are registers, as for Linux calls. Errors
 are -errno. Structures are little-endian, `repr(C)`, and every reserved
@@ -61,6 +61,7 @@ field must be 0 (EINVAL otherwise, SR-10).
 | +4 | `compartment_spawn(c, path*, argv**, envp**, stdio*)` | Starts the program at `path`, looked up beneath the compartment's root, as a process in it, the first one PID 1. It gets fds 0 to 2 from `stdio` (three of the caller's descriptors, each needing DUPLICATE; -1 leaves it closed) and nothing else. A factory or compartment handle may not be given (EPERM). Returns the PID. Needs CREATE. |
 | +5 | `compartment_kill(c, signal)` | Sends `signal` to every process in the compartment. Needs SIGNAL. |
 | +6 | `compartment_wait(c, usage*, flags)` | Fills `usage`: processes, memory bytes, tmpfs bytes and nodes, and PID 1's wait status (-1 while it runs). Without WNOHANG (1), it first waits until the compartment has no process left; a signal interrupts it (ERESTARTSYS). WNOHANG needs STAT, waiting needs WAIT. |
+| +7 | `audit_open(factory)` | A descriptor of the audit log (ADR 0045), read with read(2) from the oldest record kept. Needs AUDIT, which only the root factory has: a derived factory gets the usual factory rights, and restrict only removes rights. |
 
 `limits` is 40 bytes: processes (u32) and the allowlist profile's number
 (u32, ADR 0041; reserved until P3-S3), then memory
@@ -159,8 +160,6 @@ spec section 3, "Parser fuzzing on the host").
 
 - **Layered roots and mounted grants** (`prefix`, `writable`,
   `[[grant]]`): P3-S5.
-- **Audit records** of creation and grants: P3-S6. The calls are the
-  points where they will go.
 - **Who may ask the service** is anyone in the system compartment, with
   no per-user policy: Keel has no users yet (SR-6).
 

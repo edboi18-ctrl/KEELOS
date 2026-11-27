@@ -537,37 +537,24 @@ fn permitted(p: &Arc<IrqMutex<Process>>, number: u64, a: &[u64; 6]) -> Result<()
     Err(errno)
 }
 
-/// How many refusals a compartment logs before it only counts them.
-const DENIALS_LOGGED: u64 = 8;
-
-/// Counts a refusal by the caller's compartment's profile and logs the
-/// first few of each compartment (SR-7: "returns an error and is
-/// logged"; rate-limited, as SR-11 asks of the audit log). `op` is the
+/// Counts a refusal by the caller's compartment's profile and records it
+/// in the audit log (SR-7: "returns an error and is logged"; SR-11: the
+/// audit log, rate-limited per compartment, ADR 0045). `op` is the
 /// operation argument of a multiplexer call.
 fn note_denied(p: &Arc<IrqMutex<Process>>, number: u64, op: Option<u64>, errno: Errno) {
     let (compartment, pid) = {
         let process = p.lock();
         (process.member.compartment().clone(), process.pid())
     };
-    let before = compartment.note_denied();
-    if before < DENIALS_LOGGED {
-        let name = names::name(number).unwrap_or("unknown");
-        let (id, profile) = (compartment.id(), compartment.profile().name);
-        match op {
-            Some(op) => kprintln!(
-                "profile: compartment {id} ({profile}): pid {pid}: {name} ({number}) operation {op:#x} denied -> {errno:?}"
-            ),
-            None => kprintln!(
-                "profile: compartment {id} ({profile}): pid {pid}: {name} ({number}) denied -> {errno:?}"
-            ),
-        }
-    }
-    if before + 1 == DENIALS_LOGGED {
-        kprintln!(
-            "profile: compartment {}: further denials are counted, not logged",
-            compartment.id()
-        );
-    }
+    compartment.note_denied();
+    crate::audit::denied(
+        &compartment,
+        pid,
+        names::name(number).unwrap_or("unknown"),
+        number,
+        op,
+        errno,
+    );
 }
 
 fn dispatch(call: &SyscallArgs) -> i64 {
@@ -1077,6 +1064,13 @@ fn read_at(
         // Pipes and eventfds have no position (`stream_open`, and no
         // FMODE_PREAD for an anonymous inode): pread ESPIPE.
         _ if at.is_some() => return Err(Errno::ESPIPE),
+        // The audit log: whole lines (ADR 0045).
+        Object::Audit(reader) => {
+            let mut out = vec![0u8; (count as usize).min(CHUNK)];
+            let n = reader.read(&mut out)?;
+            copy_to_user(buf, &out[..n]).map_err(fault)?;
+            return Ok(n as u64);
+        }
         other => return crate::ready::read(&other, &[(buf, count)]).unwrap_or(Err(Errno::EINVAL)),
     };
     let (tty, nonblock) = {

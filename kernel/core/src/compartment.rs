@@ -150,6 +150,8 @@ pub struct Compartment {
     lead_status: AtomicI64,
     /// Calls and operations its profile has refused (ADR 0041).
     denied: AtomicU64,
+    /// The rate limit on its denial records in the audit log (ADR 0045).
+    audit_limit: crate::audit::Limiter,
 }
 
 impl Compartment {
@@ -172,7 +174,13 @@ impl Compartment {
             ),
             lead_status: AtomicI64::new(-1),
             denied: AtomicU64::new(0),
+            audit_limit: crate::audit::Limiter::new(),
         }
+    }
+
+    /// The rate limit on its denial records in the audit log (ADR 0045).
+    pub fn audit_limiter(&self) -> &crate::audit::Limiter {
+        &self.audit_limit
     }
 
     /// Counts a refusal by its profile, and returns how many there have
