@@ -324,6 +324,15 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         stdin: b"",
         host: false,
     },
+    // P3-S4 (ADR 0042): one compartment under load, another responsive.
+    TestProgram {
+        path: "test/loadprobe",
+        binary: "loadprobe",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     // P3-S3 (ADR 0041): allowlist profiles, Keel's own.
     TestProgram {
         path: "test/profileprobe",

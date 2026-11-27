@@ -1942,6 +1942,8 @@ pub struct Limits {
     pub memory_bytes: u64,
     pub tmpfs_bytes: u64,
     pub tmpfs_nodes: u64,
+    /// Descriptors per process (ADR 0042); 0 is the kernel's own limit.
+    pub handles: u32,
 }
 
 impl Limits {
@@ -1951,6 +1953,7 @@ impl Limits {
         memory_bytes: u64::MAX,
         tmpfs_bytes: u64::MAX,
         tmpfs_nodes: u64::MAX,
+        handles: 0,
     };
 
     /// The 40-byte structure the calls read.
@@ -1961,6 +1964,7 @@ impl Limits {
         b[8..16].copy_from_slice(&self.memory_bytes.to_le_bytes());
         b[16..24].copy_from_slice(&self.tmpfs_bytes.to_le_bytes());
         b[24..32].copy_from_slice(&self.tmpfs_nodes.to_le_bytes());
+        b[32..36].copy_from_slice(&self.handles.to_le_bytes());
         b
     }
 }

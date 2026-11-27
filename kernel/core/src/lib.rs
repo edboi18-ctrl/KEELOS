@@ -15,6 +15,7 @@ pub mod elf;
 pub mod epoll;
 pub mod errno;
 pub mod exec;
+pub mod fairq;
 
 pub mod frame;
 pub mod handle;

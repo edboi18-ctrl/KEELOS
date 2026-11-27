@@ -39,6 +39,10 @@ pub struct Limits {
     pub tmpfs_bytes: usize,
     /// tmpfs nodes it has created.
     pub tmpfs_nodes: usize,
+    /// Descriptors each of its processes may hold (EMFILE beyond, as at
+    /// RLIMIT_NOFILE; ADR 0042). The kernel's own table size, 1024, caps
+    /// it.
+    pub handles: usize,
     /// Its system-call and ioctl allowlists (ADR 0041).
     pub profile: &'static crate::profile::Profile,
 }
@@ -50,6 +54,7 @@ impl Limits {
         memory_frames: usize::MAX,
         tmpfs_bytes: usize::MAX,
         tmpfs_nodes: usize::MAX,
+        handles: usize::MAX,
         profile: &crate::profile::FULL,
     };
 
@@ -60,6 +65,7 @@ impl Limits {
             && self.memory_frames <= ceiling.memory_frames
             && self.tmpfs_bytes <= ceiling.tmpfs_bytes
             && self.tmpfs_nodes <= ceiling.tmpfs_nodes
+            && self.handles <= ceiling.handles
             && self.profile.within(ceiling.profile)
     }
 }
@@ -301,6 +307,7 @@ mod tests {
             memory_frames: 1000,
             tmpfs_bytes: 4096,
             tmpfs_nodes: 10,
+            handles: 64,
             profile: &crate::profile::DEFAULT,
         };
         assert!(ceiling.fits_within(&ceiling));
@@ -321,6 +328,10 @@ mod tests {
             },
             Limits {
                 tmpfs_nodes: 11,
+                ..ceiling
+            },
+            Limits {
+                handles: 65,
                 ..ceiling
             },
             // A profile beyond the ceiling's (ADR 0041).

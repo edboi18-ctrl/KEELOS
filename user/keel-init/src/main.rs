@@ -113,6 +113,7 @@ const LAUNCH_CEILING: sys::Limits = sys::Limits {
     memory_bytes: 1 << 30,
     tmpfs_bytes: 256 << 20,
     tmpfs_nodes: 65536,
+    handles: 1024,
 };
 /// Rights (keel_core::handle::Rights): STAT and CREATE.
 const STAT_AND_CREATE: u64 = (1 << 4) | (1 << 6);

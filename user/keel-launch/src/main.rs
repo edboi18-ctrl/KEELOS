@@ -199,6 +199,7 @@ fn launch(m: &Manifest, stdio: [i32; 3], err: i32) -> i32 {
         memory_bytes: l.memory_mb << 20,
         tmpfs_bytes: l.tmpfs_mb << 20,
         tmpfs_nodes: l.tmpfs_nodes,
+        handles: l.handles,
     };
     let c = sys::compartment_create(FACTORY, root as i32, &limits.bytes());
     sys::close(root as i32);

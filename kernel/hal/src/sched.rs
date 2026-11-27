@@ -72,6 +72,9 @@ struct Thread {
     /// Set by `request_exit`: the thread ends with this status the next
     /// time it would return to user mode, and stops blocking meanwhile.
     exit_request: Option<i64>,
+    /// Its group for CPU share: its compartment's ID, 0 for kernel
+    /// threads and the system compartment (ADR 0042).
+    group: u32,
 }
 
 /// A user thread's first entry to user mode.
@@ -120,10 +123,19 @@ struct Scheduler {
     /// Boxed so a thread's `rsp` field stays at a fixed address while the
     /// map changes.
     threads: BTreeMap<u64, Box<Thread>>,
-    ready: VecDeque<u64>,
+    /// Ready threads, fair between groups (ADR 0042).
+    ready: keel_core::fairq::FairQueue,
     current: u64,
     idle: u64,
     next_id: u64,
+}
+
+impl Scheduler {
+    /// Queues thread `id`, which must be Ready, in its group.
+    fn make_ready(&mut self, id: u64) {
+        let group = self.threads.get(&id).map_or(0, |t| t.group);
+        self.ready.push(group, id);
+    }
 }
 
 static SCHED: IrqMutex<Option<Scheduler>> = IrqMutex::new(None);
@@ -163,10 +175,11 @@ pub fn init() -> Result<(), SchedError> {
         pending_frame: None,
         interrupted: false,
         exit_request: None,
+        group: 0,
     });
     let mut sched = Scheduler {
         threads: BTreeMap::new(),
-        ready: VecDeque::new(),
+        ready: keel_core::fairq::FairQueue::new(),
         current: 0,
         idle: 1,
         next_id: 2,
@@ -250,6 +263,7 @@ fn new_thread(name: &'static str, entry: fn(), id: u64) -> Result<Box<Thread>, S
         pending_frame: None,
         interrupted: false,
         exit_request: None,
+        group: 0,
     }))
 }
 
@@ -261,6 +275,7 @@ pub fn spawn_user(
     rip: u64,
     rsp: u64,
     argument: u64,
+    group: u32,
 ) -> Result<ThreadId, SchedError> {
     let id = {
         let mut guard = SCHED.lock();
@@ -272,10 +287,11 @@ pub fn spawn_user(
     let mut thread = new_thread(name, user_thread_start, id)?;
     thread.space = Some(space);
     thread.user_entry = Some(UserEntry::Start(rip, rsp, argument));
+    thread.group = group;
     let mut guard = SCHED.lock();
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
-    sched.ready.push_back(id);
+    sched.make_ready(id);
     Ok(ThreadId(id))
 }
 
@@ -322,13 +338,16 @@ pub fn spawn_user_copy(
     if fs_base.is_some_and(|base| base >= keel_core::vm::USER_END) {
         return Err(SchedError::NotInitialised);
     }
-    let bases = {
+    // The new thread is the caller's copy (fork, clone): same segment
+    // bases and the same group, since a process never leaves its
+    // compartment (SR-2).
+    let (bases, group) = {
         let guard = SCHED.lock();
         let sched = guard.as_ref().ok_or(SchedError::NotInitialised)?;
         sched
             .threads
             .get(&sched.current)
-            .map_or([0; 2], |t| t.user_bases)
+            .map_or(([0; 2], 0), |t| (t.user_bases, t.group))
     };
     let id = {
         let mut guard = SCHED.lock();
@@ -341,6 +360,7 @@ pub fn spawn_user_copy(
     thread.fpu.save();
     thread.space = Some(space);
     thread.user_bases = bases;
+    thread.group = group;
     if let Some(base) = fs_base {
         thread.user_bases[SegmentBase::Fs as usize] = base;
     }
@@ -348,7 +368,7 @@ pub fn spawn_user_copy(
     let mut guard = SCHED.lock();
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
-    sched.ready.push_back(id);
+    sched.make_ready(id);
     Ok(ThreadId(id))
 }
 
@@ -378,7 +398,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> Result<ThreadId, SchedError> {
     let mut guard = SCHED.lock();
     let sched = guard.as_mut().ok_or(SchedError::NotInitialised)?;
     sched.threads.insert(id, thread);
-    sched.ready.push_back(id);
+    sched.make_ready(id);
     Ok(ThreadId(id))
 }
 
@@ -648,7 +668,7 @@ pub fn request_exit(id: ThreadId, status: i64) -> bool {
     thread.exit_request.get_or_insert(status);
     if matches!(thread.state, State::Blocked | State::Sleeping { .. }) {
         thread.state = State::Ready;
-        sched.ready.push_back(id.0);
+        sched.make_ready(id.0);
     }
     true
 }
@@ -704,7 +724,7 @@ pub fn interrupt(id: ThreadId) -> bool {
     thread.interrupted = true;
     if matches!(thread.state, State::Blocked | State::Sleeping { .. }) {
         thread.state = State::Ready;
-        sched.ready.push_back(id.0);
+        sched.make_ready(id.0);
     }
     true
 }
@@ -875,12 +895,14 @@ fn schedule(next_state: State) {
             }
         }
     }
-    sched.ready.extend(due);
+    for id in due {
+        sched.make_ready(id);
+    }
     NEXT_WAKE_NS.store(next_wake, Ordering::Relaxed);
 
     let current_id = sched.current;
     let keep_running = next_state == State::Ready;
-    let next_id = match sched.ready.pop_front() {
+    let next_id = match sched.ready.pop() {
         Some(id) => id,
         None if keep_running && current_id != sched.idle => return,
         None => sched.idle,
@@ -904,7 +926,7 @@ fn schedule(next_state: State) {
             next_state
         };
         if keep_running && current_id != sched.idle {
-            sched.ready.push_back(current_id);
+            sched.make_ready(current_id);
         }
     }
     let current = sched
@@ -1112,7 +1134,7 @@ impl WaitQueue {
                     && matches!(t.state, State::Blocked | State::Sleeping { .. })
                 {
                     t.state = State::Ready;
-                    sched.ready.push_back(id);
+                    sched.make_ready(id);
                 }
             }
         }

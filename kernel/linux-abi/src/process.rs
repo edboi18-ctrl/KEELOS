@@ -453,8 +453,11 @@ pub fn spawn_in_handles(
     compartment: &Arc<Compartment>,
     name: &'static str,
     loaded: &Loaded,
-    handles: HandleTable<Object>,
+    mut handles: HandleTable<Object>,
 ) -> Result<Spawned, Errno> {
+    // Its compartment's descriptor limit (ADR 0042); fork copies the
+    // table, limit and all.
+    handles.lower_limit(compartment.limits().handles)?;
     let member = compartment.admit()?;
     loaded
         .space
@@ -499,8 +502,15 @@ pub fn spawn_in_handles(
     };
     // PROCESSES stays locked (interrupts off) until the entry is in, so the
     // new thread cannot make a system call before its process exists.
-    let thread = sched::spawn_user(name, loaded.space.clone(), loaded.entry, loaded.rsp, 0)
-        .map_err(|_| Errno::ENOMEM)?;
+    let thread = sched::spawn_user(
+        name,
+        loaded.space.clone(),
+        loaded.entry,
+        loaded.rsp,
+        0,
+        compartment.id(),
+    )
+    .map_err(|_| Errno::ENOMEM)?;
     let mut process = process;
     process.threads.insert(
         thread.0,

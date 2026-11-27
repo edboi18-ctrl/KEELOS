@@ -225,3 +225,8 @@ bench = false
 name = "profileprobe"
 test = false
 bench = false
+
+[[bin]]
+name = "loadprobe"
+test = false
+bench = false

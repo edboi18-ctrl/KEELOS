@@ -79,7 +79,10 @@ fn read_limits(address: u64) -> Result<Limits, Errno> {
     let profile =
         keel_core::profile::by_id(u32::from_le_bytes(b[4..8].try_into().unwrap_or([0xff; 4])))
             .ok_or(Errno::EINVAL)?;
-    if b[32..40] != [0; 8] || processes == 0 {
+    // Bytes 32 to 35: descriptors per process (ADR 0042), 0 for the
+    // kernel's own limit; 36 to 39 reserved.
+    let handles = u32::from_le_bytes(b[32..36].try_into().unwrap_or([0; 4]));
+    if b[36..40] != [0; 4] || processes == 0 {
         return Err(Errno::EINVAL);
     }
     let unlimited_or = |v: u64, f: fn(u64) -> usize| if v == u64::MAX { usize::MAX } else { f(v) };
@@ -88,6 +91,11 @@ fn read_limits(address: u64) -> Result<Limits, Errno> {
         memory_frames: unlimited_or(u64_at(8), |v| (v / 4096) as usize),
         tmpfs_bytes: unlimited_or(u64_at(16), |v| v as usize),
         tmpfs_nodes: unlimited_or(u64_at(24), |v| v as usize),
+        handles: if handles == 0 {
+            usize::MAX
+        } else {
+            handles as usize
+        },
         profile,
     })
 }

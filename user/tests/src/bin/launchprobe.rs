@@ -18,6 +18,7 @@ use keel_rt::sys::{self, Limits};
 
 const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
+const EMFILE: i64 = -24;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const EEXIST: i64 = -17;
@@ -134,6 +135,21 @@ fn child(mode: &[u8]) -> i32 {
             if !ENV_SEEN.load(core::sync::atomic::Ordering::Relaxed) {
                 return 63;
             }
+            // The full manifest also sets `handles = 16` (ADR 0042): dup
+            // reaches descriptor 15 and no further (EMFILE).
+            if full {
+                let mut highest = 0;
+                let last = loop {
+                    let fd = sys::dup(1);
+                    if fd < 0 {
+                        break fd;
+                    }
+                    highest = fd;
+                };
+                if highest != 15 || last != EMFILE {
+                    return 65;
+                }
+            }
             sys::write(1, b"manifest: hello\n");
             43
         }
@@ -236,6 +252,7 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
         memory_bytes: 64 << 20,
         tmpfs_bytes: 1 << 20,
         tmpfs_nodes: 64,
+        handles: 0,
     };
     // 1. No such call past the last; a handle that is no factory EBADF.
     if sys::native_raw(7, 0, 0, 0) != ENOSYS

@@ -1907,6 +1907,7 @@ fn phase3(t: &mut Runner) {
 
     phase3_side_by_side(t);
     phase3_profiles(t);
+    phase3_under_load(t);
 
     // P3-S4: a compartment's process limit. One slot: a second process
     // is refused with EAGAIN while the first lives, and admitted after.
@@ -2161,6 +2162,130 @@ fn phase3_profiles(t: &mut Runner) {
             "  profileprobe: default {default:?}, full {full:?}; denied: default {}, full {}",
             d.denied(),
             f.denied()
+        );
+    }
+}
+
+/// P3-S4, security acceptance P3 item 3 (ADR 0042): a fork bomb and a
+/// memory hog in compartment A leave compartment B responsive, and A is
+/// stopped cleanly at its limits. A (17 processes, 8 MiB) runs
+/// `loadprobe bomb`: it forks until EAGAIN, every child spinning, then
+/// touches memory until its memory limit ends it with a fault. With all
+/// 16 children spinning, B runs `loadprobe respond`, whose sleeps and
+/// forks must each finish within `RESPONSIVE_MS`; so must they in the
+/// system compartment; and then `keel-shell -c` in B must finish within
+/// a second. Then A is killed;
+/// its process count, memory budget and every frame come back.
+fn phase3_under_load(t: &mut Runner) {
+    use keel_core::compartment::Limits;
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{compartment, fs, process};
+    const PROBE: &[u8] = b"/test/loadprobe";
+    const SHELL: &[u8] = b"/bin/keel-shell";
+    /// The most a 5 ms sleep may be late, or a fork and wait take, in B.
+    /// One time slice is 10 ms. With fair turns a sleep was measured at
+    /// most 38 ms late and a fork and wait (a turn for the child, then
+    /// one for the parent) at most 50 ms; with A's 16 hogs sharing one
+    /// queue, at least 160 ms and 330 ms.
+    const RESPONSIVE_MS: &[u8] = b"100";
+    const A_PROCESSES: u32 = 17;
+    let made = fs::with(|f| {
+        let comp = f.lookup(ROOT, ROOT, b"/comp")?;
+        f.create_dir(comp, b"la", 0o755)?;
+        f.create_dir(comp, b"lb", 0o755)
+    });
+    let (Ok(_), Ok(a), Ok(b)) = (
+        made,
+        compartment::create(
+            b"/comp/la",
+            Limits {
+                processes: A_PROCESSES,
+                memory_frames: 2048,
+                ..Limits::UNLIMITED
+            },
+        ),
+        compartment::create(
+            b"/comp/lb",
+            Limits {
+                processes: 4,
+                ..Limits::UNLIMITED
+            },
+        ),
+    ) else {
+        t.check(
+            "compartment.under_load",
+            false,
+            "creating /comp/la and /comp/lb",
+        );
+        return;
+    };
+    let frames = frames_outside_heap();
+    // B alone first, for the log.
+    let quiet = run_in(&b, PROBE, &[PROBE, b"respond", b"1000"]);
+    let bomb = fs::read_file(PROBE)
+        .ok()
+        .and_then(|file| {
+            keel_linux_abi::exec::load_in(a.root(), &file, PROBE, &[PROBE, b"bomb"], &[]).ok()
+        })
+        .and_then(|loaded| process::spawn_in(&a, "bomb", &loaded).ok());
+    // Until A is full: its limit reached, the children spinning.
+    let full = bomb.is_some()
+        && (0..1000).any(|_| {
+            let at_limit = a.processes() == A_PROCESSES;
+            if !at_limit {
+                sched::sleep_ms(10);
+            }
+            at_limit
+        });
+    let loaded = run_in(&b, PROBE, &[PROBE, b"respond", RESPONSIVE_MS]);
+    // The system compartment (keel-init's, and its shell's) as well: A's
+    // threads must not count against it either.
+    let system = run_test_program(PROBE, &[PROBE, b"respond", RESPONSIVE_MS]);
+    let start = time::monotonic_nanos();
+    let shell = run_in(&b, SHELL, &[SHELL, b"-c", b"echo b: responsive"]);
+    let shell_ms = (time::monotonic_nanos() - start) / 1_000_000;
+    // A's PID 1 ends at its memory limit with a fault.
+    let hog = bomb.and_then(|s| {
+        sched::join_timeout(s.thread, 20_000).then(|| sched::exit_status(s.thread))?
+    });
+    let spinning = a.processes();
+    for target in process::members(&a, |_| true) {
+        keel_linux_abi::signal::send_to_process(
+            &target,
+            keel_core::signal::SigInfo::kernel(keel_core::signal::SIGKILL),
+        );
+    }
+    let emptied = (0..1000).any(|_| {
+        let empty = a.processes() == 0;
+        if !empty {
+            sched::sleep_ms(10);
+        }
+        empty
+    });
+    sched::sleep_ms(50);
+    let frames_after = frames_outside_heap();
+    let faulted = matches!(hog, Some((_, Some(_))));
+    let ok = full
+        && quiet == Some((0, None))
+        && loaded == Some((0, None))
+        && system == Some((0, None))
+        && shell == Some((0, None))
+        && shell_ms < 1000
+        && faulted
+        && spinning == A_PROCESSES - 1
+        && emptied
+        && a.memory().used() == 0
+        && b.processes() == 0
+        && frames_after == frames;
+    t.check(
+        "compartment.under_load",
+        ok,
+        "a fork bomb (to its process limit, every child spinning) and a memory hog (ended by a fault at its memory limit) in one compartment leave another, and the system compartment, responsive: their sleeps and forks within 100 ms, and a shell within a second; the first is then killed cleanly, its memory and every frame back",
+    );
+    if !ok {
+        kprintln!(
+            "  under load: full {full}; B quiet {quiet:?}, loaded {loaded:?}; system {system:?}; shell {shell:?} in {shell_ms} ms; hog {hog:?}; {spinning} left spinning; emptied {emptied}, memory {} frames; frames outside the heap {frames} -> {frames_after}",
+            a.memory().used()
         );
     }
 }
@@ -3374,7 +3499,7 @@ fn phase3_manifest_launch(t: &mut Runner) {
     const GOOD: &[u8] = b"# launch.manifest\nname = \"probe\"\nexec = \"/prog\"\nargs = [\"child\", \"manifest\"]\nenv = [\"GREETING=hello\"]\ndevices = [\"null\"]\n\n[root]\nbase = \"/launch-test/app\"\n\n[limits]\nprocesses = 4\nmemory_mb = 64\n";
     const BAD: &[u8] = b"name = \"probe\"\nexec = \"/prog\"\n[root]\nbase = \"/launch-test/app\"\n[network]\nallowed = true\n";
     // ADR 0041: the same program, asking for the full profile.
-    const FULL: &[u8] = b"name = \"probe\"\nexec = \"/prog\"\nargs = [\"child\", \"manifest-full\"]\nenv = [\"GREETING=hello\"]\ndevices = [\"null\"]\nprofile = \"full\"\n[root]\nbase = \"/launch-test/app\"\n";
+    const FULL: &[u8] = b"name = \"probe\"\nexec = \"/prog\"\nargs = [\"child\", \"manifest-full\"]\nenv = [\"GREETING=hello\"]\ndevices = [\"null\"]\nprofile = \"full\"\n[root]\nbase = \"/launch-test/app\"\n[limits]\nhandles = 16\n";
     let made = fs::with(|f| {
         let top = f.create_dir(ROOT, b"launch-test", 0o755)?;
         let app = f.create_dir(top, b"app", 0o755)?;
@@ -3787,6 +3912,7 @@ fn phase3_hostile_executables(t: &mut Runner) {
         memory_frames: 8192,
         tmpfs_bytes: 1 << 20,
         tmpfs_nodes: 64,
+        handles: usize::MAX,
         profile: &keel_core::profile::FULL,
     };
     let (Ok(_), Ok(c)) = (made, compartment::create(b"/comp/hostile", limits)) else {
@@ -4790,7 +4916,7 @@ fn run_user_program_with(
             Prot::READ_WRITE,
         )
         .ok()?;
-    let id = sched::spawn_user("user-test", space.clone(), CODE, STACK_TOP, argument).ok()?;
+    let id = sched::spawn_user("user-test", space.clone(), CODE, STACK_TOP, argument, 0).ok()?;
     join(id);
     let (status, fault) = sched::exit_status(id)?;
     Some((status, fault, space))

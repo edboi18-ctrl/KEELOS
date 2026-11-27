@@ -123,6 +123,26 @@ impl<T: Clone> HandleTable<T> {
         }
     }
 
+    /// The most handles it may hold.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Lowers the limit to `limit` (a compartment's, ADR 0042); a higher
+    /// one leaves it as it is. EMFILE, changing nothing, if a handle is
+    /// already at an index the new limit excludes.
+    pub fn lower_limit(&mut self, limit: usize) -> Result<(), Errno> {
+        if limit >= self.limit {
+            return Ok(());
+        }
+        if self.slots.iter().skip(limit).any(Option::is_some) {
+            return Err(Errno::EMFILE);
+        }
+        self.slots.truncate(limit);
+        self.limit = limit;
+        Ok(())
+    }
+
     /// Adds a handle at the lowest free index, as POSIX requires for
     /// open(2), and returns the index.
     pub fn insert(&mut self, handle: Handle<T>) -> Result<i32, Errno> {
@@ -383,6 +403,28 @@ mod tests {
         assert_eq!(t.close(1).map(|h| h.object), Err(Errno::EBADF));
         assert_eq!(t.insert(h(4, Rights::READ)), Ok(1));
         assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn a_limit_only_goes_down_and_never_past_a_handle() {
+        let mut t = HandleTable::new(1024);
+        for i in 0..3 {
+            assert_eq!(t.insert(h(i, Rights::READ)), Ok(i as i32));
+        }
+        // A handle at index 2: a limit of 2 would drop it.
+        assert_eq!(t.lower_limit(2), Err(Errno::EMFILE));
+        assert_eq!(t.limit(), 1024);
+        assert_eq!(t.lower_limit(4), Ok(()));
+        assert_eq!(t.limit(), 4);
+        assert_eq!(t.lower_limit(100), Ok(()));
+        assert_eq!(t.limit(), 4);
+        assert_eq!(t.insert(h(3, Rights::READ)), Ok(3));
+        assert_eq!(t.insert(h(4, Rights::READ)), Err(Errno::EMFILE));
+        // A copy (fork) keeps the limit.
+        let mut copy = t.clone();
+        assert_eq!(copy.close(0).map(|h| h.object), Ok(0));
+        assert_eq!(copy.insert(h(5, Rights::READ)), Ok(0));
+        assert_eq!(copy.insert(h(6, Rights::READ)), Err(Errno::EMFILE));
     }
 
     #[test]

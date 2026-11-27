@@ -64,7 +64,9 @@ field must be 0 (EINVAL otherwise, SR-10).
 
 `limits` is 40 bytes: processes (u32) and the allowlist profile's number
 (u32, ADR 0041; reserved until P3-S3), then memory
-bytes, tmpfs bytes and tmpfs nodes (u64 each), then 8 reserved bytes.
+bytes, tmpfs bytes and tmpfs nodes (u64 each), then descriptors per
+process (u32, ADR 0042; 0 the kernel's own limit; reserved until P3-S4)
+and 4 reserved bytes.
 `u64::MAX` (and `u32::MAX`) is no limit. Memory is rounded down to 4 KiB
 frames.
 
@@ -144,7 +146,7 @@ manifest is valid TOML meaning the same.
 | `[display] allowed` | compositor connection | only `false` until Phase 5 |
 | `[network] allowed` | network | only `false` |
 | `[limits] memory_mb`, `processes`, `tmpfs_mb`, `tmpfs_nodes` | the compartment's limits | optional; default 256 MiB, 64, 64 MiB, 4096 |
-| `[limits] handles` | descriptors per process | at most 1024, Keel's fixed table size |
+| `[limits] handles` | descriptors per process (ADR 0042) | 3 to 1024; 1024 when left out |
 
 Fail closed (SR-10): an unknown key or table, a value of the wrong type,
 a key given twice, a string over 4096 bytes, or a manifest over 64 KiB
@@ -161,10 +163,6 @@ spec section 3, "Parser fuzzing on the host").
   points where they will go.
 - **Who may ask the service** is anyone in the system compartment, with
   no per-user policy: Keel has no users yet (SR-6).
-- **CPU share** (SR-8): no limit yet.
-- **A per-compartment handle cap:** each process has Keel's fixed table
-  of 1024. `[limits] handles` is checked (3 to 1024) but not yet
-  enforced below that.
 
 ## Evidence
 
