@@ -814,6 +814,41 @@ pub fn prctl_name(option: u64, name: &mut [u8; 16]) -> i64 {
     call6(157, [option, name.as_mut_ptr() as u64, 0, 0, 0, 0])
 }
 
+/// prctl(2) of `option` with every other argument 0, for testing that
+/// options are refused. A 0 pointer argument names no memory, so the
+/// kernel can write nothing of this program's (EFAULT at most).
+pub fn prctl_option(option: u64) -> i64 {
+    call6(157, [option, 0, 0, 0, 0, 0])
+}
+
+/// arch_prctl(2) of `code` with address 0, for testing that codes are
+/// refused. ARCH_SET_FS and ARCH_SET_GS are not offered (-22 here): they
+/// would move this program's thread pointer. A GET code writes to
+/// address 0, which names no memory (EFAULT).
+pub fn arch_prctl_option(code: u64) -> i64 {
+    if code == ARCH_SET_FS || code == ARCH_SET_GS {
+        return -22;
+    }
+    call3(nr::ARCH_PRCTL, code, 0, 0)
+}
+
+/// linkat(2): a new name `new` (from `newdirfd`) for `old` (from
+/// `olddirfd`); `flags` AT_SYMLINK_FOLLOW (0x400) or AT_EMPTY_PATH
+/// (0x1000).
+pub fn linkat(olddirfd: i32, old: &CStr, newdirfd: i32, new: &CStr, flags: u32) -> i64 {
+    call6(
+        265,
+        [
+            olddirfd as u64,
+            old.as_ptr() as u64,
+            newdirfd as u64,
+            new.as_ptr() as u64,
+            u64::from(flags),
+            0,
+        ],
+    )
+}
+
 pub fn dup(fd: i32) -> i64 {
     call3(32, fd as u64, 0, 0)
 }

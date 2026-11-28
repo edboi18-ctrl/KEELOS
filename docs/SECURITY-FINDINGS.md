@@ -14,7 +14,40 @@ F-0005 to F-0009 were found on 2026-11-22 by the system-call fuzzer
 (`cargo xtask fuzz`, security acceptance P1 item 6), each a denial of
 service reachable from an unprivileged user program. F-0010, of the same
 kind, was found the same day by CI. F-0011 was found by the second Phase 1
-audit (`docs/PHASE1-AUDIT-2.md`, A1), which reproduced it.
+audit (`docs/PHASE1-AUDIT-2.md`, A1), which reproduced it. F-0012 was
+found on 2026-11-28 while writing the escape suite (P3-S8, ADR 0047).
+
+### F-0012: linkat(AT_EMPTY_PATH) named a descriptor's file in the caller's tree
+
+Found 2026-11-28 by reading `linkat` while writing the escape suite's
+hard-link attempts (ADR 0047); it was not reached from a compartment
+before the fix.
+
+Cause. `linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH)` gave the file
+of any descriptor the caller held, needing only the descriptor's STAT
+right, a new name wherever the caller could create one. A descriptor can
+name a file outside the caller's tree: a file handed to a compartment as
+standard input, a file received over a Unix socket, or the console device
+(`/dev/console`, standard error of every process the kernel starts). With
+a name in its own tree, a compartment could:
+- open a file it had been given read-only again for writing, and change
+  it outside its tree (a rights escalation, against SR-1);
+- give itself a console device node, so any of its processes could open
+  the console without being handed it, and a private tree (ADR 0046)
+  would keep the node for later launches.
+
+Linux v6.12 refuses the same call (ENOENT) unless the descriptor was
+opened with the caller's own credentials or the caller has
+CAP_DAC_READ_SEARCH (`fs/namei.c`, `path_init` with LOOKUP_LINKAT_EMPTY).
+
+Fix: Keel keeps no record of who opened a file, so `linkat` refuses an
+empty path with AT_EMPTY_PATH and a descriptor (not AT_FDCWD) with ENOENT,
+after checking the descriptor is open (EBADF otherwise, as Linux).
+Nothing in Keel's programs or the Wine trace uses it.
+
+Regression test: `sec.escape_fs`, `escfs` checks 57 (its standard input,
+the read-only secret outside its tree) and 58 (the console). With the
+check removed, check 57 fails (the link is made).
 
 ### F-0011: user programs could exhaust kernel memory and panic the kernel
 

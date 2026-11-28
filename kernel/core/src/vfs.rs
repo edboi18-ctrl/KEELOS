@@ -618,6 +618,41 @@ impl Fs {
         }
     }
 
+    /// Where open(2) with O_CREAT, following links, creates `path`: the
+    /// parent directory and the last name, after following a last
+    /// component that is a dangling symbolic link to where it points.
+    /// Linux does the same (`open_last_lookups` follows the link and
+    /// creates its target), measured on Linux 6.18: through a chain of
+    /// links; a relative target from the directory holding the link;
+    /// ENOENT if the target's directory does not exist; EISDIR for a
+    /// target ending in `/`. Each target is looked up within `root`, so a
+    /// link pointing out names a place inside it (escape suite, ADR
+    /// 0047). More than `MAXSYMLINKS` links is ELOOP.
+    pub fn create_parent(&self, root: Ino, cwd: Ino, path: &[u8]) -> Result<(Ino, Vec<u8>), Errno> {
+        let (mut dir, name) = self.lookup_parent(root, cwd, path)?;
+        let mut name = name.to_vec();
+        let mut links = 0;
+        loop {
+            let target = match self.child(dir, &name).and_then(|i| self.node(i)) {
+                Ok(Node {
+                    contents: Contents::Symlink(target),
+                    ..
+                }) => target.clone(),
+                _ => return Ok((dir, name)),
+            };
+            links += 1;
+            if links > MAXSYMLINKS {
+                return Err(Errno::ELOOP);
+            }
+            if has_trailing_slash(&target) {
+                return Err(Errno::EISDIR);
+            }
+            let (next, last) = self.lookup_parent(root, dir, &target)?;
+            name = last.to_vec();
+            dir = next;
+        }
+    }
+
     /// Whether `ino` is `root` or lies beneath it (through directories'
     /// parents).
     pub fn is_beneath(&self, root: Ino, mut ino: Ino) -> bool {
@@ -2459,6 +2494,54 @@ mod tests {
         assert_eq!(a.bytes.used(), 0);
         assert_eq!(fs.bytes_used(), 50);
     }
+    #[test]
+    fn create_parent_follows_dangling_links_within_the_root() {
+        let mut fs = sample();
+        let etc = fs.lookup(ROOT, ROOT, b"/etc").unwrap();
+        let jail = fs.create_dir(ROOT, b"jail", 0o755).unwrap();
+        let d = fs.create_dir(jail, b"d", 0o755).unwrap();
+        // Not a link: the name itself.
+        assert_eq!(
+            fs.create_parent(jail, jail, b"/new"),
+            Ok((jail, b"new".to_vec()))
+        );
+        // A chain of links, and a relative target from the link's own
+        // directory, as Linux 6.18 does.
+        fs.create_symlink_as(jail, b"a", b"b", None).unwrap();
+        fs.create_symlink_as(jail, b"b", b"d/made", None).unwrap();
+        assert_eq!(
+            fs.create_parent(jail, jail, b"/a"),
+            Ok((d, b"made".to_vec()))
+        );
+        fs.create_symlink_as(d, b"up", b"../top", None).unwrap();
+        assert_eq!(
+            fs.create_parent(jail, jail, b"/d/up"),
+            Ok((jail, b"top".to_vec()))
+        );
+        // Pointing out of the root: a place inside it. `/etc` of the
+        // whole tree exists, the root's own does not (ENOENT); `..` stops
+        // at the root.
+        fs.create_symlink_as(jail, b"out", b"/../../etc/made", None)
+            .unwrap();
+        assert_eq!(fs.create_parent(jail, jail, b"/out"), Err(Errno::ENOENT));
+        assert_eq!(
+            fs.create_parent(ROOT, ROOT, b"/jail/out"),
+            Ok((etc, b"made".to_vec()))
+        );
+        fs.create_symlink_as(jail, b"up2", b"../../../x", None)
+            .unwrap();
+        assert_eq!(
+            fs.create_parent(jail, jail, b"/up2"),
+            Ok((jail, b"x".to_vec()))
+        );
+        // A target ending in `/` is EISDIR; a loop is ELOOP.
+        fs.create_symlink_as(jail, b"slash", b"newdir/", None)
+            .unwrap();
+        assert_eq!(fs.create_parent(jail, jail, b"/slash"), Err(Errno::EISDIR));
+        fs.create_symlink_as(jail, b"loop", b"loop", None).unwrap();
+        assert_eq!(fs.create_parent(jail, jail, b"/loop"), Err(Errno::ELOOP));
+    }
+
     #[test]
     fn symlinks_are_followed_and_stay_in_the_root() {
         let mut fs = sample();

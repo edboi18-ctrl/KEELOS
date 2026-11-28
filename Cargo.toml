@@ -15,6 +15,7 @@ members = [
     "user/peldr",
     "fuzz/pe-fuzz",
     "user/tests",
+    "user/sectests",
     "user/std-tests",
 ]
 # Plain `cargo build` / `cargo test` on the host only touch host-buildable

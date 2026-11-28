@@ -270,6 +270,35 @@ kernel has neither: its binary holds none of their code
 (`sr21.release_kernel`), and booted with every such option it ignores
 each, saying so (`sr21.release_ignores_options`).
 
+P3-S8 (the escape suite and in-compartment fuzzing, ADR 0047) is done.
+`user/sectests` holds four escape programs and a neighbour. They run in
+a compartment holding nothing but copies of themselves, with the full
+profile and small limits, while the neighbour runs in another. They
+cover:
+- the filesystem (`..`, symbolic links pointing out and swapped during
+  lookups, hard links, `/proc`, device nodes);
+- other compartments' processes and sockets, and guessed handle numbers;
+- the never-implemented calls, forbidden clone, prctl and arch_prctl
+  values, the 32-bit entries and writable-and-executable mappings;
+- fresh memory, which must read zero;
+- every resource limit.
+
+Each attempt fails with its documented errno (`sec.escape_fs`,
+`sec.escape_processes`, `sec.escape_calls`, `sec.escape_limits`).
+Afterwards nothing outside has changed and the neighbour was not reached
+(`sec.escape_outside`). Writing the suite found two problems, both
+fixed:
+- **F-0012:** `linkat(AT_EMPTY_PATH)` could name a descriptor's file,
+  such as a read-only file from outside or the console, in the caller's
+  tree.
+- **O_CREAT through a dangling link** created nothing, where Linux
+  creates the target.
+
+The system-call fuzzer now runs in a compartment of its own and forks.
+After every run, its compartment must empty and nothing outside it may
+have changed. The nightly workflow runs eight 60-minute shards (P3
+security acceptance item 4) and the escape suite alone.
+
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 
 - `cargo xtask test`: 9 in-kernel tests pass, `KEEL P0 OK` on serial and

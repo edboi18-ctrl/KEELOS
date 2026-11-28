@@ -129,6 +129,48 @@ pub struct TestProgram {
 }
 
 pub const TEST_PROGRAMS: &[TestProgram] = &[
+    // The escape suite (`user/sectests`, P3-S8, ADR 0047): Keel only, run
+    // by `sec.escape` from copies inside a compartment.
+    TestProgram {
+        path: "sec/escfs",
+        binary: "escfs",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
+        path: "sec/escproc",
+        binary: "escproc",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
+        path: "sec/esccalls",
+        binary: "esccalls",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
+        path: "sec/esclimits",
+        binary: "esclimits",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
+        path: "sec/escneighbour",
+        binary: "escneighbour",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
     TestProgram {
         path: "test/fuzz",
         binary: "fuzz",
@@ -717,6 +759,9 @@ pub fn build_user_tests(root: &Path) -> Result<Vec<PathBuf>> {
                 "--locked",
                 "--package",
                 "keel-user-tests",
+                // The escape suite (P3-S8, ADR 0047).
+                "--package",
+                "keel-sectests",
                 "--package",
                 "keel-peldr",
                 // Beside the tests, so the host's shellprobe finds it.

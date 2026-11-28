@@ -1,6 +1,6 @@
 //! Random system calls, for the in-guest kernel fuzzer (Phase 1 security
 //! acceptance item 6: one hour of random-syscall fuzzing, no kernel
-//! panic).
+//! panic), since P3-S8 inside a compartment (ADR 0047).
 //!
 //! The kernel is what is under test. This program's only job is to keep
 //! making calls the kernel must survive: mostly the calls Keel
@@ -51,25 +51,28 @@ const NR_POLL: u64 = 7;
 const NR_OPENAT: u64 = 257;
 /// exit and exit_group end the run early; they are made once, at the end.
 /// execve would too, if a random path ever named a program: it is never
-/// made here (hostile executables have their own test). Nor are clone,
-/// fork and vfork: every child would go on fuzzing and forking, without
-/// limit in the system compartment, until the fuzzer runs inside a
-/// compartment with a process limit (P3-S8); fork has its own tests. Nor
-/// kill (a random SIGKILL could end the fuzzer itself) or futex (a
-/// FUTEX_WAIT whose value happens to match would block for ever, which the
-/// harness counts as a hung run); both have their own tests. Nor
-/// rt_sigreturn (it would load registers from whatever lies on the stack
-/// and jump there) or tkill and tgkill (a random fatal signal, as kill);
-/// signals have their own test (exec.signals).
+/// made here (hostile executables have their own test). Nor are clone
+/// and vfork: a child sharing this program's memory would run on its
+/// stack and change what the parent's Rust code relies on (fork has its
+/// own tests). fork (57) is made: since P3-S8 the fuzzer runs inside a
+/// compartment whose process limit bounds the children, and each child,
+/// a copy, goes on fuzzing with a seed of its own; the kernel's harness
+/// kills what is left when the first process ends. Nor kill (a random
+/// SIGKILL could end the fuzzer itself, a SIGSTOP stop it for good) or
+/// futex (a FUTEX_WAIT whose value happens to match would block for ever,
+/// which the harness counts as a hung run); both have their own tests.
+/// Nor rt_sigreturn (it would load registers from whatever lies on the
+/// stack and jump there) or tkill and tgkill (a random fatal signal, as
+/// kill); signals have their own test (exec.signals).
 const NR_EXIT: u64 = 60;
 const NR_EXIT_GROUP: u64 = 231;
 const NR_EXECVE: u64 = 59;
+const NR_FORK: u64 = 57;
 const NR_RT_SIGRETURN: u64 = 15;
 const NR_TKILL: u64 = 200;
 const NR_TGKILL: u64 = 234;
-const NEVER: [u64; 11] = [
+const NEVER: [u64; 10] = [
     56,
-    57,
     58,
     NR_EXECVE,
     62,
@@ -240,8 +243,14 @@ pub fn run(seed: u64, calls: u64, initial_sp: u64) -> Option<u64> {
         // fuzz run. The one residual case, a write that starts in a
         // mapping the fuzzer made and runs on into the stack, needs a
         // random MAP_FIXED mapping placed directly below the stack, and
-        // would only corrupt this program, never the kernel.
+        // would only corrupt this program, never the kernel. fork gives the
+        // child its own copy of this memory, as `sys::fork` does; clone and
+        // vfork, which could share it, are never made (`NEVER`).
         let result = unsafe { syscall6(number, a) };
+        if number == NR_FORK && result == 0 {
+            // The child: the same seed would repeat the parent's calls.
+            state.rng = Rng::new(state.rng.next_u64() ^ (sys::getpid() as u64).rotate_left(32));
+        }
         if result >= 0 {
             state.last = result as u64;
         }

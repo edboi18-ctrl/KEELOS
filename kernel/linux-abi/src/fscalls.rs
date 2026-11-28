@@ -609,6 +609,16 @@ fn new_name<'p>(fs: &vfs::Fs, parent: &Parent<'p>) -> Result<&'p [u8], Errno> {
 /// AT_SYMLINK_FOLLOW and AT_EMPTY_PATH EINVAL; the source is not followed
 /// if it is a symbolic link unless AT_SYMLINK_FOLLOW (link(2): "does not
 /// dereference oldpath if it is a symbolic link"); then `Fs::link`.
+///
+/// An empty path with AT_EMPTY_PATH, naming the descriptor's own file,
+/// is ENOENT (escape suite, ADR 0047). A descriptor can come from outside
+/// the caller's tree (a file it was handed, read-only, or the console),
+/// and a name for it here could be opened again with more rights than
+/// the descriptor has. Linux v6.12 refuses the same (ENOENT) unless the
+/// descriptor was opened with the caller's own credentials or the caller
+/// has CAP_DAC_READ_SEARCH (`fs/namei.c`, `path_init` with
+/// LOOKUP_LINKAT_EMPTY); Keel keeps no record of who opened a file, so
+/// it refuses them all.
 pub fn linkat(
     p: &ProcessRef,
     olddirfd: i32,
@@ -622,6 +632,11 @@ pub fn linkat(
     }
     let old = path_arg(oldpath)?;
     let new = user_path(newpath)?;
+    if old.is_empty() && flags & AT_EMPTY_PATH != 0 && olddirfd != AT_FDCWD {
+        // As Linux: a descriptor that is not open is EBADF first.
+        node_at(p, olddirfd, &old, false, true)?;
+        return Err(Errno::ENOENT);
+    }
     // An image's file is copied up first, so the new name and the old
     // one stay one file in the private tree (ADR 0046).
     let source = node_for_write_at(

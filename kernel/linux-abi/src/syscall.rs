@@ -1413,8 +1413,10 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
                 if keel_core::vfs::has_trailing_slash(&path) {
                     return Err(Errno::EISDIR);
                 }
-                let (dir, name) = fs.lookup_parent(root, base, &path)?;
-                fs.create_file_as(dir, name, (mode as u32) & 0o7777 & !umask, quota.as_ref())?
+                // A dangling symbolic link as the last component creates
+                // its target, within the root (`Fs::create_parent`).
+                let (dir, name) = fs.create_parent(root, base, &path)?;
+                fs.create_file_as(dir, &name, (mode as u32) & 0o7777 & !umask, quota.as_ref())?
             }
             Err(error) => return Err(error),
         };

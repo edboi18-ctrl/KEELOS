@@ -74,6 +74,9 @@ pub enum Scenario {
     /// Phase 3: the conformance programs, each in a compartment, their
     /// output for xtask to compare with Linux's (ADR 0039).
     Conformance = 8,
+    /// Phase 3: the escape suite alone (ADR 0047), which the main boot
+    /// also runs.
+    Escape = 9,
     Unknown = 255,
 }
 
@@ -99,6 +102,7 @@ pub fn requested_scenario(cmdline: &str) -> Scenario {
         Some("fault_in_panic") => Scenario::FaultInPanic,
         Some("busybox_testsuite") => Scenario::BusyboxSuite,
         Some("conformance") => Scenario::Conformance,
+        Some("escape") => Scenario::Escape,
         Some(_) => Scenario::Unknown,
     }
 }
@@ -218,6 +222,12 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
         (3, Scenario::None) => phase3(&mut runner),
         (3, Scenario::BusyboxSuite) => phase3_busybox_suite(&mut runner),
         (3, Scenario::Conformance) => phase3_conformance(&mut runner),
+        (3, Scenario::Escape) => {
+            // The main boot's tests made `/comp` before; here it is first.
+            let _ =
+                keel_linux_abi::fs::with(|fs| fs.create_dir(keel_core::vfs::ROOT, b"comp", 0o755));
+            phase3_escape(&mut runner);
+        }
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
             kprintln!("selftest: forcing a double fault");
@@ -1183,9 +1193,9 @@ pub fn phase1_musl(t: &mut Runner) {
 /// are made, or earlier if the program kills itself (by unmapping its own
 /// code, say); either way a new run starts with the next seed.
 const FUZZ_CALLS: u64 = 2_000;
-/// A fuzz run that has not ended by then counts as a hang: Keel has no
-/// way to stop a thread yet, and the fuzzer avoids every call that can
-/// wait for long, so a hang is a kernel bug to investigate. Generous,
+/// A fuzz run that has not ended by then, from its start or from the
+/// SIGKILL that ends a waiting run, counts as a hang: a kernel bug to
+/// investigate. Generous,
 /// because a single legitimate call can move 2 GiB (MAX_RW_COUNT), which
 /// takes over a minute without hardware acceleration.
 const FUZZ_RUN_LIMIT_MS: u64 = 600_000;
@@ -1193,6 +1203,10 @@ const FUZZ_RUN_LIMIT_MS: u64 = 600_000;
 /// from running for longer than this, the kernel failed to preempt the
 /// fuzz process (as before system calls became preemptible).
 const FUZZ_MAX_WAKE_MS: u64 = 5_000;
+/// A run that makes no system call for this long is waiting, by itself
+/// or for its own children (since P3-S8 it can fork): it is killed, and
+/// must then end (ADR 0047).
+const FUZZ_IDLE_MS: u64 = 2_000;
 
 /// What a fuzzing session did.
 struct FuzzReport {
@@ -1200,15 +1214,121 @@ struct FuzzReport {
     calls: u64,
     /// Runs the kernel ended with a user fault (the fuzzer harmed itself).
     faulted: u64,
-    /// Seed of a run that did not end in time.
+    /// Seed of a run that did not end in time, or not in time after
+    /// SIGKILL.
     hung: Option<u64>,
+    /// Runs killed after making no call for `FUZZ_IDLE_MS`.
+    blocked: u64,
     /// Longest the harness thread waited past its one-second wake-up.
     worst_wake_ms: u64,
+    /// Seed of a run after which something outside the fuzzer's
+    /// compartment had changed, or the compartment had not emptied.
+    escaped: Option<u64>,
+}
+
+/// The fuzzer's compartment (P3-S8, ADR 0047): limits that bound what a
+/// run, and the children it forks, can take.
+const FUZZ_LIMITS: keel_core::compartment::Limits = keel_core::compartment::Limits {
+    processes: 16,
+    memory_frames: 65536,
+    tmpfs_bytes: 8 << 20,
+    tmpfs_nodes: 512,
+    handles: 1024,
+    profile: &keel_core::profile::FULL,
+};
+
+/// What the fuzzer must never change: the secret outside its
+/// compartment, and the names in the system's root and in the secret's
+/// directory.
+struct FuzzOutside {
+    secret: keel_core::vfs::Ino,
+    root_names: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    outside_names: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+}
+
+const FUZZ_SECRET: &[u8] = b"outside the fuzzer\n";
+
+fn names_in(
+    fs: &keel_core::vfs::Fs,
+    dir: keel_core::vfs::Ino,
+) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    let mut names: alloc::vec::Vec<_> = fs
+        .entries(dir)
+        .map(|e| e.into_iter().map(|(n, _)| n).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+impl FuzzOutside {
+    fn intact(&self) -> bool {
+        keel_linux_abi::fs::with(|fs| {
+            let outside =
+                fs.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/fuzz-outside")?;
+            Ok(fs.contents(self.secret)?.as_slice() == FUZZ_SECRET
+                && names_in(fs, keel_core::vfs::ROOT) == self.root_names
+                && names_in(fs, outside) == self.outside_names)
+        })
+        .unwrap_or(false)
+    }
+}
+
+/// Makes the fuzzer's compartment: its own tree at `/fuzz-root` (or the
+/// one an earlier session made), holding the fuzzer at `/fuzz`,
+/// `/etc/keel-release` (which the fuzzer looks for before it starts) and
+/// `/dev` with null, zero and urandom; and `/fuzz-outside/secret` outside
+/// it.
+fn fuzz_compartment(
+    program: &[u8],
+) -> Option<(
+    alloc::sync::Arc<keel_core::compartment::Compartment>,
+    FuzzOutside,
+)> {
+    use keel_core::vfs::{Device, ROOT};
+    use keel_linux_abi::fs;
+    let made = fs::with(|f| {
+        let (root, outside) = match f.lookup(ROOT, ROOT, b"/fuzz-root") {
+            Ok(root) => (root, f.lookup(ROOT, ROOT, b"/fuzz-outside")?),
+            Err(_) => {
+                let root = f.create_dir(ROOT, b"fuzz-root", 0o755)?;
+                let fuzz = f.create_file(root, b"fuzz", 0o755)?;
+                f.write(fuzz, 0, program)?;
+                let etc = f.create_dir(root, b"etc", 0o755)?;
+                let release = f.create_file(etc, b"keel-release", 0o644)?;
+                f.write(release, 0, b"fuzz\n")?;
+                let dev = f.create_dir(root, b"dev", 0o755)?;
+                f.create_device(dev, b"null", Device::Null)?;
+                f.create_device(dev, b"zero", Device::Zero)?;
+                f.create_device(dev, b"urandom", Device::Urandom)?;
+                let outside = f.create_dir(ROOT, b"fuzz-outside", 0o755)?;
+                let secret = f.create_file(outside, b"secret", 0o644)?;
+                f.write(secret, 0, FUZZ_SECRET)?;
+                (root, outside)
+            }
+        };
+        let secret = f.lookup(ROOT, outside, b"secret")?;
+        Ok((
+            root,
+            FuzzOutside {
+                secret,
+                root_names: names_in(f, ROOT),
+                outside_names: names_in(f, outside),
+            },
+        ))
+    });
+    let (root, outside) = made.ok()?;
+    let c = keel_linux_abi::compartment::create_at(root, FUZZ_LIMITS).ok()?;
+    Some((c, outside))
 }
 
 /// Runs fuzz processes one after another, run `i` with seed `seed + i`,
 /// until `deadline_ns` (monotonic) or `max_runs`. Each seed is logged
 /// before its run, so the last one in the log is the one to replay.
+///
+/// Every run is inside the fuzzer's compartment (P3-S8, ADR 0047). When
+/// its first process has ended, what it forked is killed; the
+/// compartment must then empty, give back its memory, and have changed
+/// nothing outside its tree, or the session stops there as an escape.
 fn fuzz_session(
     seed: u64,
     deadline_ns: u64,
@@ -1223,13 +1343,20 @@ fn fuzz_session(
         calls: 0,
         faulted: 0,
         hung: None,
+        blocked: 0,
         worst_wake_ms: 0,
+        escaped: None,
     };
     let Ok(file) = keel_linux_abi::fs::read_file(PATH) else {
         kprintln!(
             "fuzz: {} missing",
             core::str::from_utf8(PATH).unwrap_or("?")
         );
+        return report;
+    };
+    let Some((compartment, outside)) = fuzz_compartment(&file) else {
+        kprintln!("fuzz: could not make the fuzzer's compartment");
+        report.hung = Some(seed);
         return report;
     };
     let calls_before = keel_linux_abi::syscall::count();
@@ -1239,7 +1366,7 @@ fn fuzz_session(
     while report.runs < max_runs && time::monotonic_nanos() < deadline_ns {
         let run_seed = seed.wrapping_add(report.runs);
         let seed_text = format!("{run_seed}");
-        let args: [&[u8]; 3] = [PATH, seed_text.as_bytes(), calls.as_bytes()];
+        let args: [&[u8]; 3] = [b"/fuzz", seed_text.as_bytes(), calls.as_bytes()];
         if verbose {
             kprintln!(
                 "fuzz: run {} seed {run_seed}, {} free frames, heap {} pages, {} address spaces, {} kernel table frames",
@@ -1250,9 +1377,12 @@ fn fuzz_session(
                 paging::kernel_table_frames()
             );
         }
-        let spawned = keel_linux_abi::exec::load(&file, PATH, &args, &[])
-            .ok()
-            .and_then(|loaded| keel_linux_abi::process::spawn("fuzz", &loaded).ok());
+        let spawned =
+            keel_linux_abi::exec::load_in(compartment.root(), &file, b"/fuzz", &args, &[])
+                .ok()
+                .and_then(|loaded| {
+                    keel_linux_abi::process::spawn_in(&compartment, "fuzz", &loaded).ok()
+                });
         let Some(spawned) = spawned else {
             kprintln!(
                 "fuzz: could not start run {} (seed {run_seed})",
@@ -1263,6 +1393,9 @@ fn fuzz_session(
         };
         let run_start = time::monotonic_nanos();
         let mut last_wake = run_start;
+        // System calls made, and when they last went up.
+        let (mut seen, mut progress_at) = (keel_linux_abi::syscall::count(), run_start);
+        let mut killed_at = None;
         let ended = loop {
             let ended = sched::join_timeout(spawned.thread, 1000);
             let now = time::monotonic_nanos();
@@ -1283,15 +1416,41 @@ fn fuzz_session(
             if ended {
                 break true;
             }
-            if now - run_start > FUZZ_RUN_LIMIT_MS * 1_000_000 {
+            let count = keel_linux_abi::syscall::count();
+            if count != seen {
+                (seen, progress_at) = (count, now);
+            }
+            // No call for a while: every process of the run is waiting
+            // (a parent in wait4 for a child that sleeps for days, a read
+            // of a pipe it holds both ends of), or in one long call. Not
+            // the kernel's fault: SIGKILL must end it. A run SIGKILL cannot
+            // end in time is the kernel's.
+            if killed_at.is_none() && now - progress_at > FUZZ_IDLE_MS * 1_000_000 {
+                kill_compartment(&compartment);
+                killed_at = Some(now);
+                report.blocked += 1;
+                if verbose {
+                    kprintln!(
+                        "fuzz: run {} (seed {run_seed}) waiting with no calls; killed",
+                        report.runs
+                    );
+                }
+            }
+            let since = killed_at.unwrap_or(run_start);
+            if now - since > FUZZ_RUN_LIMIT_MS * 1_000_000 {
                 break false;
             }
         };
         if !ended {
             kprintln!(
-                "fuzz: run {} (seed {run_seed}) did not end within {} s",
+                "fuzz: run {} (seed {run_seed}) did not end within {} s{}",
                 report.runs,
-                FUZZ_RUN_LIMIT_MS / 1000
+                FUZZ_RUN_LIMIT_MS / 1000,
+                if killed_at.is_some() {
+                    " of SIGKILL"
+                } else {
+                    ""
+                }
             );
             report.hung = Some(run_seed);
             break;
@@ -1300,6 +1459,30 @@ fn fuzz_session(
             report.faulted += 1;
         }
         report.runs += 1;
+        // What the run forked is killed; then nothing of it may be left,
+        // and nothing outside its compartment may have changed.
+        kill_compartment(&compartment);
+        let killed = time::monotonic_nanos();
+        let emptied = loop {
+            if compartment.processes() == 0 {
+                break true;
+            }
+            if time::monotonic_nanos() - killed > FUZZ_RUN_LIMIT_MS * 1_000_000 {
+                break false;
+            }
+            sched::sleep_ms(10);
+        };
+        if !emptied || compartment.memory().used() != 0 || !outside.intact() {
+            kprintln!(
+                "fuzz: after run {} (seed {run_seed}): {} processes and {} frames left in its compartment; outside intact {}",
+                report.runs - 1,
+                compartment.processes(),
+                compartment.memory().used(),
+                outside.intact()
+            );
+            report.escaped = Some(run_seed);
+            break;
+        }
     }
     report.calls = keel_linux_abi::syscall::count() - calls_before;
     report
@@ -1321,10 +1504,11 @@ pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
     let report = fuzz_session(seed, deadline, u64::MAX, FUZZ_CALLS, true);
     let elapsed_s = (time::monotonic_nanos() - start) / 1_000_000_000;
     kprintln!(
-        "fuzz: done: {} runs, {} system calls, {} runs ended by a fault, {} s, worst harness wake-up delay {} ms, free frames {} -> {}",
+        "fuzz: done: {} runs, {} system calls, {} runs ended by a fault, {} killed while waiting, {} s, worst harness wake-up delay {} ms, free frames {} -> {}",
         report.runs,
         report.calls,
         report.faulted,
+        report.blocked,
         elapsed_s,
         report.worst_wake_ms,
         frames_before,
@@ -1342,8 +1526,11 @@ pub fn run_fuzz(minutes: u64, seed: u64) -> bool {
     );
     runner.check(
         "fuzz.syscalls",
-        report.hung.is_none() && report.runs > 0 && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
-        "random system calls from user programs: no kernel panic, no hung run, and the kernel stays responsive, for the whole session",
+        report.hung.is_none()
+            && report.escaped.is_none()
+            && report.runs > 0
+            && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
+        "random system calls from a program in a compartment: no kernel panic, no hung run, no escape (nothing outside its compartment changed, nothing of a run left behind), and the kernel stays responsive, for the whole session",
     );
     kresult!(
         "TEST SUMMARY passed={} failed={}",
@@ -1984,6 +2171,7 @@ fn phase3(t: &mut Runner) {
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
+    phase3_escape(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -1993,6 +2181,254 @@ fn phase3(t: &mut Runner) {
     );
     if status != Some((0, None)) {
         kprintln!("  threadprobe: {status:?}");
+    }
+}
+
+/// The escape suite's compartment limits (ADR 0047): small, so each can
+/// be pushed past, and the widest profile, so every attempt reaches the
+/// check that must stop it.
+const ESCAPE_LIMITS: keel_core::compartment::Limits = keel_core::compartment::Limits {
+    processes: 8,
+    memory_frames: 8192,
+    tmpfs_bytes: 1 << 20,
+    tmpfs_nodes: 64,
+    handles: 32,
+    profile: &keel_core::profile::FULL,
+};
+
+/// Sends SIGKILL to every process of `c` (a run that did not end).
+fn kill_compartment(c: &alloc::sync::Arc<keel_core::compartment::Compartment>) {
+    for target in keel_linux_abi::process::members(c, |_| true) {
+        keel_linux_abi::signal::send_to_process(
+            &target,
+            keel_core::signal::SigInfo::kernel(keel_core::signal::SIGKILL),
+        );
+    }
+}
+
+/// P3-S8, security acceptance P3 item 1: the escape suite (`user/sectests`,
+/// ADR 0047). Its programs run one after another in `/comp/esc`, a
+/// compartment holding nothing but copies of them, while `escneighbour`
+/// runs in `/comp/escn`. Each program's standard input is
+/// `/sec-outside/secret` (outside both), read-only. Every program must
+/// exit 0; afterwards the secret is unchanged, nothing new is outside
+/// the escape compartment's tree, and the neighbour found that nothing
+/// reached it.
+fn phase3_escape(t: &mut Runner) {
+    use alloc::vec::Vec;
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{compartment, fs, process};
+    /// A test's name, the program, its arguments after argv[0].
+    type Program = (&'static str, &'static [u8], &'static [&'static [u8]]);
+    const PROGRAMS: [Program; 4] = [
+        ("sec.escape_fs", b"escfs", &[]),
+        ("sec.escape_processes", b"escproc", &[b"16"]),
+        ("sec.escape_calls", b"esccalls", &[]),
+        (
+            "sec.escape_limits",
+            b"esclimits",
+            &[b"8", b"8192", b"1048576", b"64", b"32"],
+        ),
+    ];
+    const NEIGHBOUR: &[u8] = b"escneighbour";
+    const SECRET: &[u8] = b"outside\n";
+    /// The longest one program may take (each takes a few seconds under
+    /// TCG); a run beyond it is killed, and fails, so a program stuck on
+    /// a broken rule ends the boot with its output rather than a timeout.
+    const RUN_LIMIT_S: u64 = 30;
+
+    // The scene: the secret outside, two empty roots, the programs copied
+    // into them (made by the kernel, so charged to no compartment).
+    let names =
+        |f: &keel_core::vfs::Fs, dir: &[u8]| -> Result<Vec<Vec<u8>>, keel_core::errno::Errno> {
+            let ino = f.lookup(ROOT, ROOT, dir)?;
+            let mut names: Vec<Vec<u8>> = f.entries(ino)?.into_iter().map(|(n, _)| n).collect();
+            names.sort();
+            Ok(names)
+        };
+    let scene = fs::with(|f| {
+        let outside = f.create_dir(ROOT, b"sec-outside", 0o755)?;
+        let secret = f.create_file(outside, b"secret", 0o644)?;
+        f.write(secret, 0, SECRET)?;
+        let comp = f.lookup(ROOT, ROOT, b"/comp")?;
+        let esc = f.create_dir(comp, b"esc", 0o755)?;
+        let escn = f.create_dir(comp, b"escn", 0o755)?;
+        Ok((secret, esc, escn))
+    });
+    let copy = |dir: keel_core::vfs::Ino, name: &[u8]| -> Option<()> {
+        let mut from = Vec::from(&b"/sec/"[..]);
+        from.extend_from_slice(name);
+        let data = fs::read_file(&from).ok()?;
+        fs::with(|f| {
+            let ino = f.create_file(dir, name, 0o755)?;
+            f.write(ino, 0, &data)
+        })
+        .ok()
+        .map(|_| ())
+    };
+    let comps = scene.ok().and_then(|(secret, esc, escn)| {
+        for (_, name, _) in PROGRAMS {
+            copy(esc, name)?;
+        }
+        copy(escn, NEIGHBOUR)?;
+        let a = compartment::create(b"/comp/esc", ESCAPE_LIMITS).ok()?;
+        let b = compartment::create(
+            b"/comp/escn",
+            keel_core::compartment::Limits {
+                processes: 8,
+                ..keel_core::compartment::Limits::UNLIMITED
+            },
+        )
+        .ok()?;
+        Some((secret, a, b))
+    });
+    let Some((secret, esc, escn)) = comps else {
+        t.check("sec.escape_fs", false, "setting up the escape suite");
+        return;
+    };
+    let before = fs::with(|f| Ok((names(f, b"/")?, names(f, b"/comp")?)));
+
+    // Waits for `thread` up to `seconds`; kills `c` if it is still going.
+    let bounded = |thread: sched::ThreadId,
+                   c: &alloc::sync::Arc<keel_core::compartment::Compartment>,
+                   seconds: u64| {
+        let start = time::monotonic_nanos();
+        loop {
+            if sched::join_timeout(thread, 1000) {
+                return true;
+            }
+            if time::monotonic_nanos() - start > seconds * 1_000_000_000 {
+                kill_compartment(c);
+                join(thread);
+                return false;
+            }
+        }
+    };
+    let start = |c: &alloc::sync::Arc<keel_core::compartment::Compartment>,
+                 name: &[u8],
+                 args: &[&[u8]],
+                 stdio| {
+        let mut path = Vec::from(&b"/"[..]);
+        path.extend_from_slice(name);
+        let mut argv: Vec<&[u8]> = alloc::vec![path.as_slice()];
+        argv.extend_from_slice(args);
+        let file = fs::read_file(&{
+            let mut p = Vec::from(&b"/sec/"[..]);
+            p.extend_from_slice(name);
+            p
+        })
+        .ok()?;
+        let loaded = keel_linux_abi::exec::load_in(c.root(), &file, &path, &argv, &[]).ok()?;
+        process::spawn_in_with(c, "escape", &loaded, stdio).ok()
+    };
+
+    // The neighbour, with 4 children, until it is ready.
+    let neighbour = start(&escn, NEIGHBOUR, &[b"4"], None);
+    let ready = neighbour.as_ref().is_some_and(|n| {
+        (0..6000).any(|_| {
+            let found = fs::lookup(b"/comp/escn/ready").is_ok();
+            if !found {
+                sched::sleep_ms(10);
+            }
+            found || sched::exit_status(n.thread).is_some()
+        }) && fs::lookup(b"/comp/escn/ready").is_ok()
+    });
+
+    for (test, name, args) in PROGRAMS {
+        let out = fs::with(|f| f.create_detached(Vec::new(), 0o600));
+        let spawned = match (ready, out) {
+            (true, Ok(out)) => start(&esc, name, args, Some((secret, out))).map(|s| (s, out)),
+            _ => None,
+        };
+        let status = spawned.map(|(s, out)| {
+            let ended = bounded(s.thread, &esc, RUN_LIMIT_S);
+            sched::sleep_ms(20);
+            let text = fs::with(|f| {
+                let text = f.contents(out);
+                f.unpin(out);
+                text
+            })
+            .unwrap_or_default();
+            (ended, sched::exit_status(s.thread), text)
+        });
+        let ok = matches!(&status, Some((true, Some((0, None)), _))) && esc.processes() == 0;
+        let what = match name {
+            b"escfs" => {
+                "inside a minimal compartment, no route reaches a file outside its root (`..`, absolute and relative symbolic links, a link swapped during lookups, hard links, renames, /proc), no descriptor it was given can be named in its tree, and no device node is there or can be made"
+            }
+            b"escproc" => {
+                "inside a minimal compartment, no PID outside it can be signalled, waited for or inspected, the other compartment's socket file and abstract names cannot be reached, and every handle number it was not given, and every native call on it, is EBADF"
+            }
+            b"esccalls" => {
+                "inside a minimal compartment, every never-implemented call is ENOSYS, namespace clone flags and dangerous prctl options EINVAL, the 32-bit entries end by a signal, writable-and-executable mappings EACCES, and every page it is given reads zero"
+            }
+            _ => {
+                "inside a minimal compartment, each limit (processes, descriptors, tmpfs bytes and nodes, memory) is refused in its documented way past the limit, and given back"
+            }
+        };
+        t.check(test, ok, what);
+        if !ok {
+            let (ended, exit, text) = status.unwrap_or_default();
+            kprintln!(
+                "  {}: ended {ended}, status {exit:?}, {} processes left; output: {}",
+                core::str::from_utf8(name).unwrap_or("?"),
+                esc.processes(),
+                core::str::from_utf8(&text).unwrap_or("?").trim_end()
+            );
+        }
+    }
+
+    // The neighbour checks what reached it, then ends.
+    let stopped = fs::with(|f| {
+        let dir = f.lookup(ROOT, ROOT, b"/comp/escn")?;
+        f.create_file(dir, b"stop", 0o644)
+    })
+    .is_ok();
+    let neighbour_status = neighbour.map(|n| {
+        let ended = bounded(n.thread, &escn, RUN_LIMIT_S);
+        (ended, sched::exit_status(n.thread))
+    });
+    sched::sleep_ms(50);
+    let after = fs::with(|f| {
+        let contents = f.contents(secret)?;
+        let outside = names(f, b"/sec-outside")?;
+        let neighbour = names(f, b"/comp/escn")?;
+        Ok((
+            contents.as_slice() == SECRET,
+            outside == [b"secret".to_vec()],
+            (names(f, b"/")?, names(f, b"/comp")?),
+            neighbour,
+        ))
+    });
+    let unchanged = match (&before, &after) {
+        (Ok(before), Ok((secret_same, outside_same, now, neighbour))) => {
+            *secret_same
+                && *outside_same
+                && before == now
+                && neighbour.iter().all(|n| {
+                    [&b"escneighbour"[..], b"mine", b"ready", b"sock", b"stop"]
+                        .contains(&n.as_slice())
+                })
+        }
+        _ => false,
+    };
+    let ok = ready
+        && stopped
+        && neighbour_status == Some((true, Some((0, None))))
+        && unchanged
+        && escn.processes() == 0
+        && esc.memory().used() == 0;
+    t.check(
+        "sec.escape_outside",
+        ok,
+        "after the escape suite the secret outside is unchanged and still read-only to it, nothing new is in the system's tree or the other compartment's, and the other compartment's processes, sockets and files were not reached",
+    );
+    if !ok {
+        kprintln!(
+            "  escape: neighbour ready {ready}, status {neighbour_status:?}; unchanged {unchanged} (after {:?}); memory left {}",
+            after.as_ref().map(|a| (a.0, a.1)),
+            esc.memory().used()
+        );
     }
 }
 
@@ -4645,8 +5081,11 @@ pub fn phase1_fuzz_smoke(t: &mut Runner) {
     let report = fuzz_session(0x6b65_656c, u64::MAX, 3, 200, false);
     t.check(
         "fuzz.smoke",
-        report.hung.is_none() && report.runs == 3 && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
-        "three runs of random system calls end without a kernel panic or a hung call",
+        report.hung.is_none()
+            && report.escaped.is_none()
+            && report.runs == 3
+            && report.worst_wake_ms <= FUZZ_MAX_WAKE_MS,
+        "three runs of random system calls in a compartment end without a kernel panic, a hung call or an escape",
     );
     kprintln!(
         "  fuzz smoke: {} runs, {} system calls, {} ended by a fault",

@@ -177,6 +177,13 @@ name = "keel-rt"
 version = "0.0.0"
 
 [[package]]
+name = "keel-sectests"
+version = "0.0.0"
+dependencies = [
+ "keel-rt",
+]
+
+[[package]]
 name = "keel-shell"
 version = "0.0.0"
 dependencies = [

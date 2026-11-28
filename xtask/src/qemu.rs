@@ -89,6 +89,9 @@ pub const PHASES: &[Phase] = &[
     },
 ];
 
+/// The escape suite's scenario, run only on request (ADR 0047).
+pub const ESCAPE_SCENARIO: &str = "escape";
+
 /// First line of the kernel's panic output (`keel-kernel/src/main.rs`).
 const PANIC_BANNER: &str = "*** KEEL KERNEL PANIC ***";
 
@@ -1264,6 +1267,18 @@ pub fn test(
     {
         test_release_gating(options, timeout)?;
         println!("xtask: phase 3 release checks PASSED");
+        return Ok(());
+    }
+    // `--phase 3 --scenario escape`: the escape suite alone (ADR 0047),
+    // for the nightly security workflow and for work on it. The main boot
+    // runs it too, so a full run does not boot it again.
+    if let (Some(ESCAPE_SCENARIO), [phase]) = (only_scenario, selected.as_slice())
+        && phase.number == 3
+    {
+        // Five programs of at most 30 s each, as the kernel bounds them.
+        let timeout = timeout.max(Duration::from_secs(600));
+        test_boot(phase, Some(ESCAPE_SCENARIO), options, timeout)?;
+        println!("xtask: phase 3 scenario {ESCAPE_SCENARIO} PASSED");
         return Ok(());
     }
     if let (Some(name), [phase]) = (only_scenario, selected.as_slice()) {
