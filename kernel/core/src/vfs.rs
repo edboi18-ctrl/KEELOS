@@ -162,6 +162,14 @@ struct Node {
     /// (`shmem_get_inode`); only a memfd made with MFD_ALLOW_SEALING
     /// starts with none.
     seals: u32,
+    /// Part of a read-only image (P3-S5, ADR 0046): its contents, names and
+    /// metadata never change again. Compartments' private trees name it
+    /// until they change it, when they get their own copy
+    /// ([`Fs::copy_up`]).
+    frozen: bool,
+    /// Its link count when it was frozen, which `stat` reports: `links`
+    /// also counts the private trees that name it.
+    image_links: u32,
 }
 
 /// `include/uapi/linux/fcntl.h`: no more seals may be added.
@@ -364,6 +372,8 @@ impl Node {
             mtime: now,
             ctime: now,
             seals: F_SEAL_SEAL,
+            frozen: false,
+            image_links: 0,
         }
     }
 }
@@ -439,6 +449,16 @@ impl Fs {
 
     fn node_mut(&mut self, ino: Ino) -> Result<&mut Node, Errno> {
         self.nodes.get_mut(&ino).ok_or(Errno::ENOENT)
+    }
+
+    /// The node, to change what it holds or reports: EROFS if it is part of
+    /// a read-only image (ADR 0046).
+    fn node_mut_writable(&mut self, ino: Ino) -> Result<&mut Node, Errno> {
+        let node = self.node_mut(ino)?;
+        if node.frozen {
+            return Err(Errno::EROFS);
+        }
+        Ok(node)
     }
 
     /// What `ino` is.
@@ -691,6 +711,9 @@ impl Fs {
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
+        if node.frozen {
+            return Err(Errno::EROFS);
+        }
         Ok(())
     }
 
@@ -892,7 +915,10 @@ impl Fs {
         let now = self.now();
         let node = self.node_mut(ino)?;
         node.links += 1;
-        node.ctime = now;
+        // An image's node only counts the new name: its times are fixed.
+        if !node.frozen {
+            node.ctime = now;
+        }
         self.enter(dir, name, ino);
         Ok(())
     }
@@ -911,7 +937,7 @@ impl Fs {
     fn detach(&mut self, dir: Ino, name: &[u8]) -> Result<Ino, Errno> {
         let now = self.now();
         let ino = {
-            let d = self.node_mut(dir)?;
+            let d = self.node_mut_writable(dir)?;
             let Contents::Directory(entries) = &mut d.contents else {
                 return Err(Errno::ENOTDIR);
             };
@@ -928,7 +954,9 @@ impl Fs {
         if matches!(node.contents, Contents::Directory(_)) {
             node.links = 0;
         }
-        node.ctime = now;
+        if !node.frozen {
+            node.ctime = now;
+        }
         self.maybe_free(ino);
         Ok(ino)
     }
@@ -1014,6 +1042,10 @@ impl Fs {
         if self.node(new_dir)?.links == 0 {
             return Err(Errno::ENOENT);
         }
+        // Nothing moves into, out of or within an image (ADR 0046).
+        if self.node(old_dir)?.frozen || self.node(new_dir)?.frozen {
+            return Err(Errno::EROFS);
+        }
         let now = self.now();
         if flags & RENAME_EXCHANGE != 0 {
             let target = target.ok_or(Errno::ENOENT)?;
@@ -1027,7 +1059,9 @@ impl Fs {
                 if matches!(node.contents, Contents::Directory(_)) {
                     node.parent = dir;
                 }
-                node.ctime = now;
+                if !node.frozen {
+                    node.ctime = now;
+                }
             }
             self.stamp_dirs(old_dir, new_dir, now);
             return Ok(());
@@ -1056,7 +1090,9 @@ impl Fs {
         if matches!(node.contents, Contents::Directory(_)) {
             node.parent = new_dir;
         }
-        node.ctime = now;
+        if !node.frozen {
+            node.ctime = now;
+        }
         self.stamp_dirs(old_dir, new_dir, now);
         Ok(())
     }
@@ -1120,7 +1156,7 @@ impl Fs {
     /// change time.
     pub fn set_permissions(&mut self, ino: Ino, permissions: u32) -> Result<(), Errno> {
         let now = self.now();
-        let node = self.node_mut(ino)?;
+        let node = self.node_mut_writable(ino)?;
         node.permissions = permissions & 0o7777;
         node.ctime = now;
         Ok(())
@@ -1136,7 +1172,7 @@ impl Fs {
         mtime: Option<Timespec>,
     ) -> Result<(), Errno> {
         let now = self.now();
-        let node = self.node_mut(ino)?;
+        let node = self.node_mut_writable(ino)?;
         if let Some(t) = atime {
             node.atime = t;
         }
@@ -1158,6 +1194,7 @@ impl Fs {
     pub fn touch_atime(&mut self, ino: Ino) {
         let now = self.now();
         if let Ok(node) = self.node_mut(ino)
+            && !node.frozen
             && (node.atime <= node.mtime
                 || node.atime <= node.ctime
                 || now.sec - node.atime.sec >= 24 * 60 * 60)
@@ -1221,6 +1258,9 @@ impl Fs {
         if data.is_empty() {
             return Ok(0);
         }
+        if self.node(ino)?.frozen {
+            return Err(Errno::EROFS);
+        }
         let mut end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
         // F_SEAL_GROW (ADR 0044). Linux writes a file a page at a time
         // (`generic_perform_write`), and `shmem_write_begin` refuses each
@@ -1281,6 +1321,9 @@ impl Fs {
         let (bytes_used, byte_limit) = (self.bytes_used, self.byte_limit);
         let may_allocate = self.may_allocate;
         let is_file = matches!(self.node(ino)?.contents, Contents::File(_));
+        if is_file && self.node(ino)?.frozen {
+            return Err(Errno::EROFS);
+        }
         if !is_file {
             return Err(match self.kind(ino)? {
                 Kind::Directory => Errno::EISDIR,
@@ -1367,6 +1410,9 @@ impl Fs {
         if !matches!(node.contents, Contents::File(_)) {
             return Err(Errno::EINVAL);
         }
+        if node.frozen {
+            return Err(Errno::EROFS);
+        }
         if node.seals & F_SEAL_SEAL != 0 {
             return Err(Errno::EPERM);
         }
@@ -1410,13 +1456,255 @@ impl Fs {
         Ok(())
     }
 
+    /// Whether `ino` is part of a read-only image (ADR 0046).
+    pub fn is_frozen(&self, ino: Ino) -> Result<bool, Errno> {
+        Ok(self.node(ino)?.frozen)
+    }
+
+    /// Makes the tree under directory `top` a read-only image (ADR 0046):
+    /// every node in it frozen for good, so nothing can change its data,
+    /// names or metadata (EROFS). Already frozen nodes stay as they are.
+    /// EBUSY, changing nothing, if a file (or any node but a directory) in
+    /// it is open or mapped (pinned): a descriptor opened for writing, or a
+    /// shared mapping, could otherwise still change it. An open directory
+    /// is fine: nothing changes a directory through its descriptor but new
+    /// names, which a frozen directory refuses (EROFS). ENOTDIR if `top`
+    /// is not a directory. Returns how many nodes it froze.
+    pub fn freeze(&mut self, top: Ino) -> Result<usize, Errno> {
+        if self.kind(top)? != Kind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let mut all = Vec::new();
+        let mut todo = alloc::vec![top];
+        while let Some(ino) = todo.pop() {
+            let node = self.node(ino)?;
+            if node.frozen {
+                continue;
+            }
+            match &node.contents {
+                Contents::Directory(entries) => todo.extend(entries.values().copied()),
+                _ if node.pins > 0 => return Err(Errno::EBUSY),
+                _ => {}
+            }
+            all.push(ino);
+        }
+        all.sort_unstable();
+        all.dedup();
+        for &ino in &all {
+            let node = self.node_mut(ino)?;
+            node.frozen = true;
+            node.image_links = node.links;
+        }
+        Ok(all.len())
+    }
+
+    /// Lays the image under frozen directory `from` over directory `into`
+    /// (ADR 0046), for a compartment's private tree:
+    /// - each of `from`'s directories becomes a directory of `into`'s own,
+    ///   with the same permissions and times, charged to `quota`;
+    /// - each of its other nodes (files, links, devices) is entered by
+    ///   name, shared with the image, until the compartment changes it;
+    /// - a name `into` already has is replaced, so a later layer (a
+    ///   template prefix) overrides an earlier one (the base).
+    ///
+    /// EINVAL if `from` is not frozen; EROFS if `into` is; ENOSPC past the
+    /// quota, with what was laid so far kept.
+    pub fn layer(&mut self, into: Ino, from: Ino, quota: Option<&Arc<Quota>>) -> Result<(), Errno> {
+        if !self.node(from)?.frozen || self.kind(from)? != Kind::Directory {
+            return Err(Errno::EINVAL);
+        }
+        if self.kind(into)? != Kind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.node(into)?.frozen {
+            return Err(Errno::EROFS);
+        }
+        let mut todo = alloc::vec![(into, from)];
+        while let Some((into, from)) = todo.pop() {
+            for (name, child) in self.entries(from)? {
+                let existing = self.child(into, &name).ok();
+                let child_is_dir = self.kind(child)? == Kind::Directory;
+                match existing {
+                    Some(e) if child_is_dir && self.kind(e)? == Kind::Directory => {
+                        todo.push((e, child));
+                        continue;
+                    }
+                    Some(_) => self.remove_tree(into, &name)?,
+                    None => {}
+                }
+                if child_is_dir {
+                    let (permissions, atime, mtime) = {
+                        let c = self.node(child)?;
+                        (c.permissions, c.atime, c.mtime)
+                    };
+                    let dir = self.create_dir_as(into, &name, permissions, quota)?;
+                    let node = self.node_mut(dir)?;
+                    (node.atime, node.mtime) = (atime, mtime);
+                    todo.push((dir, child));
+                } else {
+                    self.link(child, into, &name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes `name` from `dir`, and if it is a directory everything
+    /// beneath it first.
+    fn remove_tree(&mut self, dir: Ino, name: &[u8]) -> Result<(), Errno> {
+        let ino = self.child(dir, name)?;
+        if self.kind(ino)? == Kind::Directory {
+            for (child, _) in self.entries(ino)? {
+                self.remove_tree(ino, &child)?;
+            }
+            self.rmdir(dir, name)
+        } else {
+            self.unlink(dir, name)
+        }
+    }
+
+    /// Gives `dir`'s entry `name` a node of its own if it names a node of
+    /// a read-only image (ADR 0046): a copy with the same contents (file
+    /// data is shared until written, `Arc`), permissions, times and seals,
+    /// owned by and charged to `quota` (one node, and the file's bytes,
+    /// which a write then copies). The image's node keeps its other
+    /// names. Returns the entry's node, new or not. EROFS if `dir` is
+    /// itself part of an image. A copied file is a new node, so a hard
+    /// link to the image's node elsewhere in the tree still names the
+    /// image's, as on Linux's overlayfs without its inode index.
+    pub fn copy_up(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<Ino, Errno> {
+        let old = self.child(dir, name)?;
+        let source = self.node(old)?;
+        if !source.frozen {
+            return Ok(old);
+        }
+        if self.node(dir)?.frozen {
+            return Err(Errno::EROFS);
+        }
+        let mut copy = Node::new(
+            source.contents.clone(),
+            source.permissions,
+            quota.cloned(),
+            source.ctime,
+        );
+        (copy.atime, copy.mtime, copy.seals) = (source.atime, source.mtime, source.seals);
+        let bytes = match &copy.contents {
+            Contents::File(data) => data.len(),
+            _ => 0,
+        };
+        if self
+            .bytes_used
+            .checked_add(bytes)
+            .is_none_or(|t| t > self.byte_limit)
+        {
+            return Err(Errno::ENOSPC);
+        }
+        if let Some(q) = quota
+            && !q.bytes.try_charge(bytes)
+        {
+            return Err(Errno::ENOSPC);
+        }
+        if let Err(e) = self.take_slot(quota) {
+            if let Some(q) = quota {
+                q.bytes.uncharge(bytes);
+            }
+            return Err(e);
+        }
+        self.bytes_used += bytes;
+        copy.charged = if quota.is_some() { bytes } else { 0 };
+        copy.parent = dir;
+        copy.links = 1;
+        let new = self.next_ino;
+        self.next_ino += 1;
+        self.nodes.insert(new, copy);
+        self.set_entry(dir, name, new)?;
+        // The image's node loses this name.
+        let owner = self.node(old)?.owner.clone();
+        self.give_slot(owner.as_ref());
+        let node = self.node_mut(old)?;
+        node.links = node.links.saturating_sub(1);
+        self.maybe_free(old);
+        Ok(new)
+    }
+
+    /// Resolves `path` as [`Fs::resolve`] for a call that will change what
+    /// it names (open for writing, truncate, chmod, utimensat, link): a
+    /// node of a read-only image named from a compartment's private tree
+    /// is first copied up there ([`Fs::copy_up`]), charged to `quota`. One
+    /// named from within an image stays as it is, and the change is then
+    /// refused (EROFS).
+    pub fn resolve_for_write(
+        &mut self,
+        root: Ino,
+        cwd: Ino,
+        path: &[u8],
+        follow_last: bool,
+        quota: Option<&Arc<Quota>>,
+    ) -> Result<Ino, Errno> {
+        let ino = self.resolve(root, cwd, path, follow_last)?;
+        if !self.node(ino)?.frozen {
+            return Ok(ino);
+        }
+        match self.entry_of(root, cwd, path, follow_last)? {
+            Some((dir, name)) if !self.node(dir)?.frozen => self.copy_up(dir, &name, quota),
+            _ => Ok(ino),
+        }
+    }
+
+    /// The directory and name of the entry `path` resolves to, after any
+    /// symbolic links (None for a path with no last component, such as
+    /// `/`).
+    fn entry_of(
+        &self,
+        root: Ino,
+        cwd: Ino,
+        path: &[u8],
+        follow_last: bool,
+    ) -> Result<Option<(Ino, Vec<u8>)>, Errno> {
+        let mut names: Vec<Vec<u8>> = components(path)?.map(<[u8]>::to_vec).collect();
+        let mut dir = self.start(root, cwd, path)?;
+        let mut budget = 0;
+        loop {
+            let Some(last) = names.pop() else {
+                return Ok(None);
+            };
+            let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+            dir = self.walk(root, dir, &refs, true, &mut budget)?;
+            let at = self.step(root, dir, &last)?;
+            match &self.node(at)?.contents {
+                Contents::Symlink(target) if follow_last => {
+                    budget += 1;
+                    if budget > MAXSYMLINKS {
+                        return Err(Errno::ELOOP);
+                    }
+                    if target.first() == Some(&b'/') {
+                        dir = root;
+                    }
+                    names = components(target)?.map(<[u8]>::to_vec).collect();
+                }
+                _ => return Ok(Some((dir, last))),
+            }
+        }
+    }
+
     /// File status. A directory's link count is 2 plus its subdirectories
     /// (0 once removed) and its size tmpfs's 20 bytes per entry plus two;
     /// a symbolic link's size is its target's length (`shmem_symlink`).
     pub fn stat(&self, ino: Ino) -> Result<Stat, Errno> {
         let node = self.node(ino)?;
+        // An image's node reports the links it had in the image.
+        let links = if node.frozen {
+            node.image_links
+        } else {
+            node.links
+        };
         let (kind, size, nlink, rdev) = match &node.contents {
-            Contents::File(data) => (S_IFREG, data.len() as u64, node.links, (0, 0)),
+            Contents::File(data) => (S_IFREG, data.len() as u64, links, (0, 0)),
             Contents::Directory(entries) => {
                 let subdirs = entries
                     .values()
@@ -1426,10 +1714,10 @@ impl Fs {
                 let size = (2 + entries.len() as u64) * BOGO_DIRENT_SIZE;
                 (S_IFDIR, size, nlink, (0, 0))
             }
-            Contents::Device(device) => (S_IFCHR, 0, node.links, device.number()),
-            Contents::Symlink(target) => (S_IFLNK, target.len() as u64, node.links, (0, 0)),
-            Contents::Socket => (S_IFSOCK, 0, node.links, (0, 0)),
-            Contents::Fifo => (S_IFIFO, 0, node.links, (0, 0)),
+            Contents::Device(device) => (S_IFCHR, 0, links, device.number()),
+            Contents::Symlink(target) => (S_IFLNK, target.len() as u64, links, (0, 0)),
+            Contents::Socket => (S_IFSOCK, 0, links, (0, 0)),
+            Contents::Fifo => (S_IFIFO, 0, links, (0, 0)),
         };
         Ok(Stat {
             ino,
@@ -1595,6 +1883,223 @@ mod tests {
         let (mut fs, f) = sealed(100, F_SEAL_GROW);
         assert_eq!(fs.write(f, 95, &data[..10]), Err(Errno::EPERM));
         assert_eq!(fs.write(f, 90, &data[..10]), Ok(10));
+    }
+
+    /// An image at /img (a file, a subdirectory with a file, a symbolic
+    /// link to the first, a hard link), frozen, and an empty /priv.
+    fn imaged() -> (Fs, Ino, Ino) {
+        let mut fs = Fs::new(1 << 20);
+        let img = fs.create_dir(ROOT, b"img", 0o755).unwrap();
+        let a = fs.create_file(img, b"a", 0o644).unwrap();
+        fs.write(a, 0, b"image a").unwrap();
+        let sub = fs.create_dir(img, b"sub", 0o750).unwrap();
+        let b = fs.create_file(sub, b"b", 0o600).unwrap();
+        fs.write(b, 0, b"image b").unwrap();
+        fs.create_symlink_as(img, b"link", b"a", None).unwrap();
+        fs.link(a, img, b"hard").unwrap();
+        fs.freeze(img).unwrap();
+        let private = fs.create_dir(ROOT, b"priv", 0o755).unwrap();
+        (fs, img, private)
+    }
+
+    fn text(fs: &Fs, ino: Ino) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = fs.read(ino, 0, &mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    #[test]
+    fn a_frozen_image_cannot_change() {
+        let (mut fs, img, _) = imaged();
+        let a = fs.child(img, b"a").unwrap();
+        assert_eq!(fs.write(a, 0, b"x"), Err(Errno::EROFS));
+        assert_eq!(fs.set_len(a, 0), Err(Errno::EROFS));
+        assert_eq!(fs.set_permissions(a, 0o777), Err(Errno::EROFS));
+        assert_eq!(fs.set_times(a, None, None), Err(Errno::EROFS));
+        assert_eq!(fs.create_file(img, b"new", 0o644), Err(Errno::EROFS));
+        assert_eq!(fs.unlink(img, b"a"), Err(Errno::EROFS));
+        assert_eq!(fs.rename(img, b"a", img, b"z", 0), Err(Errno::EROFS));
+        assert_eq!(fs.rename(img, b"a", ROOT, b"z", 0), Err(Errno::EROFS));
+        assert_eq!(fs.rename(ROOT, b"priv", img, b"p", 0), Err(Errno::EROFS));
+        // Writing through a path inside the image is refused too.
+        let r = fs
+            .resolve_for_write(ROOT, ROOT, b"/img/a", true, None)
+            .unwrap();
+        assert_eq!(r, a);
+        assert_eq!(fs.write(r, 0, b"x"), Err(Errno::EROFS));
+        assert_eq!(text(&fs, a), b"image a");
+        // Reading leaves its access time as it was, a day later too (when
+        // relatime would otherwise stamp it).
+        fn a_day_later() -> Timespec {
+            Timespec {
+                sec: 2 * 24 * 60 * 60,
+                nsec: 0,
+            }
+        }
+        let before = fs.stat(a).unwrap().atime;
+        fs.set_clock(a_day_later);
+        fs.touch_atime(a);
+        assert_eq!(fs.stat(a).unwrap().atime, before);
+        let unfrozen = fs.create_file(ROOT, b"loose", 0o644).unwrap();
+        fs.touch_atime(unfrozen);
+        assert_eq!(fs.stat(unfrozen).unwrap().atime, a_day_later());
+        // Freezing again changes nothing.
+        assert_eq!(fs.freeze(img), Ok(0));
+    }
+
+    #[test]
+    fn an_image_is_read_only_before_its_seals_are_asked() {
+        // A frozen file with F_SEAL_GROW: a write past its end is EROFS,
+        // the filesystem being read-only, not the seal's EPERM.
+        let mut fs = Fs::new(1 << 20);
+        let img = fs.create_dir(ROOT, b"img", 0o755).unwrap();
+        let f = fs.create_file(img, b"f", 0o644).unwrap();
+        fs.allow_sealing(f).unwrap();
+        fs.add_seals(f, F_SEAL_GROW).unwrap();
+        fs.freeze(img).unwrap();
+        assert_eq!(fs.write(f, 0, b"past the end"), Err(Errno::EROFS));
+        assert_eq!(fs.add_seals(f, F_SEAL_SHRINK), Err(Errno::EROFS));
+    }
+
+    #[test]
+    fn an_open_or_mapped_node_cannot_be_frozen() {
+        let mut fs = Fs::new(1 << 20);
+        let img = fs.create_dir(ROOT, b"img", 0o755).unwrap();
+        let f = fs.create_file(img, b"f", 0o644).unwrap();
+        fs.pin(f);
+        assert_eq!(fs.freeze(img), Err(Errno::EBUSY));
+        assert_eq!(fs.is_frozen(img), Ok(false));
+        fs.unpin(f);
+        // An open directory does not stop it.
+        fs.pin(img);
+        assert_eq!(fs.freeze(img), Ok(2));
+        assert_eq!(fs.create_file(img, b"g", 0o644), Err(Errno::EROFS));
+        assert_eq!(fs.freeze(f), Err(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn a_layer_shares_files_and_copies_directories() {
+        let (mut fs, img, private) = imaged();
+        assert_eq!(fs.layer(private, ROOT, None), Err(Errno::EINVAL));
+        fs.layer(private, img, None).unwrap();
+        let a = fs.child(img, b"a").unwrap();
+        // Files are the image's; directories are the private tree's own.
+        assert_eq!(fs.child(private, b"a"), Ok(a));
+        let sub = fs.child(private, b"sub").unwrap();
+        assert_ne!(sub, fs.child(img, b"sub").unwrap());
+        assert!(!fs.is_frozen(sub).unwrap());
+        assert_eq!(fs.stat(sub).unwrap().mode & 0o7777, 0o750);
+        // The image's file reports its own link count (a and hard), not
+        // the private names.
+        assert_eq!(fs.stat(a).unwrap().nlink, 2);
+        // The private tree can take new names and lose old ones.
+        fs.create_file(sub, b"new", 0o644).unwrap();
+        fs.unlink(private, b"hard").unwrap();
+        fs.rename(private, b"link", sub, b"moved", 0).unwrap();
+        assert_eq!(fs.child(img, b"hard"), Ok(a));
+        assert!(fs.child(img, b"link").is_ok());
+        // The moved link is the image's (its relative target now names
+        // nothing in sub).
+        let link = fs.child(img, b"link").unwrap();
+        assert_eq!(fs.resolve(ROOT, ROOT, b"/priv/sub/moved", false), Ok(link));
+        assert_eq!(
+            fs.lookup(ROOT, ROOT, b"/priv/sub/moved"),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(fs.layer(img, img, None), Err(Errno::EROFS));
+    }
+
+    #[test]
+    fn writing_copies_up_and_the_image_keeps_its_own() {
+        let (mut fs, img, private) = imaged();
+        fs.layer(private, img, None).unwrap();
+        let a = fs.child(img, b"a").unwrap();
+        let mine = fs
+            .resolve_for_write(ROOT, ROOT, b"/priv/a", true, None)
+            .unwrap();
+        assert_ne!(mine, a);
+        assert!(!fs.is_frozen(mine).unwrap());
+        assert_eq!(text(&fs, mine), b"image a");
+        fs.write(mine, 0, b"PRIV").unwrap();
+        assert_eq!(text(&fs, mine), b"PRIVe a");
+        assert_eq!(text(&fs, a), b"image a");
+        assert_eq!(fs.child(private, b"a"), Ok(mine));
+        // Again: already its own.
+        assert_eq!(
+            fs.resolve_for_write(ROOT, ROOT, b"/priv/a", true, None),
+            Ok(mine)
+        );
+        // Through the symbolic link: the link stays shared, its target is
+        // what is copied (here the private copy already).
+        assert_eq!(
+            fs.resolve_for_write(ROOT, ROOT, b"/priv/link", true, None),
+            Ok(mine)
+        );
+        // The hard link still names the image's node.
+        assert_eq!(fs.child(private, b"hard"), Ok(a));
+        // Deeper, through a private directory.
+        let b = fs.lookup(ROOT, ROOT, b"/img/sub/b").unwrap();
+        let mine_b = fs
+            .resolve_for_write(ROOT, ROOT, b"/priv/sub/b", true, None)
+            .unwrap();
+        assert_ne!(mine_b, b);
+        assert_eq!(fs.stat(mine_b).unwrap().mode & 0o7777, 0o600);
+        fs.set_permissions(mine_b, 0o640).unwrap();
+        assert_eq!(fs.stat(b).unwrap().mode & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn copies_and_private_directories_are_charged() {
+        let (mut fs, img, private) = imaged();
+        let quota = Arc::new(Quota {
+            bytes: crate::compartment::Budget::new(1 << 20),
+            nodes: crate::compartment::Budget::new(100),
+        });
+        fs.layer(private, img, Some(&quota)).unwrap();
+        // One private directory (sub).
+        assert_eq!(quota.nodes.used(), 1);
+        let mine = fs
+            .resolve_for_write(ROOT, ROOT, b"/priv/a", true, Some(&quota))
+            .unwrap();
+        assert_eq!(quota.nodes.used(), 2);
+        assert_eq!(quota.bytes.used(), 7);
+        fs.unlink(private, b"a").unwrap();
+        assert_eq!(quota.bytes.used(), 0);
+        assert_eq!(quota.nodes.used(), 1);
+        let _ = mine;
+        // A quota with no room left: the copy is refused, nothing changes.
+        let full = Arc::new(Quota {
+            bytes: crate::compartment::Budget::new(3),
+            nodes: crate::compartment::Budget::new(100),
+        });
+        let other = fs.create_dir(ROOT, b"other", 0o755).unwrap();
+        fs.layer(other, img, Some(&full)).unwrap();
+        let a = fs.child(img, b"a").unwrap();
+        assert_eq!(
+            fs.resolve_for_write(ROOT, ROOT, b"/other/a", true, Some(&full)),
+            Err(Errno::ENOSPC)
+        );
+        assert_eq!(fs.child(other, b"a"), Ok(a));
+    }
+
+    #[test]
+    fn a_later_layer_overrides_an_earlier_one() {
+        let (mut fs, img, private) = imaged();
+        let prefix = fs.create_dir(ROOT, b"prefix", 0o755).unwrap();
+        let pa = fs.create_file(prefix, b"a", 0o644).unwrap();
+        fs.write(pa, 0, b"prefix a").unwrap();
+        let psub = fs.create_dir(prefix, b"sub", 0o755).unwrap();
+        fs.create_file(psub, b"c", 0o644).unwrap();
+        // A file where the base has a directory, and the reverse.
+        fs.create_file(prefix, b"link", 0o644).unwrap();
+        fs.freeze(prefix).unwrap();
+        fs.layer(private, img, None).unwrap();
+        fs.layer(private, prefix, None).unwrap();
+        assert_eq!(fs.child(private, b"a"), Ok(pa));
+        let sub = fs.child(private, b"sub").unwrap();
+        // The directories merge.
+        assert!(fs.child(sub, b"b").is_ok() && fs.child(sub, b"c").is_ok());
+        assert_eq!(fs.kind(fs.child(private, b"link").unwrap()), Ok(Kind::File));
     }
 
     #[test]
@@ -1883,10 +2388,9 @@ mod tests {
     }
 
     fn quota(bytes: usize, nodes: usize) -> Arc<Quota> {
-        use crate::compartment::Budget;
         Arc::new(Quota {
-            bytes: Budget::new(bytes),
-            nodes: Budget::new(nodes),
+            bytes: crate::compartment::Budget::new(bytes),
+            nodes: crate::compartment::Budget::new(nodes),
         })
     }
 

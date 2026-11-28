@@ -1980,6 +1980,7 @@ fn phase3(t: &mut Runner) {
     phase3_launch(t);
     phase3_manifest_launch(t);
     phase3_launch_service(t);
+    phase3_layered_roots(t);
     phase3_shell(t);
     phase3_console_shell(t);
     phase3_console_busybox(t);
@@ -3676,6 +3677,120 @@ fn phase3_manifest_launch(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  launch: made {made:?}; warm {warm:?}, good {good:?}, bad {bad:?}, full profile {full:?}, without a factory {unarmed:?}; processes {processes} -> {processes_after}; frames outside the heap {frames} -> {frames_after}"
+        );
+    }
+}
+
+/// P3-S5 (ADR 0046): layered roots. `/layer-test/base` and
+/// `/layer-test/prefix` are laid as read-only images under a private tree
+/// by keel-launch, through `keel-init --launch`:
+/// - `private.toml` runs launchprobe's `layered` mode (46): the prefix
+///   overrides the base; it writes, creates, removes, renames and chmods
+///   in its private tree;
+/// - `again.toml`, the same private tree, finds those changes (47);
+/// - `ephemeral.toml` gets a fresh tree, sees none of them (46), and its
+///   tree is gone afterwards.
+///
+/// The images are as they were, and read-only to the kernel too (EROFS).
+fn phase3_layered_roots(t: &mut Runner) {
+    use keel_core::errno::Errno;
+    use keel_core::vfs::ROOT;
+    use keel_linux_abi::{fs, process};
+    const INIT: &[u8] = b"/sbin/keel-init";
+    const PRIVATE: &[u8] = b"name = \"layered\"\nexec = \"/prog\"\nargs = [\"child\", \"layered\"]\n[root]\nbase = \"/layer-test/base\"\nprefix = \"/layer-test/prefix\"\nwritable = \"private\"\n";
+    const AGAIN: &[u8] = b"name = \"layered\"\nexec = \"/prog\"\nargs = [\"child\", \"layered-again\"]\n[root]\nbase = \"/layer-test/base\"\nprefix = \"/layer-test/prefix\"\nwritable = \"private\"\n";
+    const EPHEMERAL: &[u8] = b"name = \"layered-e\"\nexec = \"/prog\"\nargs = [\"child\", \"layered\"]\n[root]\nbase = \"/layer-test/base\"\nprefix = \"/layer-test/prefix\"\nwritable = \"ephemeral\"\n";
+    let made = fs::with(|f| {
+        let top = f.create_dir(ROOT, b"layer-test", 0o755)?;
+        let base = f.create_dir(top, b"base", 0o755)?;
+        // The program is a copy: freezing a hard link to /test/launchprobe
+        // would freeze that file too.
+        let program = f.contents(f.lookup(ROOT, ROOT, b"/test/launchprobe")?)?;
+        let prog = f.create_file(base, b"prog", 0o755)?;
+        f.write(prog, 0, &program)?;
+        f.create_dir(base, b"dev", 0o755)?;
+        let etc = f.create_dir(base, b"etc", 0o755)?;
+        for (name, text) in [(&b"greeting"[..], &b"base"[..]), (b"keep", b"keep")] {
+            let file = f.create_file(etc, name, 0o644)?;
+            f.write(file, 0, text)?;
+        }
+        let lib = f.create_dir(base, b"lib", 0o755)?;
+        let x = f.create_file(lib, b"x", 0o644)?;
+        f.write(x, 0, b"x")?;
+        let prefix = f.create_dir(top, b"prefix", 0o755)?;
+        let petc = f.create_dir(prefix, b"etc", 0o755)?;
+        for (name, text) in [(&b"greeting"[..], &b"prefix"[..]), (b"extra", b"extra")] {
+            let file = f.create_file(petc, name, 0o644)?;
+            f.write(file, 0, text)?;
+        }
+        for (name, text) in [
+            (&b"private.toml"[..], PRIVATE),
+            (b"again.toml", AGAIN),
+            (b"ephemeral.toml", EPHEMERAL),
+        ] {
+            let file = f.create_file(top, name, 0o644)?;
+            f.write(file, 0, text)?;
+        }
+        Ok(())
+    });
+    let run = |manifest: &[u8]| {
+        let file = fs::read_file(INIT).ok()?;
+        let loaded =
+            keel_linux_abi::exec::load(&file, INIT, &[INIT, b"--launch", manifest], &[]).ok()?;
+        let spawned =
+            process::spawn_with_fd3("launch", &loaded, keel_linux_abi::native::root_factory())
+                .ok()?;
+        join(spawned.thread);
+        sched::exit_status(spawned.thread)
+    };
+    let processes = process::count();
+    let first = run(b"/layer-test/private.toml");
+    let again = run(b"/layer-test/again.toml");
+    let ephemeral = run(b"/layer-test/ephemeral.toml");
+    sched::sleep_ms(50);
+    let read = |path: &[u8]| {
+        fs::with(|f| {
+            let ino = f.lookup(ROOT, ROOT, path)?;
+            let mut buf = [0u8; 32];
+            let n = f.read(ino, 0, &mut buf)?;
+            Ok((buf, n))
+        })
+        .ok()
+        .map(|(b, n)| alloc::vec::Vec::from(&b[..n]))
+    };
+    let images_kept = read(b"/layer-test/base/etc/keep").as_deref() == Some(&b"keep"[..])
+        && read(b"/layer-test/base/lib/x").as_deref() == Some(&b"x"[..])
+        && read(b"/layer-test/prefix/etc/greeting").as_deref() == Some(&b"prefix"[..])
+        && fs::with(|f| {
+            let g = f.lookup(ROOT, ROOT, b"/layer-test/prefix/etc/greeting")?;
+            let keep = f.lookup(ROOT, ROOT, b"/layer-test/base/etc/keep")?;
+            Ok(f.stat(g)?.mode & 0o7777 == 0o644
+                && f.write(keep, 0, b"k") == Err(Errno::EROFS)
+                && f.is_frozen(keep)?)
+        }) == Ok(true);
+    let private_kept = read(b"/var/keel/layered/etc/keep").as_deref() == Some(&b"mine"[..]);
+    let ephemeral_gone = fs::with(|f| {
+        let run = f.lookup(ROOT, ROOT, b"/run/keel")?;
+        Ok(f.entries(run)?
+            .iter()
+            .all(|(name, _)| !name.starts_with(b"layered-e-")))
+    }) == Ok(true);
+    let ok = made.is_ok()
+        && first == Some((46, None))
+        && again == Some((47, None))
+        && ephemeral == Some((46, None))
+        && images_kept
+        && private_kept
+        && ephemeral_gone
+        && process::count() == processes;
+    t.check(
+        "launch.layered",
+        ok,
+        "layered roots: base and prefix laid as read-only images under a private tree, the prefix overriding the base; the compartment writes, creates, removes, renames and chmods its own copies; a private tree keeps its changes to the next launch, an ephemeral one starts fresh and is removed after; the images are unchanged and read-only (EROFS)",
+    );
+    if !ok {
+        kprintln!(
+            "  layered: made {made:?}; private {first:?}, again {again:?}, ephemeral {ephemeral:?}; images kept {images_kept}, private kept {private_kept}, ephemeral gone {ephemeral_gone}"
         );
     }
 }

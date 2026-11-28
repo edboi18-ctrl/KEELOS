@@ -1396,6 +1396,16 @@ fn openat(p: &Arc<IrqMutex<Process>>, dirfd: i32, path: u64, flags: u64, mode: u
     let node = fs::with(|fs| {
         let node = match fs.resolve(root, base, &path, follow) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(Errno::EEXIST),
+            // A file of a read-only image opened for writing: the private
+            // tree's own copy (ADR 0046); within the image itself, EROFS,
+            // as open(2) answers on a read-only filesystem.
+            Ok(node) if write && fs.kind(node)? == Kind::File && fs.is_frozen(node)? => {
+                let node = fs.resolve_for_write(root, base, &path, follow, quota.as_ref())?;
+                if fs.is_frozen(node)? {
+                    return Err(Errno::EROFS);
+                }
+                node
+            }
             Ok(node) => node,
             Err(Errno::ENOENT) if flags & O_CREAT != 0 => {
                 // "name/" cannot be created as a file (EISDIR, as

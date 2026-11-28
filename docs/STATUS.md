@@ -238,6 +238,15 @@ never-implemented calls are in no profile (host tests), and the 32-bit
 entry paths fault (`compartment.profiles`). A manifest gets `default`
 unless it asks for `full` (`launch.manifest`).
 
+P3-S5 (layered roots, ADR 0046) is done. A manifest with `[root]
+writable = "private"` or `"ephemeral"` gets a private tree over its
+`base` and `prefix`, which become read-only images: frozen for good
+(EROFS to every process), their directories copied into the private
+tree and their files shared until the compartment changes one, which
+then gets its own copy, charged to it. A private tree keeps its changes
+between launches; an ephemeral one is fresh each launch and removed
+when the compartment ends (`launch.layered`, `exec.launch` check 13).
+
 P3-S6 (the audit log, ADR 0045) is done: compartment creations, device
 grants and denied operations (profile refusals and native calls above
 a ceiling, rate-limited per compartment: 32, then 1 a second, the

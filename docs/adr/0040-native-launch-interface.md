@@ -46,7 +46,7 @@ as Linux gives for anon_inode files.
 
 ### The calls
 
-Eight calls (seven, and since ADR 0045 `audit_open`), numbered from `0x1000_0000`. That is far above Linux's
+Nine calls (seven, and since ADR 0045 `audit_open` and ADR 0046 `layer`), numbered from `0x1000_0000`. That is far above Linux's
 x86-64 numbers (below 512) and below the x32 bit (`0x4000_0000`), which
 Keel refuses. The arguments are registers, as for Linux calls. Errors
 are -errno. Structures are little-endian, `repr(C)`, and every reserved
@@ -62,6 +62,7 @@ field must be 0 (EINVAL otherwise, SR-10).
 | +5 | `compartment_kill(c, signal)` | Sends `signal` to every process in the compartment. Needs SIGNAL. |
 | +6 | `compartment_wait(c, usage*, flags)` | Fills `usage`: processes, memory bytes, tmpfs bytes and nodes, and PID 1's wait status (-1 while it runs). Without WNOHANG (1), it first waits until the compartment has no process left; a signal interrupts it (ERESTARTSYS). WNOHANG needs STAT, waiting needs WAIT. |
 | +7 | `audit_open(factory)` | A descriptor of the audit log (ADR 0045), read with read(2) from the oldest record kept. Needs AUDIT, which only the root factory has: a derived factory gets the usual factory rights, and restrict only removes rights. |
+| +8 | `layer(factory, into, from)` | Makes the tree under directory `from` a read-only image for good (EBUSY if a file in it is in use) and lays it over directory `into`, a compartment's private tree (ADR 0046). Needs CREATE on the factory and on `into`, ENUMERATE on `from`. |
 
 `limits` is 40 bytes: processes (u32) and the allowlist profile's number
 (u32, ADR 0041; reserved until P3-S3), then memory
@@ -142,7 +143,7 @@ manifest is valid TOML meaning the same.
 | `devices` | device grants, by name | optional; the five above |
 | `profile` | syscall and ioctl allowlist (ADR 0041) | `"default"` (when left out) or `"full"` |
 | `[root] base` | the directory that becomes `/`, a path in keel-launch's tree | required |
-| `[root] prefix`, `writable` | layered image | refused until P3-S5 |
+| `[root] prefix`, `writable` | a layered root (ADR 0046): `base` and `prefix` as read-only images under a private tree | `writable` is `"private"` or `"ephemeral"`; `prefix` needs it |
 | `[[grant]]` | a directory mounted inside | refused until P3-S5 (needs mounts) |
 | `[display] allowed` | compositor connection | only `false` until Phase 5 |
 | `[network] allowed` | network | only `false` |
@@ -158,8 +159,8 @@ spec section 3, "Parser fuzzing on the host").
 
 ## Not yet covered
 
-- **Layered roots and mounted grants** (`prefix`, `writable`,
-  `[[grant]]`): P3-S5.
+- **Mounted grants** (`[[grant]]`): still refused. Layered roots
+  (`prefix`, `writable`) came with ADR 0046.
 - **Who may ask the service** is anyone in the system compartment, with
   no per-user policy: Keel has no users yet (SR-6).
 

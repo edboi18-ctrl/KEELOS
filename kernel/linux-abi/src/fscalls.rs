@@ -138,6 +138,26 @@ pub(crate) fn node_at(
     fs::with(|fs| fs.resolve(root, base, path, follow))
 }
 
+/// As [`node_at`], for a call that changes the node: one of a read-only
+/// image named from the compartment's private tree is copied up first
+/// (ADR 0046), charged to its quota. An empty path names the descriptor's
+/// node as it is: a change through a descriptor of an image's node is
+/// EROFS.
+pub(crate) fn node_for_write_at(
+    p: &ProcessRef,
+    dirfd: i32,
+    path: &[u8],
+    follow: bool,
+    empty: bool,
+) -> Result<Ino, Errno> {
+    if path.is_empty() {
+        return node_at(p, dirfd, path, follow, empty);
+    }
+    let (root, base) = start(p, dirfd, path, false)?;
+    let quota = crate::syscall::quota_of(p);
+    fs::with(|fs| fs.resolve_for_write(root, base, path, follow, quota.as_ref()))
+}
+
 /// A path argument that may be empty (with AT_EMPTY_PATH): user_path
 /// refuses nothing itself, but a lookup of "" is ENOENT.
 fn path_arg(address: u64) -> Result<Vec<u8>, Errno> {
@@ -602,7 +622,9 @@ pub fn linkat(
     }
     let old = path_arg(oldpath)?;
     let new = user_path(newpath)?;
-    let source = node_at(
+    // An image's file is copied up first, so the new name and the old
+    // one stay one file in the private tree (ADR 0046).
+    let source = node_for_write_at(
         p,
         olddirfd,
         &old,
@@ -660,7 +682,7 @@ pub fn readlinkat(p: &ProcessRef, dirfd: i32, path: u64, buf: u64, size: i32) ->
 /// 07777) of what the path names, following links. Stored only (SR-6).
 pub fn fchmodat(p: &ProcessRef, dirfd: i32, path: u64, mode: u32) -> SysResult {
     let path = user_path(path)?;
-    let node = node_at(p, dirfd, &path, true, false)?;
+    let node = node_for_write_at(p, dirfd, &path, true, false)?;
     fs::with(|fs| fs.set_permissions(node, mode & 0o7777))?;
     Ok(0)
 }
@@ -734,7 +756,7 @@ pub fn utimensat(p: &ProcessRef, dirfd: i32, path: u64, times: u64, flags: u32) 
             return Err(Errno::EINVAL);
         }
         let path = path_arg(path)?;
-        node_at(
+        node_for_write_at(
             p,
             dirfd,
             &path,

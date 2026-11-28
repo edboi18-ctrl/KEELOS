@@ -24,6 +24,8 @@ const EAGAIN: i64 = -11;
 const EEXIST: i64 = -17;
 const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
+const EBUSY: i64 = -16;
+const EROFS: i64 = -30;
 const ENOSYS: i64 = -38;
 const O_DIRECTORY: u64 = 0o200000;
 const SIGKILL: i32 = 9;
@@ -118,6 +120,10 @@ fn child(mode: &[u8]) -> i32 {
         // With `manifest-full`, from a manifest asking for the full
         // profile (ADR 0041): getppid, outside the default profile, works
         // only then.
+        // A layered root (ADR 0046): `/` is a private tree over the base
+        // and prefix images. `layered` is a first launch (exit 46),
+        // `layered-again` a later one of the same private tree (47).
+        b"layered" | b"layered-again" => layered(mode == b"layered-again"),
         b"manifest" | b"manifest-full" => {
             let full = mode == b"manifest-full";
             if (sys::getppid() == ENOSYS) == full {
@@ -259,7 +265,7 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
         handles: 0,
     };
     // 1. No such call past the last; a handle that is no factory EBADF.
-    if sys::native_raw(8, 0, 0, 0) != ENOSYS
+    if sys::native_raw(9, 0, 0, 0) != ENOSYS
         || sys::compartment_create(0, 0, &limits.bytes()) != EBADF
     {
         return 1;
@@ -530,7 +536,175 @@ fn checks(base: &Buf<128>, me: &CStr) -> i32 {
         return 12;
     }
     sys::close(log);
+    // 13. layer (ADR 0046), and what a frozen image refuses. The image
+    //     is made once, at a fixed path, and kept: nothing removes an
+    //     image (the warm run makes it, so the measured run leaks
+    //     nothing). Nothing here links /test/launchprobe into it, which
+    //     would freeze that file too.
+    let r = layer_checks(base);
+    if r != 0 {
+        return r;
+    }
     0
+}
+
+/// Check 13 (see above): 0, or 13.
+fn layer_checks(base: &Buf<128>) -> i32 {
+    const O_WRONLY_TRUNC: u64 = 1 | 0o1000;
+    const IMAGE: &CStr = c"/tmp/keel-launchprobe-image";
+    if sys::mkdir(IMAGE, 0o755) == 0 {
+        let f = sys::open(
+            c"/tmp/keel-launchprobe-image/f",
+            sys::O_WRONLY | sys::O_CREAT,
+            0o644,
+        );
+        if f < 0
+            || sys::write(f as i32, b"f") != 1
+            || sys::mkdir(c"/tmp/keel-launchprobe-image/inner", 0o755) != 0
+        {
+            return 13;
+        }
+        sys::close(f as i32);
+    }
+    let dir = |p: &CStr| sys::open(p, sys::O_RDONLY | O_DIRECTORY, 0) as i32;
+    let mut busy_dir = path(base, b"/busy");
+    let mut private_dir = path(base, b"/priv");
+    if sys::mkdir(path(base, b"/busy").c(), 0o755) != 0
+        || sys::mkdir(path(base, b"/priv").c(), 0o755) != 0
+    {
+        return 13;
+    }
+    let held = sys::open(
+        path(&busy_dir, b"/f").c(),
+        sys::O_RDWR | sys::O_CREAT,
+        0o644,
+    );
+    let (image, private, busy) = (dir(IMAGE), dir(path(base, b"/priv").c()), dir(busy_dir.c()));
+    let file = sys::open(c"/tmp/keel-launchprobe-image/f", sys::O_RDONLY, 0) as i32;
+    let no_create = sys::native_restrict(FACTORY, STAT) as i32;
+    let refusals_ok = held >= 0
+        && image >= 0
+        && private >= 0
+        && sys::native_layer(no_create, private, image) == EBADF
+        && sys::native_layer(FACTORY, file, image) == ENOTDIR
+        && sys::native_layer(FACTORY, private, private) == EINVAL
+        // An open file in it: EBUSY, and it stays as it was.
+        && sys::native_layer(FACTORY, private, busy) == EBUSY
+        && sys::write(held as i32, b"still mine") == 10
+        // A private tree inside the image it would be laid from: EINVAL.
+        && sys::mkdir(path(&busy_dir, b"/sub").c(), 0o755) == 0
+        && {
+            let sub = dir(path(&busy_dir, b"/sub").c());
+            let r = sys::native_layer(FACTORY, sub, busy);
+            sys::close(sub);
+            r == EINVAL
+        };
+    sys::rmdir(path(&busy_dir, b"/sub").c());
+    sys::close(held as i32);
+    sys::close(file);
+    sys::close(no_create);
+    sys::unlink(path(&busy_dir, b"/f").c());
+    sys::close(busy);
+    sys::rmdir(busy_dir.c());
+    if !refusals_ok || sys::native_layer(FACTORY, private, image) != 0 {
+        return 13;
+    }
+    // The private tree has the image's file, and writes its own copy; the
+    // image cannot be written, nor laid over (it is frozen), nor have a
+    // private tree inside it.
+    let inner = dir(c"/tmp/keel-launchprobe-image/inner");
+    // What it holds before this program truncates its own copy.
+    let shared = holds(path(&private_dir, b"/f").c(), b"f");
+    let copy = sys::open(path(&private_dir, b"/f").c(), O_WRONLY_TRUNC, 0);
+    let ok = shared
+        && copy >= 0
+        && sys::write(copy as i32, b"copy") == 4
+        && holds(path(&private_dir, b"/f").c(), b"copy")
+        && holds(c"/tmp/keel-launchprobe-image/f", b"f")
+        && sys::open(c"/tmp/keel-launchprobe-image/f", sys::O_WRONLY, 0) == EROFS
+        && sys::open(
+            c"/tmp/keel-launchprobe-image/g",
+            sys::O_WRONLY | sys::O_CREAT,
+            0o644,
+        ) == EROFS
+        && sys::native_layer(FACTORY, image, private) == EROFS
+        && sys::native_layer(FACTORY, inner, image) == EROFS;
+    sys::close(copy as i32);
+    sys::close(inner);
+    sys::close(image);
+    sys::close(private);
+    sys::unlink(path(&private_dir, b"/f").c());
+    sys::rmdir(path(&private_dir, b"/inner").c());
+    sys::rmdir(private_dir.c());
+    if ok { 0 } else { 13 }
+}
+
+/// What the file at `path` holds (up to 32 bytes), or None.
+fn contents(path: &CStr) -> Option<([u8; 32], usize)> {
+    let fd = sys::open(path, sys::O_RDONLY, 0);
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    let n = sys::read(fd as i32, &mut buf);
+    sys::close(fd as i32);
+    (n >= 0).then_some((buf, n as usize))
+}
+
+fn holds(path: &CStr, want: &[u8]) -> bool {
+    contents(path).is_some_and(|(b, n)| &b[..n] == want)
+}
+
+/// The `layered` child modes (ADR 0046).
+fn layered(again: bool) -> i32 {
+    const O_TRUNC: u64 = 0o1000;
+    if again {
+        // The private tree kept what the first launch did.
+        return if holds(c"/etc/keep", b"mine")
+            && holds(c"/etc/new", b"")
+            && contents(c"/lib/x").is_none()
+            && holds(c"/etc/extra2", b"extra")
+        {
+            47
+        } else {
+            71
+        };
+    }
+    // The prefix overrides the base; the base shows through elsewhere.
+    if !holds(c"/etc/greeting", b"prefix")
+        || !holds(c"/etc/keep", b"keep")
+        || !holds(c"/etc/extra", b"extra")
+        || !holds(c"/lib/x", b"x")
+    {
+        return 72;
+    }
+    // Writing a base file: the compartment's own copy.
+    let fd = sys::open(c"/etc/keep", sys::O_WRONLY | O_TRUNC, 0);
+    if fd < 0 || sys::write(fd as i32, b"mine") != 4 {
+        return 73;
+    }
+    sys::close(fd as i32);
+    if !holds(c"/etc/keep", b"mine") {
+        return 74;
+    }
+    // New names, removed names, renamed names, changed modes.
+    let made = sys::open(c"/etc/new", sys::O_WRONLY | sys::O_CREAT, 0o644);
+    if made < 0
+        || sys::unlink(c"/lib/x") != 0
+        || sys::rename(c"/etc/extra", c"/etc/extra2") != 0
+        || sys::chmod(c"/etc/greeting", 0o600) != 0
+    {
+        return 75;
+    }
+    sys::close(made as i32);
+    let mut st = [0u8; 144];
+    if sys::stat(c"/etc/greeting", &mut st) != 0
+        || u32::from_le_bytes([st[24], st[25], st[26], st[27]]) & 0o7777 != 0o600
+        || contents(c"/lib/x").is_some()
+    {
+        return 76;
+    }
+    46
 }
 
 /// Whether GREETING=hello was in the environment (the manifest mode).
@@ -565,7 +739,7 @@ fn main(startup: &Startup) -> i32 {
     }
     sys::rmdir(base.c());
     if result == 0 {
-        sys::write(1, b"launchprobe: 12 checks passed\n");
+        sys::write(1, b"launchprobe: 13 checks passed\n");
     }
     result
 }

@@ -90,6 +90,182 @@ fn refused(err: i32, step: &[u8], errno: i64) -> i32 {
     2
 }
 
+/// A NUL-terminated path built in place.
+struct PathBuf {
+    buf: [u8; MAX_PATH],
+    len: usize,
+}
+
+impl PathBuf {
+    fn new(parts: &[&[u8]]) -> Option<PathBuf> {
+        let mut p = PathBuf {
+            buf: [0; MAX_PATH],
+            len: 0,
+        };
+        for part in parts {
+            p.push(part)?;
+        }
+        Some(p)
+    }
+
+    fn push(&mut self, part: &[u8]) -> Option<()> {
+        if self.len + part.len() + 1 > MAX_PATH || part.contains(&0) {
+            return None;
+        }
+        self.buf[self.len..self.len + part.len()].copy_from_slice(part);
+        self.len += part.len();
+        self.buf[self.len] = 0;
+        Some(())
+    }
+
+    fn c(&self) -> &CStr {
+        CStr::from_bytes_until_nul(&self.buf[..=self.len]).unwrap_or(c"")
+    }
+}
+
+const EEXIST: i64 = -17;
+const EISDIR: i64 = -21;
+const AT_REMOVEDIR: u32 = 0x200;
+/// Where a compartment's private tree is kept (ADR 0046): one that keeps
+/// its changes under /var/keel, a fresh one for each launch under
+/// /run/keel.
+const PRIVATE: &[u8] = b"/var/keel/";
+const EPHEMERAL: &[u8] = b"/run/keel/";
+
+/// mkdir(2), an existing directory being fine.
+fn ensure_dir(path: &CStr) -> Result<(), i64> {
+    match sys::mkdir(path, 0o755) {
+        r if r == 0 || r == EEXIST => Ok(()),
+        r => Err(r),
+    }
+}
+
+/// Removes the tree at `path`, everything beneath it first (an ephemeral
+/// root, after its compartment has ended).
+fn remove_tree(path: &mut PathBuf) -> Result<(), i64> {
+    loop {
+        let dir = sys::open(path.c(), sys::O_RDONLY | O_DIRECTORY, 0);
+        if dir < 0 {
+            return Err(dir);
+        }
+        let dir = dir as i32;
+        let mut buf = [0u8; 2048];
+        let n = sys::getdents64(dir, &mut buf);
+        if n < 0 {
+            sys::close(dir);
+            return Err(n);
+        }
+        let mut removed = false;
+        let mut at = 0;
+        while at < n as usize {
+            let reclen = u16::from_le_bytes([buf[at + 16], buf[at + 17]]) as usize;
+            let raw = &buf[at + 19..at + reclen];
+            let name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+            at += reclen;
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let mut child = [0u8; 256];
+            child[..name.len()].copy_from_slice(name);
+            let child = CStr::from_bytes_until_nul(&child[..=name.len()]).unwrap_or(c"");
+            match sys::unlinkat(dir, child, 0) {
+                0 => {}
+                EISDIR => {
+                    let keep = path.len;
+                    if path.push(b"/").is_none() || path.push(name).is_none() {
+                        sys::close(dir);
+                        return Err(-36);
+                    }
+                    let inner = remove_tree(path);
+                    path.len = keep;
+                    path.buf[keep] = 0;
+                    inner?;
+                }
+                e => {
+                    sys::close(dir);
+                    return Err(e);
+                }
+            }
+            removed = true;
+        }
+        sys::close(dir);
+        if !removed {
+            break;
+        }
+    }
+    match sys::unlinkat(-100, path.c(), AT_REMOVEDIR) {
+        0 => Ok(()),
+        e => Err(e),
+    }
+}
+
+/// The root of a compartment with a layered root (ADR 0046): its private
+/// tree, made if it is not there (or always, ephemeral), with the base
+/// and then the prefix laid over it as read-only images.
+fn layered_root(m: &Manifest, err: i32) -> Result<PathBuf, i32> {
+    let ephemeral = m.writable == keel_manifest::Writable::Ephemeral;
+    let mut pid = [0u8; 20];
+    let path = if ephemeral {
+        PathBuf::new(&[EPHEMERAL, m.name(), b"-", decimal(sys::getpid(), &mut pid)])
+    } else {
+        PathBuf::new(&[PRIVATE, m.name()])
+    };
+    let Some(mut path) = path else {
+        say_to(err, &[b"the root path is too long\n"]);
+        return Err(2);
+    };
+    let top = if ephemeral { EPHEMERAL } else { PRIVATE };
+    for dir in [&top[..4], &top[..top.len() - 1]] {
+        let Some(d) = PathBuf::new(&[dir]) else {
+            return Err(2);
+        };
+        if let Err(e) = ensure_dir(d.c()) {
+            return Err(refused(err, b"making the root's directory", e));
+        }
+    }
+    // A leftover ephemeral tree (a launch that did not end cleanly) goes
+    // first: an ephemeral root always starts as the images.
+    let mut made = sys::mkdir(path.c(), 0o700);
+    if ephemeral && made == EEXIST {
+        if let Err(e) = remove_tree(&mut path) {
+            return Err(refused(err, b"removing an old root", e));
+        }
+        made = sys::mkdir(path.c(), 0o700);
+    }
+    let fresh = match made {
+        0 => true,
+        EEXIST if !ephemeral => false,
+        e => return Err(refused(err, b"making the private root", e)),
+    };
+    if fresh {
+        let into = sys::open(path.c(), sys::O_RDONLY | O_DIRECTORY, 0);
+        if into < 0 {
+            return Err(refused(err, b"opening the private root", into));
+        }
+        for image in [m.root(), m.prefix()] {
+            if image.is_empty() {
+                continue;
+            }
+            let Some(image) = PathBuf::new(&[image]) else {
+                return Err(2);
+            };
+            let from = sys::open(image.c(), sys::O_RDONLY | O_DIRECTORY, 0);
+            if from < 0 {
+                sys::close(into as i32);
+                return Err(refused(err, b"opening an image", from));
+            }
+            let r = sys::native_layer(FACTORY, into as i32, from as i32);
+            sys::close(from as i32);
+            if r < 0 {
+                sys::close(into as i32);
+                return Err(refused(err, b"laying an image", r));
+            }
+        }
+        sys::close(into as i32);
+    }
+    Ok(path)
+}
+
 /// NUL-terminated copies of strings, for the calls.
 struct CStrings {
     buf: [u8; 8192],
@@ -188,7 +364,17 @@ fn launch(m: &Manifest, stdio: [i32; 3], err: i32) -> i32 {
         say_to(err, &[b"too many or too long arguments and environment\n"]);
         return 2;
     }
-    let root = sys::open(strings.get(0), sys::O_RDONLY | O_DIRECTORY, 0);
+    // A layered root (ADR 0046) is the private tree over the images; a
+    // plain one is the base itself.
+    let mut layered = None;
+    if m.writable != keel_manifest::Writable::Base {
+        match layered_root(m, err) {
+            Ok(path) => layered = Some(path),
+            Err(status) => return status,
+        }
+    }
+    let root_path = layered.as_ref().map_or(strings.get(0), PathBuf::c);
+    let root = sys::open(root_path, sys::O_RDONLY | O_DIRECTORY, 0);
     if root < 0 {
         return refused(err, b"opening the root", root);
     }
@@ -239,6 +425,13 @@ fn launch(m: &Manifest, stdio: [i32; 3], err: i32) -> i32 {
         Err(e) => refused(err, b"waiting", e),
     };
     sys::close(c);
+    // "ephemeral discards on exit".
+    if m.writable == keel_manifest::Writable::Ephemeral
+        && let Some(mut path) = layered
+        && let Err(e) = remove_tree(&mut path)
+    {
+        refused(err, b"removing the ephemeral root", e);
+    }
     status
 }
 

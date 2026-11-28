@@ -99,6 +99,19 @@ impl Profile {
     }
 }
 
+/// `[root] writable` (ADR 0046): how the compartment's root is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writable {
+    /// Not given: the root is `base` itself, as it is.
+    Base,
+    /// A private tree that keeps its changes from one launch to the next,
+    /// over `base` (and `prefix`) as read-only images.
+    Private,
+    /// A fresh private tree each launch, removed when the compartment
+    /// ends ("ephemeral discards on exit").
+    Ephemeral,
+}
+
 /// A parse error: the line (from 1; 0 for the whole manifest) and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error {
@@ -124,6 +137,9 @@ pub struct Manifest {
     nenv: usize,
     devices: [Option<Device>; 5],
     root: Option<Span>,
+    prefix: Option<Span>,
+    /// `[root] writable`.
+    pub writable: Writable,
     pub limits: Limits,
     /// `profile`, the default if not given.
     pub profile: Profile,
@@ -147,6 +163,11 @@ impl Manifest {
     /// The directory that becomes the compartment's `/`.
     pub fn root(&self) -> &[u8] {
         self.root.map_or(&[], |s| self.text(s))
+    }
+
+    /// `[root] prefix`: a template laid over the base (empty if none).
+    pub fn prefix(&self) -> &[u8] {
+        self.prefix.map_or(&[], |s| self.text(s))
     }
 
     /// The arguments after argv[0].
@@ -374,6 +395,10 @@ impl<'a> Parser<'a> {
                 {
                     return Err(self.err("name must be 1 to 64 letters, digits, '-', '_' or '.'"));
                 }
+                // It names the private tree's directory (ADR 0046).
+                if text == b"." || text == b".." {
+                    return Err(self.err("name may not be . or .."));
+                }
                 self.m.name = Some(s);
             }
             (Table::Top, b"exec", Value::Str(raw)) => {
@@ -430,8 +455,19 @@ impl<'a> Parser<'a> {
                 }
                 self.m.root = Some(s);
             }
-            (Table::Root, b"prefix" | b"writable", _) => {
-                return Err(self.err("layered roots are not supported until P3-S5"));
+            (Table::Root, b"prefix", Value::Str(raw)) => {
+                let s = self.store(raw)?;
+                if self.m.text(s).first() != Some(&b'/') || self.m.text(s).contains(&0) {
+                    return Err(self.err("root prefix must be an absolute path"));
+                }
+                self.m.prefix = Some(s);
+            }
+            (Table::Root, b"writable", Value::Str(raw)) => {
+                self.m.writable = match raw {
+                    b"private" => Writable::Private,
+                    b"ephemeral" => Writable::Ephemeral,
+                    _ => return Err(self.err("writable must be \"private\" or \"ephemeral\"")),
+                };
             }
             (Table::Display, b"allowed", Value::Bool(false))
             | (Table::Network, b"allowed", Value::Bool(false)) => {}
@@ -463,7 +499,7 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| self.err("tmpfs_nodes must be 0 to 16777216"))?;
             }
             (Table::Top, b"name" | b"exec" | b"args" | b"env" | b"devices" | b"profile", _)
-            | (Table::Root, b"base", _)
+            | (Table::Root, b"base" | b"prefix" | b"writable", _)
             | (Table::Display | Table::Network, b"allowed", _)
             | (Table::Display, b"max_surfaces", _) => {
                 return Err(self.err("value of the wrong type"));
@@ -494,6 +530,8 @@ pub fn parse(text: &[u8]) -> Result<Manifest, Error> {
             nenv: 0,
             devices: [None; 5],
             root: None,
+            prefix: None,
+            writable: Writable::Base,
             limits: Limits::DEFAULT,
             profile: Profile::Default,
         },
@@ -557,6 +595,10 @@ pub fn parse(text: &[u8]) -> Result<Manifest, Error> {
     if p.m.root.is_none() {
         return Err(p.err("[root] base is required"));
     }
+    // A prefix is a layer, so it needs a private tree to lie in.
+    if p.m.prefix.is_some() && p.m.writable == Writable::Base {
+        return Err(p.err("[root] prefix needs writable"));
+    }
     Ok(p.m)
 }
 
@@ -615,6 +657,15 @@ processes = 8
         let m = parse(b"name = \"x\"\nexec = \"/x\"\n[root]\nbase = \"/r\"\n").unwrap();
         assert_eq!(m.limits, Limits::DEFAULT);
         assert_eq!(m.profile, Profile::Default);
+        assert_eq!((m.writable, m.prefix()), (Writable::Base, &b""[..]));
+        let layered = parse(
+            b"name = \"x\"\nexec = \"/x\"\n[root]\nbase = \"/b\"\nprefix = \"/p\"\nwritable = \"ephemeral\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (layered.root(), layered.prefix(), layered.writable),
+            (&b"/b"[..], &b"/p"[..], Writable::Ephemeral)
+        );
         let full =
             parse(b"name = \"x\"\nexec = \"/x\"\nprofile = \"full\"\n[root]\nbase = \"/r\"\n");
         assert_eq!(full.map(|m| m.profile), Ok(Profile::Full));
@@ -634,6 +685,7 @@ processes = 8
         let with = |first: &str| std::format!("{first}\n{base}");
         fails(&with("name = \"x\"\nname = \"y\""), 2, "key given twice");
         fails(&with("nme = \"x\""), 1, "unknown key");
+        fails(&with("name = \"..\""), 1, "name may not be . or ..");
         fails(&with("name = 3"), 1, "value of the wrong type");
         fails(
             &with("name = \"a b\""),
@@ -678,10 +730,19 @@ processes = 8
             "table given twice",
         );
         fails(&with("name = \"x\"\n[nope]"), 2, "unknown table");
+        let root = |lines: &str| {
+            std::format!("name = \"x\"\nexec = \"/x\"\n[root]\nbase = \"/r\"\n{lines}")
+        };
         fails(
-            &with("name = \"x\"\n[root]\nprefix = \"p\""),
-            3,
-            "layered roots are not supported until P3-S5",
+            &root("prefix = \"p\""),
+            5,
+            "root prefix must be an absolute path",
+        );
+        fails(&root("prefix = \"/p\""), 0, "[root] prefix needs writable");
+        fails(
+            &root("writable = \"shared\""),
+            5,
+            "writable must be \"private\" or \"ephemeral\"",
         );
         fails(
             &with("name = \"x\"\n[display]\nallowed = true"),

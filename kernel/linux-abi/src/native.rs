@@ -22,7 +22,7 @@ type ProcessRef = Arc<IrqMutex<Process>>;
 /// the x32 bit (0x4000_0000), which Keel refuses.
 pub const BASE: u64 = 0x1000_0000;
 /// How many native calls there are.
-pub const COUNT: u64 = 8;
+pub const COUNT: u64 = 9;
 
 /// A compartment factory: creates compartments whose limits fit beneath
 /// its ceiling.
@@ -139,6 +139,7 @@ pub fn dispatch(p: &ProcessRef, n: u64, a: &[u64; 6]) -> SysResult {
         5 => kill(p, fd(0), a[1]),
         6 => wait(p, fd(0), a[1], a[2]),
         7 => audit_open(p, fd(0)),
+        8 => layer(p, fd(0), fd(1), fd(2)),
         _ => Err(Errno::ENOSYS),
     }
 }
@@ -258,6 +259,56 @@ fn denied(p: &ProcessRef, what: &'static str, n: u64) -> Errno {
     };
     crate::audit::denied(&compartment, pid, what, BASE + n, None, Errno::EPERM);
     Errno::EPERM
+}
+
+/// A directory handle's node, needing `rights` (ENOTDIR for anything but
+/// a directory, checked first, as `compartment_create` does).
+fn directory_node(p: &ProcessRef, fd: i32, rights: Rights) -> Result<keel_core::vfs::Ino, Errno> {
+    let node = match object(p, fd, Rights::NONE)? {
+        Object::File(file) => {
+            let f = file.lock();
+            if f.kind != Kind::Directory || f.proc.is_some() {
+                return Err(Errno::ENOTDIR);
+            }
+            f.node
+        }
+        _ => return Err(Errno::ENOTDIR),
+    };
+    object(p, fd, rights)?;
+    Ok(node)
+}
+
+/// `layer(factory, into, from)` (ADR 0046): makes the tree under
+/// directory `from` a read-only image for good (EBUSY if a node in it is
+/// open or mapped), then lays it over directory `into`: `into` gets its
+/// own copies of the image's directories, and names the image's other
+/// nodes until a compartment rooted there changes one, which gets its own
+/// copy then. Names `into` has are replaced, so a template prefix laid
+/// after a base overrides it. Needs CREATE on the factory, ENUMERATE on
+/// `from`, and CREATE on `into`, which must not be part of an image
+/// (EROFS). The private directories and copies are charged to the
+/// caller's compartment.
+fn layer(p: &ProcessRef, factory_fd: i32, into: i32, from: i32) -> SysResult {
+    factory(p, factory_fd, Rights::CREATE)?;
+    let into = directory_node(p, into, Rights::CREATE)?;
+    let from = directory_node(p, from, Rights::ENUMERATE)?;
+    if into == from {
+        return Err(Errno::EINVAL);
+    }
+    let quota = crate::syscall::quota_of(p);
+    crate::fs::with(|fs| {
+        if fs.is_frozen(into)? {
+            return Err(Errno::EROFS);
+        }
+        // An image that would hold the tree it is laid over could never
+        // be frozen safely: `into` beneath `from` is EINVAL.
+        if fs.is_beneath(from, into) {
+            return Err(Errno::EINVAL);
+        }
+        fs.freeze(from)?;
+        fs.layer(into, from, quota.as_ref())
+    })?;
+    Ok(0)
 }
 
 /// `audit_open(factory)`: an audit handle (ADR 0045), read with read(2),

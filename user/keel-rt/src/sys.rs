@@ -2059,6 +2059,18 @@ pub fn audit_open(factory: i32) -> i64 {
     call3(NATIVE_BASE + 7, factory as u32 as u64, 0, 0)
 }
 
+/// `layer(factory, into, from)` (ADR 0046): makes the tree under the
+/// directory `from` a read-only image and lays it over the directory
+/// `into`, a compartment's private tree.
+pub fn native_layer(factory: i32, into: i32, from: i32) -> i64 {
+    call3(
+        NATIVE_BASE + 8,
+        factory as u32 as u64,
+        into as u32 as u64,
+        from as u32 as u64,
+    )
+}
+
 /// `compartment_wait(c, usage*, flags)`: flags 1 is WNOHANG.
 pub fn compartment_wait(c: i32, flags: u64) -> Result<Usage, i64> {
     let mut b = [0u8; 40];

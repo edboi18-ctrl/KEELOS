@@ -34,6 +34,7 @@ pub enum Errno {
     EFBIG = 27,
     ENOSPC = 28,
     ESPIPE = 29,
+    EROFS = 30,
     EPIPE = 32,
     EDOM = 33,
     ERANGE = 34,
