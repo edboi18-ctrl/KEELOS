@@ -227,6 +227,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
             let _ =
                 keel_linux_abi::fs::with(|fs| fs.create_dir(keel_core::vfs::ROOT, b"comp", 0o755));
             phase3_escape(&mut runner);
+            phase3_kill_during_fork(&mut runner);
         }
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
@@ -2172,6 +2173,7 @@ fn phase3(t: &mut Runner) {
     phase3_console_shell(t);
     phase3_console_busybox(t);
     phase3_escape(t);
+    phase3_kill_during_fork(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2198,10 +2200,105 @@ const ESCAPE_LIMITS: keel_core::compartment::Limits = keel_core::compartment::Li
 
 /// Sends SIGKILL to every process of `c` (a run that did not end).
 fn kill_compartment(c: &alloc::sync::Arc<keel_core::compartment::Compartment>) {
-    for target in keel_linux_abi::process::members(c, |_| true) {
-        keel_linux_abi::signal::send_to_process(
-            &target,
-            keel_core::signal::SigInfo::kernel(keel_core::signal::SIGKILL),
+    keel_linux_abi::process::kill_every(c, |_| true);
+}
+
+/// ADR 0047 regression (the fuzzer's shard 6 left a process after
+/// killing its compartment): `forkstorm` forks without pause, up to its
+/// compartment's process limit, while the compartment is killed, 40 times
+/// at different moments. Each time every process must go within 2 s,
+/// including any whose fork completed during the kill.
+fn phase3_kill_during_fork(t: &mut Runner) {
+    use keel_linux_abi::{compartment, fs, process};
+    const PROGRAM: &[u8] = b"/test/forkstorm";
+    const ROUNDS: u64 = 40;
+    let made = fs::with(|f| {
+        let comp = f.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        f.create_dir(comp, b"storm", 0o755)
+    });
+    let limits = keel_core::compartment::Limits {
+        processes: 16,
+        memory_frames: 65536,
+        ..keel_core::compartment::Limits::UNLIMITED
+    };
+    let (Ok(_), Ok(c), Ok(file)) = (
+        made,
+        compartment::create(b"/comp/storm", limits),
+        fs::read_file(PROGRAM),
+    ) else {
+        t.check("compartment.kill_during_fork", false, "setting up");
+        return;
+    };
+    let mut failed = None;
+    let mut most = 0;
+    for round in 0..ROUNDS {
+        let started = keel_linux_abi::exec::load_in(c.root(), &file, PROGRAM, &[PROGRAM], &[])
+            .ok()
+            .and_then(|loaded| process::spawn_in(&c, "forkstorm", &loaded).ok());
+        if started.is_none() {
+            failed = Some((round, "could not start"));
+            break;
+        }
+        // 2 to 80 ms: early, while it is filling up, and late, at the limit.
+        sched::sleep_ms(2 + (round * 37) % 79);
+        most = most.max(c.processes());
+        let before = (c.processes(), process::members(&c, |_| true).len());
+        let sent_pids: alloc::vec::Vec<u32> = process::members(&c, |_| true)
+            .iter()
+            .map(|q| q.lock().pid())
+            .collect();
+        let sent = process::kill_every(&c, |_| true);
+        let unmarked = process::members(&c, |q| q.killed_by.is_none()).len();
+        let start = time::monotonic_nanos();
+        while c.processes() != 0 && time::monotonic_nanos() - start < 2_000_000_000 {
+            sched::sleep_ms(5);
+        }
+        if c.processes() != 0 {
+            let running = process::members(&c, |_| true);
+            let zombies = process::zombies(&c, |_| true).len();
+            kprintln!(
+                "  kill during fork: round {round}: {} processes left after 2 s; {} running, {zombies} zombies; at the kill {before:?} (slots, running), {sent} sent SIGKILL, {unmarked} unmarked just after",
+                c.processes(),
+                running.len()
+            );
+            kprintln!("    listed before the kill: {sent_pids:?}");
+            for r in running.iter().take(16) {
+                let q = r.lock();
+                let parent = q.parent.as_ref().and_then(alloc::sync::Weak::upgrade);
+                let (ppid, pkilled) = parent
+                    .map(|pp| {
+                        let pp = pp.lock();
+                        (pp.pid(), pp.killed_by)
+                    })
+                    .unwrap_or((0, None));
+                kprintln!(
+                    "    pid {}: killed_by {:?}, parent {ppid} killed_by {pkilled:?}",
+                    q.pid(),
+                    q.killed_by,
+                );
+            }
+            failed = Some((round, "processes left"));
+            // Clean up for the tests after this one.
+            for _ in 0..100 {
+                process::kill_every(&c, |_| true);
+                sched::sleep_ms(10);
+                if c.processes() == 0 {
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    let ok = failed.is_none() && c.memory().used() == 0;
+    t.check(
+        "compartment.kill_during_fork",
+        ok,
+        "a compartment killed 40 times while its processes fork without pause empties each time, every frame back: a child whose fork completes during the kill goes too",
+    );
+    if !ok {
+        kprintln!(
+            "  kill during fork: {failed:?}; at most {most} processes seen; memory left {}",
+            c.memory().used()
         );
     }
 }

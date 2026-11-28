@@ -41,6 +41,11 @@ test = false
 bench = false
 
 [[bin]]
+name = "forkstorm"
+test = false
+bench = false
+
+[[bin]]
 name = "forger"
 test = false
 bench = false

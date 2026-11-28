@@ -677,11 +677,29 @@ fn fork_with(p: &Arc<IrqMutex<Process>>, frame: &TrapFrame, mode: Vfork) -> Resu
         .threads
         .insert(thread.0, ThreadInfo::first(pid, thread_signals, comm));
     processes.insert(thread.0, child.clone());
-    p.lock().children.push(Child {
-        process: child,
-        pid,
-        status: None,
-    });
+    // A SIGKILL to the parent while the child was made (its sender's list
+    // of processes may predate the child) takes the child too, as Linux's
+    // copy_process checks fatal_signal_pending under the lock kill also
+    // holds (`kernel/fork.c`: "Let kill terminate clone/fork in the
+    // middle"). Checked here, under the process table's lock and after
+    // the child is in it, so either the sender's list has the child or
+    // the parent's mark is seen (`kill_every` lists again after sending).
+    let killed = {
+        let mut parent = p.lock();
+        parent.children.push(Child {
+            process: child.clone(),
+            pid,
+            status: None,
+        });
+        parent.killed_by
+    };
+    // Before the table is unlocked: unlocking enables interrupts, and
+    // the child, run first, could fork a grandchild while not yet marked,
+    // which would outlive it (`compartment.kill_during_fork`). The order
+    // table, process, scheduler is the one fork already takes.
+    if let Some(signal) = killed {
+        kill_all_threads(&child, signal);
+    }
     drop(processes);
     if let Some(done) = done {
         VFORK_DONE.wait_until(|| {
@@ -767,7 +785,13 @@ pub fn clone_thread(
     let mut processes = PROCESSES.lock();
     let thread =
         sched::spawn_user_copy("thread", space, registers, fs_base).map_err(|_| Errno::ENOMEM)?;
-    p.lock().threads.insert(
+    let mut process = p.lock();
+    // SIGKILL may have come while the thread was made: it listed the
+    // threads, under this lock, before this one was there. The new thread
+    // goes with the rest (Linux: copy_process's "Let kill terminate
+    // clone/fork in the middle", `kernel/fork.c`).
+    let killed = process.killed_by;
+    process.threads.insert(
         thread.0,
         ThreadInfo {
             tid,
@@ -783,7 +807,13 @@ pub fn clone_thread(
             restart: None,
         },
     );
+    drop(process);
     processes.insert(thread.0, p.clone());
+    // Before the table is unlocked, as for fork.
+    if let Some(signal) = killed {
+        sched::request_exit(thread, 128 + i64::from(signal));
+    }
+    drop(processes);
     Ok(u64::from(tid))
 }
 
@@ -898,6 +928,38 @@ pub fn find_thread(
         .then(|| (p.clone(), ThreadId(thread)))
     })
 }
+
+/// SIGKILL to every process of `compartment` for which `pick` holds,
+/// until none is left that has not been sent it. One pass is not
+/// enough: a fork that completes after the pass listed the processes,
+/// but before its parent was sent SIGKILL, leaves a child the list
+/// missed (found by the in-compartment fuzzer, ADR 0047). Listing again
+/// after sending finds it; a fork that completes later still sees its
+/// parent killed and kills the child itself (`fork_with`). Linux holds
+/// tasklist_lock across the walk instead (`kill_something_info`,
+/// `kernel/signal.c`), which copy_process also takes. Returns how many
+/// were sent it.
+pub fn kill_every(compartment: &Arc<Compartment>, pick: impl Fn(&Process) -> bool) -> usize {
+    let mut sent: Vec<Arc<IrqMutex<Process>>> = Vec::new();
+    loop {
+        let new: Vec<_> = members(compartment, &pick)
+            .into_iter()
+            .filter(|q| !sent.iter().any(|s| Arc::ptr_eq(s, q)))
+            .collect();
+        if new.is_empty() {
+            return sent.len();
+        }
+        for target in &new {
+            crate::signal::send_to_process(
+                target,
+                keel_core::signal::SigInfo::kernel(SIGKILL_NUMBER),
+            );
+        }
+        sent.extend(new);
+    }
+}
+
+const SIGKILL_NUMBER: i32 = keel_core::signal::SIGKILL;
 
 /// Ends every thread of `target` because of `signal` (SIGKILL, or a
 /// signal whose default action terminates): the wait status is the

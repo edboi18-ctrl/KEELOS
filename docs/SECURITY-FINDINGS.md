@@ -15,7 +15,50 @@ F-0005 to F-0009 were found on 2026-11-22 by the system-call fuzzer
 service reachable from an unprivileged user program. F-0010, of the same
 kind, was found the same day by CI. F-0011 was found by the second Phase 1
 audit (`docs/PHASE1-AUDIT-2.md`, A1), which reproduced it. F-0012 was
-found on 2026-11-28 while writing the escape suite (P3-S8, ADR 0047).
+found on 2026-11-28 while writing the escape suite (P3-S8, ADR 0047),
+and F-0013 the same day by the in-compartment fuzzer's first CI run.
+
+### F-0013: a process forked during a compartment's SIGKILL survived it
+
+Found 2026-11-28 by the nightly fuzzer's first in-compartment run
+(security.yml, shard 6, seed 737679503508, after 1,390 runs and 2.7
+million calls). After the harness killed the fuzzer's compartment, one
+process and 31 frames were still there ten minutes later. The seed did
+not reproduce it: it depends on timing. `compartment.kill_during_fork`
+(below) reproduced it in about half its boots.
+
+Cause. Killing a compartment, or every process in it, sent SIGKILL to
+each process in a list taken first. There were two windows:
+- **A fork completing during the kill.** Its child was not on the list,
+  and nothing killed it. The same held for the native `compartment_kill`
+  (keel-launch's way to end an application) and for kill(-1, SIGKILL).
+  Linux holds `tasklist_lock` across the walk (`kill_something_info`,
+  `kernel/signal.c`), and `copy_process` takes it too, then checks
+  `fatal_signal_pending` ("Let kill terminate clone/fork in the middle",
+  `kernel/fork.c`).
+- **Marking the child after unlocking the process table.** The first
+  version of the fix killed such a child just after releasing the table
+  lock. Releasing it re-enabled interrupts, so the child could run first
+  and fork a grandchild before it was marked. The diagnostics showed this
+  exactly: unmarked survivors whose PIDs were just above every PID
+  signalled, and whose parents were already dead.
+
+Fix:
+- `fork_with` checks, under the process table's lock and after the child
+  is in the table, whether the parent has been killed. If so, it kills
+  the child before unlocking. `clone_thread` does the same for a new
+  thread.
+- `process::kill_every` sends SIGKILL to every process of a compartment,
+  then lists them again, until no unsignalled one is left. Every fork
+  that completes before its parent is signalled is in a later list. Every
+  fork that completes after sees the mark.
+- It is used by the native `compartment_kill`, kill(-1, SIGKILL) and the
+  kernel's tests.
+
+Regression test: `compartment.kill_during_fork` runs `user/tests/forkstorm`,
+in which every process forks as fast as it can up to its compartment's
+limit of 16. It kills the compartment 40 times, at moments from 2 to
+80 ms in, and the compartment must empty within 2 s each time.
 
 ### F-0012: linkat(AT_EMPTY_PATH) named a descriptor's file in the caller's tree
 

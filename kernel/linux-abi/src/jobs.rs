@@ -180,7 +180,10 @@ pub fn kill_all(p: &ProcessRef, info: SigInfo) -> Result<(), Errno> {
     {
         return Err(Errno::ESRCH);
     }
-    if info.signo != 0 {
+    if info.signo == keel_core::signal::SIGKILL {
+        // Every process, including one a fork completes meanwhile.
+        process::kill_every(&compartment, |q| q.pid() > 1 && q.pid() != me);
+    } else if info.signo != 0 {
         for t in &targets {
             crate::signal::send_to_process(t, info);
         }

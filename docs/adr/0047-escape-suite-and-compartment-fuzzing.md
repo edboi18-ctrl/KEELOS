@@ -185,6 +185,22 @@ as arguments:
   looked up within the root. Safe before, but this is the path that most
   needs testing, so it is now tested as Linux behaves.
 
+### A fix the fuzzer found: F-0013
+
+The first nightly run of the fuzzer in a compartment found that a
+process forked while its compartment was being killed could survive the
+kill (`docs/SECURITY-FINDINGS.md`, F-0013). Now:
+- **fork and clone:** under the process table's lock, they check whether
+  the caller has been killed. If so, they kill the new child or thread
+  before the lock is released.
+- **`process::kill_every`:** it sends SIGKILL, then lists the
+  compartment's processes again, until it finds none it has not
+  signalled. The native `compartment_kill`, kill(-1, SIGKILL) and the
+  kernel's tests use it.
+
+`compartment.kill_during_fork` (phase 3, and the escape scenario) kills a
+compartment of continually forking processes 40 times.
+
 ### The fuzzer in a compartment
 
 - **Its compartment:** `/fuzz-root`, holding:
@@ -255,6 +271,11 @@ as arguments:
 
   Before the idle kill, the same seeds gave a run (seed 79) that waited
   600 s.
+- **First nightly run** (security.yml on this branch, KVM, 2026-11-28):
+  - the escape suite passed;
+  - seven of the eight 60-minute shards passed;
+  - shard 6 found F-0013 after 1,390 runs and 2.7 million calls, with
+    617 runs killed while waiting.
 - **Mutations,** each run through the escape scenario (the fuzzer's
   through `cargo xtask fuzz`), each caught:
 
@@ -267,6 +288,11 @@ as arguments:
   | mprotect allowing writable and executable | `sec.escape_calls`: check 46 |
   | the compartment's descriptor limit not applied | `sec.escape_limits`: check 10 |
   | the fuzzer spawned in the system compartment, as before | `fuzz.syscalls`: the first run waited, and the kill, which reaches only the fuzzer's compartment, could not end it |
+
+  | fork not checking whether its caller was killed (`fork_with`) | `compartment.kill_during_fork`: round 0, 16 processes left |
+  | that, and a single pass in `kill_every` (the code before F-0013) | `compartment.kill_during_fork`: round 0 |
+  | the child killed after the table is unlocked (the first version of the fix) | `compartment.kill_during_fork`, in about half its boots: a grandchild forked before the child was marked |
+  | a single pass in `kill_every`, fork's check kept | not caught (4 boots, 160 kills). The window, a fork completing between the list and its parent's signal, is too narrow for the test; the second pass rests on the reasoning above, as Linux's lock does |
 
   With the PID mutation the suite first ran into the boot's timeout. Each
   program is now limited to 30 s, and killed past it, so it fails with

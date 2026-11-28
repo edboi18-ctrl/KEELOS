@@ -392,7 +392,10 @@ fn kill(p: &ProcessRef, fd: i32, signal: u64) -> SysResult {
     if !(0..=NSIG as i32).contains(&signal) {
         return Err(Errno::EINVAL);
     }
-    if signal != 0 {
+    if signal == keel_core::signal::SIGKILL {
+        // Every process, including one a fork completes meanwhile.
+        process::kill_every(&c, |_| true);
+    } else if signal != 0 {
         for target in process::members(&c, |_| true) {
             crate::signal::send_to_process(&target, SigInfo::kernel(signal));
         }
