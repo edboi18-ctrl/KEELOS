@@ -296,8 +296,12 @@ fixed:
 
 The system-call fuzzer now runs in a compartment of its own and forks.
 After every run, its compartment must empty and nothing outside it may
-have changed. The nightly workflow runs eight 60-minute shards (P3
-security acceptance item 4) and the escape suite alone.
+have changed. The nightly workflow runs eight 60-minute shards and the
+escape suite alone. Its first two runs found F-0013 (a process forked
+during a compartment's SIGKILL survived it) and F-0014 (SIGKILL did not
+end a process waiting with no timeout), both fixed with regression
+tests. The third run (run 9, commit 2214775) passed all eight shards:
+security acceptance P3 item 4, eight hours with no panic and no escape.
 
 ## Test results (local, QEMU 8.2.2 TCG, OVMF, Ubuntu 24.04)
 

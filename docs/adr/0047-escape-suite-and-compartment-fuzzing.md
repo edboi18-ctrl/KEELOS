@@ -287,6 +287,11 @@ waits now stop on `signal::should_stop`, which includes an exit request.
     617 runs killed while waiting.
 - **Second run** (on the F-0013 fix): every shard found F-0014 within
   12 minutes.
+- **Third run** (security.yml run 9, on the F-0014 fix, commit 2214775,
+  2026-11-28): the escape suite and all eight 60-minute shards passed.
+  That is eight hours of in-compartment fuzzing in parallel shards with
+  distinct seeds, with no kernel panic and no escape: security
+  acceptance P3 item 4.
 - **Mutations,** each run through the escape scenario (the fuzzer's
   through `cargo xtask fuzz`), each caught:
 
