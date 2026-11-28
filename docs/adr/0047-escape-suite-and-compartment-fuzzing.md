@@ -201,6 +201,15 @@ kill (`docs/SECURITY-FINDINGS.md`, F-0013). Now:
 `compartment.kill_during_fork` (phase 3, and the escape scenario) kills a
 compartment of continually forking processes 40 times.
 
+### A second fix the fuzzer found: F-0014
+
+The run on the F-0013 fix found that SIGKILL did not end a process
+waiting with no timeout in epoll_wait, poll, select, the sleeps,
+sigsuspend or a FIFO's open (`docs/SECURITY-FINDINGS.md`, F-0014). Those
+waits now stop on `signal::should_stop`, which includes an exit request.
+`compartment.kill_waiting` (phase 3, and the escape scenario) kills
+`user/tests/waiter` in nine endless waits.
+
 ### The fuzzer in a compartment
 
 - **Its compartment:** `/fuzz-root`, holding:
@@ -276,6 +285,8 @@ compartment of continually forking processes 40 times.
   - seven of the eight 60-minute shards passed;
   - shard 6 found F-0013 after 1,390 runs and 2.7 million calls, with
     617 runs killed while waiting.
+- **Second run** (on the F-0013 fix): every shard found F-0014 within
+  12 minutes.
 - **Mutations,** each run through the escape scenario (the fuzzer's
   through `cargo xtask fuzz`), each caught:
 
@@ -292,6 +303,7 @@ compartment of continually forking processes 40 times.
   | fork not checking whether its caller was killed (`fork_with`) | `compartment.kill_during_fork`: round 0, 16 processes left |
   | that, and a single pass in `kill_every` (the code before F-0013) | `compartment.kill_during_fork`: round 0 |
   | the child killed after the table is unlocked (the first version of the fix) | `compartment.kill_during_fork`, in about half its boots: a grandchild forked before the child was marked |
+  | `should_stop` without the exit request (the waits before F-0014) | `compartment.kill_waiting`: epoll, poll, select and sleep not ended by SIGKILL |
   | a single pass in `kill_every`, fork's check kept | not caught (4 boots, 160 kills). The window, a fork completing between the list and its parent's signal, is too narrow for the test; the second pass rests on the reasoning above, as Linux's lock does |
 
   With the PID mutation the suite first ran into the boot's timeout. Each

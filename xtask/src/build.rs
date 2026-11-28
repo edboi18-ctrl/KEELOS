@@ -180,6 +180,14 @@ pub const TEST_PROGRAMS: &[TestProgram] = &[
         host: false,
     },
     TestProgram {
+        path: "test/waiter",
+        binary: "waiter",
+        args: &[],
+        env: &[],
+        stdin: b"",
+        host: false,
+    },
+    TestProgram {
         path: "test/forkstorm",
         binary: "forkstorm",
         args: &[],

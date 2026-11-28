@@ -830,6 +830,18 @@ pub fn pending_unblocked(p: &Arc<IrqMutex<Process>>) -> bool {
     })
 }
 
+/// Whether a wait must end now: a signal is pending that the thread does
+/// not block, the thread was interrupted, or it has been asked to exit
+/// (SIGKILL, ADR 0047). Linux's SIGKILL sets the pending flag of every
+/// thread (`complete_signal`, `signal_wake_up(t, 1)`), so `signal_pending`
+/// holds and every interruptible or killable wait returns; Keel's SIGKILL
+/// asks the threads to exit instead (`process::kill_all_threads`), which
+/// a wait that checked only the first two never saw: it slept again, for
+/// ever (the fuzzer's epoll_wait with no timeout).
+pub fn should_stop(p: &Arc<IrqMutex<Process>>) -> bool {
+    pending_unblocked(p) || sched::interrupted() || sched::exit_requested().is_some()
+}
+
 /// `set_user_sigmask`: with a mask (8 bytes at `mask`; `size` must be
 /// 8, else EINVAL; unreadable EFAULT), blocks it for the call; see
 /// [`end_temporary_mask`]. Without one (address 0), nothing changes.
@@ -861,7 +873,7 @@ pub fn rt_sigsuspend(p: &Arc<IrqMutex<Process>>, mask: u64, size: u64) -> Result
     copy_from_user(&mut b, mask).map_err(|_| Errno::EFAULT)?;
     let mask = u64::from_le_bytes(b);
     process::with_current_thread(p, |t| t.signals.set_temporary(mask)).ok_or(Errno::ESRCH)?;
-    while !pending_unblocked(p) && !sched::interrupted() {
+    while !should_stop(p) {
         crate::ready::wait(|| pending_unblocked(p), None);
     }
     Err(Errno::ERESTARTNOHAND)

@@ -100,7 +100,7 @@ fn sleep_until(p: &ProcessRef, deadline: u64, relative: Option<u64>) -> SysResul
         if now >= deadline {
             return Ok(0);
         }
-        if crate::signal::pending_unblocked(p) || sched::interrupted() {
+        if crate::signal::should_stop(p) {
             let Some(rem) = relative else {
                 return Err(Errno::ERESTARTNOHAND);
             };

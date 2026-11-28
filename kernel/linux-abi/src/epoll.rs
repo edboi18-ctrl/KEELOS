@@ -18,7 +18,7 @@ use keel_core::epoll::{
 };
 use keel_core::errno::Errno;
 use keel_core::handle::{Handle, Rights};
-use keel_hal::sched::{self, Waited};
+use keel_hal::sched::Waited;
 use keel_hal::sync::IrqMutex;
 use keel_hal::vm::{copy_from_user, copy_to_user};
 
@@ -365,7 +365,7 @@ fn wait_on(p: &ProcessRef, epfd: i32, events: u64, maxevents: i32, timeout: Time
         if timed_out || deadline.is_some_and(|d| keel_hal::time::monotonic_nanos() >= d) {
             return Ok(0);
         }
-        if crate::signal::pending_unblocked(p) || sched::interrupted() {
+        if crate::signal::should_stop(p) {
             return Err(Errno::EINTR);
         }
         let waited = crate::ready::wait(

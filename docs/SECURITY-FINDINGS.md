@@ -16,7 +16,49 @@ service reachable from an unprivileged user program. F-0010, of the same
 kind, was found the same day by CI. F-0011 was found by the second Phase 1
 audit (`docs/PHASE1-AUDIT-2.md`, A1), which reproduced it. F-0012 was
 found on 2026-11-28 while writing the escape suite (P3-S8, ADR 0047),
-and F-0013 the same day by the in-compartment fuzzer's first CI run.
+and F-0013 and F-0014 the same day by the in-compartment fuzzer's CI
+runs.
+
+### F-0014: SIGKILL did not end a process waiting with no timeout
+
+Found 2026-11-28 by the second in-compartment fuzzing run (security.yml
+on the F-0013 fix). All eight shards stopped within 12 minutes on a run
+that did not end within 600 s of SIGKILL. The previous commit's kernel
+failed the same way on the same seed (737889220485), so the F-0013 fix
+did not cause it; the first run's seeds had not met it.
+
+Finding the call:
+- the kernel's own syscall trace (`trace=syscalls`, a test kernel)
+  showed the run's last completed call;
+- a host replay of the fuzzer's generator found the one that never
+  returned: epoll_wait(3, ..., timeout), with a timeout whose low 32
+  bits are negative, so no timeout, on an epoll instance with nothing
+  ready.
+
+Cause. Keel's SIGKILL asks each thread to exit (`request_exit`), which
+wakes a sleeping thread. But the waits in epoll_wait, poll and select,
+nanosleep and clock_nanosleep, rt_sigsuspend and a FIFO's open looped
+on "a signal pending that the thread does not block, or the thread
+interrupted", and SIGKILL is neither. Each saw nothing to stop for and
+slept again: the process could not be killed. rt_sigsuspend would have
+spun instead, since the wait returns at once once an exit is asked.
+
+On Linux, SIGKILL sets every thread's pending flag (`complete_signal`,
+`signal_wake_up(t, 1)`, `kernel/signal.c`), so `signal_pending` holds
+and every interruptible or killable wait returns.
+
+Fix: `signal::should_stop` is true for a pending unblocked signal, an
+interrupted thread, or a thread asked to exit. Those five waits use it,
+and the terminal write loop checks the exit request too. A process that
+cannot be killed defeats the native `compartment_kill` and every
+compartment limit that relies on ending a compartment.
+
+Regression test: `compartment.kill_waiting` runs `user/tests/waiter` in
+each of nine endless waits: epoll_wait, poll and select with no timeout,
+a day's nanosleep, sigsuspend, a FIFO's open, an empty pipe's read,
+accept, and wait4 for a sleeping child. Each must end by SIGKILL within
+a second, status 137. With the old check, epoll, poll, select and the
+sleep are not ended, which fills the test's compartment.
 
 ### F-0013: a process forked during a compartment's SIGKILL survived it
 

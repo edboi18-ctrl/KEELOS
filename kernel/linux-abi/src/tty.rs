@@ -1106,7 +1106,7 @@ pub fn write(open: &TtyOpen, nonblock: bool, segs: &[(u64, u64)]) -> SysResult {
             Err(e) if written == 0 => return Err(e),
             Err(_) => break,
         }
-        if written < count && sched::interrupted() {
+        if written < count && (sched::interrupted() || sched::exit_requested().is_some()) {
             break;
         }
     }
@@ -1117,7 +1117,7 @@ pub fn write(open: &TtyOpen, nonblock: bool, segs: &[(u64, u64)]) -> SysResult {
 fn write_chunk(open: &TtyOpen, nonblock: bool, data: &[u8]) -> Result<usize, Errno> {
     let mut done = 0usize;
     loop {
-        if sched::interrupted() {
+        if sched::interrupted() || sched::exit_requested().is_some() {
             return if done > 0 {
                 Ok(done)
             } else {

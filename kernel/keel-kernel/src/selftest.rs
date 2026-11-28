@@ -228,6 +228,7 @@ pub fn run(phase: u32, scenario: Scenario) -> bool {
                 keel_linux_abi::fs::with(|fs| fs.create_dir(keel_core::vfs::ROOT, b"comp", 0o755));
             phase3_escape(&mut runner);
             phase3_kill_during_fork(&mut runner);
+            phase3_kill_waiting(&mut runner);
         }
         (1, Scenario::DoubleFault) => {
             ACTIVE_SCENARIO.store(Scenario::DoubleFault as u8, Ordering::Relaxed);
@@ -2174,6 +2175,7 @@ fn phase3(t: &mut Runner) {
     phase3_console_busybox(t);
     phase3_escape(t);
     phase3_kill_during_fork(t);
+    phase3_kill_waiting(t);
     const THREAD_PROBE: &[u8] = b"/test/threadprobe";
     let status = run_test_program(THREAD_PROBE, &[THREAD_PROBE]);
     t.check(
@@ -2298,6 +2300,90 @@ fn phase3_kill_during_fork(t: &mut Runner) {
     if !ok {
         kprintln!(
             "  kill during fork: {failed:?}; at most {most} processes seen; memory left {}",
+            c.memory().used()
+        );
+    }
+}
+
+/// ADR 0047 regression (the fuzzer's epoll_wait with no timeout outlived
+/// SIGKILL): `user/tests/waiter` blocks for good in one kind of wait per
+/// mode, and SIGKILL must end it there, within a second, its status the
+/// signal's (137), every frame back.
+fn phase3_kill_waiting(t: &mut Runner) {
+    use keel_linux_abi::{compartment, fs, process};
+    const PROGRAM: &[u8] = b"/test/waiter";
+    const MODES: [&[u8]; 9] = [
+        b"epoll",
+        b"poll",
+        b"select",
+        b"sleep",
+        b"sigsuspend",
+        b"fifo",
+        b"pipe",
+        b"accept",
+        b"wait4",
+    ];
+    let made = fs::with(|f| {
+        let comp = f.lookup(keel_core::vfs::ROOT, keel_core::vfs::ROOT, b"/comp")?;
+        f.create_dir(comp, b"waiting", 0o755)
+    });
+    let limits = keel_core::compartment::Limits {
+        processes: 4,
+        ..keel_core::compartment::Limits::UNLIMITED
+    };
+    let (Ok(_), Ok(c), Ok(file)) = (
+        made,
+        compartment::create(b"/comp/waiting", limits),
+        fs::read_file(PROGRAM),
+    ) else {
+        t.check("compartment.kill_waiting", false, "setting up");
+        return;
+    };
+    let mut failed = alloc::vec::Vec::new();
+    for mode in MODES {
+        let name = core::str::from_utf8(mode).unwrap_or("?");
+        let started =
+            keel_linux_abi::exec::load_in(c.root(), &file, PROGRAM, &[PROGRAM, mode], &[])
+                .ok()
+                .and_then(|loaded| process::spawn_in(&c, "waiter", &loaded).ok());
+        let Some(started) = started else {
+            failed.push((name, "could not start", None));
+            continue;
+        };
+        // Long enough to be in its wait.
+        sched::sleep_ms(300);
+        if sched::exit_status(started.thread).is_some() {
+            failed.push((name, "did not wait", sched::exit_status(started.thread)));
+            continue;
+        }
+        process::kill_every(&c, |_| true);
+        let ended = sched::join_timeout(started.thread, 1000);
+        let start = time::monotonic_nanos();
+        while c.processes() != 0 && time::monotonic_nanos() - start < 1_000_000_000 {
+            sched::sleep_ms(5);
+        }
+        let status = sched::exit_status(started.thread);
+        if !ended || status != Some((137, None)) || c.processes() != 0 {
+            failed.push((name, "not ended by SIGKILL", status));
+            for _ in 0..100 {
+                process::kill_every(&c, |_| true);
+                sched::sleep_ms(10);
+                if c.processes() == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let ok = failed.is_empty() && c.memory().used() == 0;
+    t.check(
+        "compartment.kill_waiting",
+        ok,
+        "SIGKILL ends a process at once wherever it waits for good: epoll_wait, poll and select with no timeout, nanosleep, sigsuspend, a FIFO's open, an empty pipe's read, accept and wait4",
+    );
+    if !ok {
+        kprintln!(
+            "  kill waiting: {failed:?}; {} processes and {} frames left",
+            c.processes(),
             c.memory().used()
         );
     }

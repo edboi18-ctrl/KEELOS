@@ -141,7 +141,7 @@ pub fn open_fifo(p: &ProcessRef, node: Ino, flags: u64) -> Result<Object, Errno>
             if moved(&pipe.lock()) {
                 return true;
             }
-            if crate::signal::pending_unblocked(p) || sched::interrupted() {
+            if crate::signal::should_stop(p) {
                 return moved(&pipe.lock());
             }
             wait(
@@ -801,7 +801,7 @@ fn wait_scan(
         if count > 0 {
             return Ok(count);
         }
-        if crate::signal::pending_unblocked(p) || sched::interrupted() {
+        if crate::signal::should_stop(p) {
             return Err(Errno::ERESTARTNOHAND);
         }
         if deadline.is_some_and(|d| keel_hal::time::monotonic_nanos() >= d) {
